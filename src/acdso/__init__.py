@@ -132,7 +132,7 @@ from acdso.advisors import (
     AnthropicProvider,
     AzureOpenAIProvider,
     OllamaProvider,
-    LiteLLMProvider,
+    OpenAICompatibleProvider,
     # Factory and utilities
     create_advisor,
     llm_advisor_stub,
@@ -242,7 +242,7 @@ __all__ = [
     "AnthropicProvider",
     "AzureOpenAIProvider",
     "OllamaProvider",
-    "LiteLLMProvider",
+    "OpenAICompatibleProvider",
     "create_advisor",
     "llm_advisor_stub",
     "BaseLLMAdvisor",

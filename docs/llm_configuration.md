@@ -105,19 +105,26 @@ provider = OllamaProvider(
 - `mistral` - Fast
 - `codellama` - Code-focused
 
-### LiteLLM (100+ Providers)
+### OpenAI-Compatible Endpoints
 
 **Requirements:**
-- `pip install acdso[litellm]`
+- `pip install acdso[openai_compatible]`
 
 ```python
-from acdso import LiteLLMProvider, LLMAdvisor
+from acdso import OpenAICompatibleProvider, LLMAdvisor
 
-# Use any LiteLLM-supported model
-provider = LiteLLMProvider(model="gpt-4o")
-provider = LiteLLMProvider(model="claude-3-sonnet-20240229")
-provider = LiteLLMProvider(model="ollama/llama3")
-provider = LiteLLMProvider(model="cohere/command-r")
+# OpenAI
+provider = OpenAICompatibleProvider(model="gpt-4o")
+
+# Ollama (via OpenAI-compatible endpoint)
+provider = OpenAICompatibleProvider(
+    model="llama3", base_url="http://localhost:11434/v1"
+)
+
+# vLLM or LM Studio
+provider = OpenAICompatibleProvider(
+    model="mistral", base_url="http://localhost:8000/v1"
+)
 
 advisor = LLMAdvisor(provider=provider)
 ```

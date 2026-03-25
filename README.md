@@ -34,7 +34,7 @@ pip install acdso[boosters]
 pip install acdso[openai]      # OpenAI GPT
 pip install acdso[anthropic]   # Anthropic Claude
 pip install acdso[llm]         # Both providers
-pip install acdso[litellm]     # 100+ providers via LiteLLM
+pip install acdso[openai_compatible]  # Any OpenAI-compatible endpoint
 
 # AutoML integrations
 pip install acdso[flaml]       # Microsoft FLAML
@@ -215,7 +215,7 @@ clf = ACDSOClassifier(llm_advisor=advisor)
 | Anthropic | `pip install acdso[anthropic]` | `ANTHROPIC_API_KEY` |
 | Azure OpenAI | `pip install acdso[openai]` | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT` |
 | Ollama | - | - (local) |
-| LiteLLM | `pip install acdso[litellm]` | varies by provider |
+| OpenAI-Compatible | `pip install acdso[openai_compatible]` | `OPENAI_API_KEY` or custom |
 
 ### Advanced Configuration
 
@@ -552,7 +552,6 @@ wrapper = GenericModelWrapper(
 - lightgbm >= 3.3.0 (boosting)
 - openai >= 1.0.0 (LLM)
 - anthropic >= 0.18.0 (LLM)
-- litellm >= 1.0.0 (LLM)
 - flaml >= 2.0.0 (AutoML integration)
 
 ---
