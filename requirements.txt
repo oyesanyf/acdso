@@ -113,7 +113,7 @@ gymnasium>=0.29.0
 ydata-profiling>=4.0.0
 sweetviz>=2.1.0
 # dataprep>=0.4.0  # Can have dependency conflicts
-# dtale>=2.0.0  # For interactive analysis
+# dtale>=3.22.0  # For interactive analysis
 
 # ===================================
 # LLM Providers (Optional)

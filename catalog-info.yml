@@ -1,0 +1,23 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: acdso
+  description: acdso repository (HTML)
+  tags:
+  - html
+  - backend
+  annotations:
+    github.com/project-slug: contextmedia/acdso
+    jira/project-key: SEC
+    critical-app-list/top-contributors: femi.oyesanya@patientpoint.com
+    critical-app-list/engineering-manager: Jeffrey Aschenbach
+    critical-app-list/manager-email: Jeff.Aschenbach@patientpoint.com
+    critical-app-list/codebase: Infrastructure
+    critical-app-list/team: Infrastructure/Security
+    critical-app-list/last-updated: '2026-04-03T10:45:19.885496'
+    critical-app-list/source: automated
+spec:
+  type: service
+  lifecycle: development
+  owner: cybersecurity
+  system: core-platform
