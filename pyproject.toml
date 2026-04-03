@@ -94,7 +94,7 @@ automl-full = [
 ydata-profiling = ["ydata-profiling>=4.0.0"]
 sweetviz = ["sweetviz>=2.1.0"]
 dataprep = ["dataprep>=0.4.0"]
-dtale = ["dtale>=2.0.0"]
+dtale = ["dtale>=3.22.0"]
 great-expectations = ["great-expectations>=0.15.0"]
 eda = ["ydata-profiling>=4.0.0", "sweetviz>=2.1.0"]  # Common EDA tools
 
