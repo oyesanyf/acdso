@@ -6743,7 +6743,7 @@ def _run_autonomous_custom_file(
             all_results.append(("Benchmark (Custom File)", "SUCCESS", time.time() - phase8_start))
             analysis_outputs['benchmark'] = benchmark_summary
         else:
-            all_results.append(("Benchmark (Custom File)", "FAILED: No results", time.time() - phase8_start))
+            all_results.append(("Benchmark (Custom File)", "not_ok: No results", time.time() - phase8_start))
     except Exception as e:
         print(f"\n  [X] Benchmark failed: {e}")
         all_results.append(("Benchmark (Custom File)", f"FAILED: {e}", time.time() - phase8_start))
@@ -7355,7 +7355,7 @@ def run_autonomous_demo(
             phase9_results.append(("Comprehensive AutoML Benchmark", "SUCCESS", time.time() - phase9_start))
             all_benchmark_results.append(benchmark_summary)
         else:
-            phase9_results.append(("Comprehensive AutoML Benchmark", "FAILED: No results", time.time() - phase9_start))
+            phase9_results.append(("Comprehensive AutoML Benchmark", "not_ok: No results", time.time() - phase9_start))
     except ImportError:
         phase9_results.append(("Comprehensive AutoML Benchmark", "SKIPPED: Full benchmark suite not available", time.time() - phase9_start))
         log_console("  Note: Full benchmark suite not available. Install for comprehensive benchmarking.")
@@ -7958,7 +7958,7 @@ def _generate_autonomous_report(report_data: dict) -> str:
                 <div class="value">{success}</div>
                 <div class="label">Successful</div>
             </div>
-            <div class="card failed">
+            <div class="card not_ok">
                 <div class="value">{failed}</div>
                 <div class="label">Failed</div>
             </div>
@@ -9172,7 +9172,7 @@ def _generate_html_report(summary, output_path: str):
     
     # Add failed systems
     for result in failed_results:
-        html += f"""            <div class="system-card failed">
+        html += f"""            <div class="system-card not_ok">
                 <div class="system-header">
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
                         <span class="system-rank rank-other">-</span>
