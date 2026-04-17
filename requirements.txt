@@ -40,7 +40,7 @@ flaml>=2.0.0
 tpot>=1.0.0
 
 # H2O AutoML - Enterprise-grade
-h2o>=3.40.0
+h2o>=3.46.0.1
 
 # AutoGluon - AWS's AutoML (specific version for stability)
 autogluon.tabular[fastai]==1.4.1b20251209
