@@ -43,17 +43,21 @@ Usage:
 
 from __future__ import annotations
 
+import os
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, clone
-from sklearn.model_selection import cross_val_score, StratifiedKFold, KFold
+from sklearn.base import BaseEstimator, clone, is_classifier
+from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import Pipeline
 from scipy import stats
 from scipy.cluster import hierarchy
+from scipy.spatial.distance import squareform
 
 
 @dataclass
@@ -235,7 +239,7 @@ class SafeFeatureImportance:
     def __init__(
         self,
         estimator: BaseEstimator,
-        scorer: str = "accuracy",
+        scorer: Optional[str] = None,
         n_repeats: int = 10,
         cv_folds: int = 5,
         n_bootstrap: int = 20,
@@ -270,47 +274,163 @@ class SafeFeatureImportance:
         if hasattr(self.estimator, 'best_estimator_'):
             return self.estimator.best_estimator_
         return self.estimator
+
+    def _resolve_scorer(self, pipeline: Optional[BaseEstimator] = None) -> str:
+        """Resolve scorer automatically from estimator type when scorer=None."""
+        if self.scorer is not None:
+            return self.scorer
+        target_est = pipeline if pipeline is not None else self._get_pipeline()
+        if is_classifier(self.estimator) or is_classifier(target_est):
+            return "accuracy"
+        return "r2"
     
+    def _resolve_workers(self, n_tasks: int) -> int:
+        """Resolve bounded thread worker count without oversubscription."""
+        cpu_cnt = os.cpu_count() or 2
+        if self.n_jobs == 1:
+            cap = 1
+        elif self.n_jobs is None or self.n_jobs == -1:
+            cap = min(cpu_cnt, 8)
+        elif self.n_jobs < -1:
+            cap = max(1, min(cpu_cnt + 1 + self.n_jobs, 8))
+        else:
+            cap = min(int(self.n_jobs), cpu_cnt, 8)
+        return max(1, min(max(1, n_tasks), cap))
+
+    @staticmethod
+    def _set_n_jobs_recursive(est: Any, n_jobs_val: int) -> None:
+        """Recursively clamp inner estimator n_jobs to avoid nested oversubscription."""
+        try:
+            params = est.get_params(deep=True)
+            updates = {k: n_jobs_val for k in params if k == "n_jobs" or k.endswith("__n_jobs")}
+            if updates:
+                est.set_params(**updates)
+        except Exception:
+            if hasattr(est, "n_jobs"):
+                try:
+                    est.n_jobs = n_jobs_val
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _has_expanding_or_dropping_step(obj: Any) -> bool:
+        """Check whether pre-final pipeline steps contain OneHotEncoder or feature selectors."""
+        cls_name = type(obj).__name__
+        if "OneHotEncoder" in cls_name or "Select" in cls_name:
+            return True
+        if hasattr(obj, "steps"):
+            return any(SafeFeatureImportance._has_expanding_or_dropping_step(s) for _, s in obj.steps)
+        if hasattr(obj, "transformers"):
+            return any(SafeFeatureImportance._has_expanding_or_dropping_step(t) for _, t, _ in obj.transformers)
+        return False
+
+    @staticmethod
+    def _slice_rows(X: Any, idx: np.ndarray) -> Any:
+        """Slice rows while preserving DataFrame column names."""
+        if hasattr(X, "iloc"):
+            return X.iloc[idx]
+        return np.asarray(X)[idx]
+
+    def _fit_and_permute_split(
+        self,
+        pipeline: BaseEstimator,
+        X_train: Any,
+        y_train: np.ndarray,
+        X_val: Any,
+        y_val: np.ndarray,
+        seed: int,
+        inner_n_jobs: int,
+    ) -> np.ndarray:
+        """Fit a cloned pipeline (caching 1-to-1 preprocessing when safe) and compute permutation importance."""
+        n_features = X_train.shape[1]
+        can_split_pre = (
+            isinstance(pipeline, Pipeline)
+            and len(pipeline.steps) >= 2
+            and not self._has_expanding_or_dropping_step(Pipeline(pipeline.steps[:-1]))
+        )
+
+        resolved_scorer = self._resolve_scorer(pipeline)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+            if can_split_pre:
+                try:
+                    pre_clone = clone(Pipeline(pipeline.steps[:-1]))
+                    X_train_t = pre_clone.fit_transform(X_train, y_train)
+                    if getattr(X_train_t, "shape", (0, -1))[1] == n_features:
+                        X_val_t = pre_clone.transform(X_val)
+                        est_clone = clone(pipeline.steps[-1][1])
+                        self._set_n_jobs_recursive(est_clone, inner_n_jobs)
+                        est_clone.fit(X_train_t, y_train)
+                        result = permutation_importance(
+                            est_clone,
+                            X_val_t,
+                            y_val,
+                            n_repeats=self.n_repeats,
+                            random_state=seed,
+                            n_jobs=inner_n_jobs,
+                            scoring=resolved_scorer,
+                        )
+                        return np.asarray(result.importances_mean, dtype=float)
+                except Exception:
+                    pass
+
+            try:
+                model = clone(pipeline)
+                self._set_n_jobs_recursive(model, inner_n_jobs)
+                model.fit(X_train, y_train)
+            except Exception:
+                model = pipeline
+
+            result = permutation_importance(
+                model,
+                X_val,
+                y_val,
+                n_repeats=self.n_repeats,
+                random_state=seed,
+                n_jobs=inner_n_jobs,
+                scoring=resolved_scorer,
+            )
+            return np.asarray(result.importances_mean, dtype=float)
+
     def _compute_correlations(self, X: pd.DataFrame) -> Tuple[np.ndarray, Dict[int, List[str]]]:
         """Compute correlation matrix and identify correlated groups."""
-        # Get numeric columns only
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-        
+
         if len(numeric_cols) < 2:
-            return np.eye(len(X.columns)), {}
-        
-        X_numeric = X[numeric_cols].copy()
-        
-        # Handle missing values
+            return np.eye(len(numeric_cols)), {}
+
+        X_numeric = X[numeric_cols]
         X_numeric = X_numeric.fillna(X_numeric.median())
-        
-        # Compute correlation matrix
-        corr_matrix = np.abs(X_numeric.corr().values)
-        np.fill_diagonal(corr_matrix, 0)
-        
-        # Cluster correlated features
-        groups = {}
+
+        corr_matrix = np.nan_to_num(np.abs(X_numeric.corr().values), nan=0.0)
+        np.fill_diagonal(corr_matrix, 0.0)
+
+        groups: Dict[int, List[str]] = {}
         if corr_matrix.shape[0] > 1:
             try:
-                # Hierarchical clustering
-                linkage = hierarchy.linkage(1 - corr_matrix, method='complete')
-                clusters = hierarchy.fcluster(linkage, t=1 - self.correlation_threshold, criterion='distance')
-                
+                dist_matrix = np.maximum(0.0, 1.0 - corr_matrix)
+                np.fill_diagonal(dist_matrix, 0.0)
+                dist_matrix = 0.5 * (dist_matrix + dist_matrix.T)
+                linkage = hierarchy.linkage(squareform(dist_matrix, checks=False), method='complete')
+                clusters = hierarchy.fcluster(linkage, t=1.0 - self.correlation_threshold, criterion='distance')
+
                 for i, cluster_id in enumerate(clusters):
-                    if cluster_id not in groups:
-                        groups[cluster_id] = []
-                    groups[cluster_id].append(numeric_cols[i])
-                
-                # Only keep groups with more than one feature
+                    cid = int(cluster_id)
+                    if cid not in groups:
+                        groups[cid] = []
+                    groups[cid].append(numeric_cols[i])
+
                 groups = {k: v for k, v in groups.items() if len(v) > 1}
             except Exception:
                 pass
-        
+
         return corr_matrix, groups
-    
+
     def _compute_permutation_importance(
         self,
-        X: np.ndarray,
+        X: Any,
         y: np.ndarray,
         model: BaseEstimator,
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -320,98 +440,102 @@ class SafeFeatureImportance:
             n_repeats=self.n_repeats,
             random_state=self.random_state,
             n_jobs=self.n_jobs,
-            scoring=self.scorer,
+            scoring=self._resolve_scorer(model),
         )
         return result.importances_mean, result.importances_std
-    
+
     def _compute_cv_importance(
         self,
         X: pd.DataFrame,
         y: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute cross-validated permutation importance."""
-        X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
+        """Compute cross-validated permutation importance (DataFrame-safe, bounded parallel)."""
         y_arr = np.asarray(y)
-        
-        n_features = X_arr.shape[1]
-        all_importances = []
-        
-        # Determine CV splitter
-        if len(np.unique(y_arr)) <= 10:  # Classification
-            cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-        else:  # Regression
-            cv = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-        
         pipeline = self._get_pipeline()
-        
-        for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_arr, y_arr)):
-            self._log(f"Computing importance for fold {fold_idx + 1}/{self.cv_folds}")
-            
-            X_train, X_val = X_arr[train_idx], X_arr[val_idx]
-            y_train, y_val = y_arr[train_idx], y_arr[val_idx]
-            
-            # Clone and fit model
-            try:
-                model = clone(pipeline)
-                model.fit(X_train, y_train)
-            except Exception:
-                # Use original fitted model if cloning fails
-                model = pipeline
-            
-            # Compute permutation importance on validation set
-            imp_mean, _ = self._compute_permutation_importance(X_val, y_val, model)
-            all_importances.append(imp_mean)
-        
-        all_importances = np.array(all_importances)
-        mean_importance = np.mean(all_importances, axis=0)
-        std_importance = np.std(all_importances, axis=0)
-        
-        return mean_importance, std_importance
-    
+
+        if is_classifier(pipeline) or (
+            not hasattr(pipeline, "_estimator_type") and len(np.unique(y_arr)) <= 10
+        ):
+            _, counts = np.unique(y_arr, return_counts=True)
+            n_splits = max(2, min(self.cv_folds, int(counts.min()))) if counts.size else self.cv_folds
+            cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
+        else:
+            n_splits = max(2, min(self.cv_folds, len(y_arr) // 2))
+            cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
+
+        splits = list(cv.split(X, y_arr))
+        rng = np.random.RandomState(self.random_state)
+        seeds = [int(rng.randint(0, 2**31 - 1)) for _ in splits]
+        n_workers = self._resolve_workers(len(splits))
+        inner_n_jobs = 1 if n_workers > 1 else self.n_jobs
+
+        def _run_fold(fold_idx: int) -> np.ndarray:
+            train_idx, val_idx = splits[fold_idx]
+            self._log(f"Computing importance for fold {fold_idx + 1}/{len(splits)}")
+            return self._fit_and_permute_split(
+                pipeline,
+                self._slice_rows(X, train_idx),
+                y_arr[train_idx],
+                self._slice_rows(X, val_idx),
+                y_arr[val_idx],
+                seeds[fold_idx],
+                inner_n_jobs,
+            )
+
+        if n_workers == 1:
+            all_importances = [_run_fold(i) for i in range(len(splits))]
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                all_importances = list(pool.map(_run_fold, range(len(splits))))
+
+        all_arr = np.asarray(all_importances, dtype=float)
+        return np.mean(all_arr, axis=0), np.std(all_arr, axis=0)
+
     def _compute_stability(
         self,
         X: pd.DataFrame,
         y: np.ndarray,
     ) -> np.ndarray:
-        """Compute importance stability via bootstrap."""
-        X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
+        """Compute importance stability via bootstrap (DataFrame-safe, bounded parallel)."""
         y_arr = np.asarray(y)
-        
-        n_samples = X_arr.shape[0]
-        n_features = X_arr.shape[1]
-        
+        n_samples, n_features = X.shape
+        if self.n_bootstrap <= 0:
+            return np.ones(n_features, dtype=float)
+
         rng = np.random.RandomState(self.random_state)
-        bootstrap_rankings = []
-        
+        boot_indices = [rng.choice(n_samples, size=n_samples, replace=True) for _ in range(self.n_bootstrap)]
+        seeds = [int(rng.randint(0, 2**31 - 1)) for _ in range(self.n_bootstrap)]
+
         pipeline = self._get_pipeline()
-        
-        for i in range(self.n_bootstrap):
-            # Bootstrap sample
-            idx = rng.choice(n_samples, size=n_samples, replace=True)
-            X_boot = X_arr[idx]
+        n_workers = self._resolve_workers(self.n_bootstrap)
+        inner_n_jobs = 1 if n_workers > 1 else self.n_jobs
+
+        def _run_boot(b_idx: int) -> np.ndarray:
+            idx = boot_indices[b_idx]
+            X_boot = self._slice_rows(X, idx)
             y_boot = y_arr[idx]
-            
-            # Fit and compute importance
-            try:
-                model = clone(pipeline)
-                model.fit(X_boot, y_boot)
-                imp_mean, _ = self._compute_permutation_importance(X_boot, y_boot, model)
-            except Exception:
-                imp_mean, _ = self._compute_permutation_importance(X_boot, y_boot, pipeline)
-            
-            # Get ranking
-            ranking = np.argsort(np.argsort(-imp_mean))  # Rank (0 = most important)
-            bootstrap_rankings.append(ranking)
-        
-        bootstrap_rankings = np.array(bootstrap_rankings)
-        
-        # Stability = 1 - normalized std of rankings
-        rank_std = np.std(bootstrap_rankings, axis=0)
-        max_std = n_features / 2  # Maximum possible std
-        stability = 1 - (rank_std / max_std)
-        stability = np.clip(stability, 0, 1)
-        
-        return stability
+            imp_mean = self._fit_and_permute_split(
+                pipeline,
+                X_boot,
+                y_boot,
+                X_boot,
+                y_boot,
+                seeds[b_idx],
+                inner_n_jobs,
+            )
+            return np.argsort(np.argsort(-imp_mean))
+
+        if n_workers == 1:
+            bootstrap_rankings = [_run_boot(i) for i in range(self.n_bootstrap)]
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                bootstrap_rankings = list(pool.map(_run_boot, range(self.n_bootstrap)))
+
+        rank_arr = np.asarray(bootstrap_rankings, dtype=float)
+        rank_std = np.std(rank_arr, axis=0)
+        max_std = max(1e-12, n_features / 2.0)
+        stability = 1.0 - (rank_std / max_std)
+        return np.clip(stability, 0.0, 1.0)
     
     def compute(
         self,
@@ -525,7 +649,7 @@ class SafeFeatureImportance:
             method="permutation_cv",
             n_repeats=self.n_repeats,
             cv_folds=self.cv_folds,
-            scorer=self.scorer,
+            scorer=self._resolve_scorer(),
             reliable_count=reliable_count,
             warnings=warnings,
         )

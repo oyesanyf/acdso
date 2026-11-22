@@ -19,6 +19,8 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from .transformers import _coerce_datetime_series
+
 
 @dataclass
 class TimeSeriesRiskReport:
@@ -327,7 +329,8 @@ def detect_trend(
     slope : float
         Estimated slope.
     """
-    clean_series = series.dropna().values
+    clean_values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+    clean_series = clean_values[np.isfinite(clean_values)]
     
     if len(clean_series) < 10:
         return False, 'none', 0.0
@@ -376,8 +379,9 @@ def detect_outliers(
     outlier_indices : list
         Indices of outliers.
     """
-    clean_series = series.dropna()
-    values = clean_series.values
+    coerced = pd.to_numeric(series, errors="coerce").astype(np.float64).replace([np.inf, -np.inf], np.nan)
+    clean_series = coerced.dropna()
+    values = clean_series.to_numpy(dtype=np.float64)
     
     if len(values) < 10:
         return False, []
@@ -437,12 +441,27 @@ def check_temporal_leakage(
     
     # Check for highly correlated features with future target
     try:
-        future_target = df[target_col].shift(-1)
+        target_num = (
+            pd.to_numeric(df[target_col], errors="coerce")
+            .astype(np.float64)
+            .replace([np.inf, -np.inf], np.nan)
+        )
+        future_target = target_num.shift(-1)
         
         for col in feature_cols:
-            if df[col].dtype in [np.float64, np.int64, float, int]:
-                corr = df[col].corr(future_target)
-                if abs(corr) > 0.95:
+            if (
+                col in df.columns
+                and pd.api.types.is_numeric_dtype(df[col])
+                and not pd.api.types.is_datetime64_any_dtype(df[col])
+                and not pd.api.types.is_timedelta64_dtype(df[col])
+            ):
+                feat_num = (
+                    pd.to_numeric(df[col], errors="coerce")
+                    .astype(np.float64)
+                    .replace([np.inf, -np.inf], np.nan)
+                )
+                corr = feat_num.corr(future_target)
+                if pd.notna(corr) and abs(corr) > 0.95:
                     warnings_list.append(
                         f"Feature '{col}' is highly correlated (r={corr:.2f}) with future target. "
                         "Possible data leakage."
@@ -527,7 +546,9 @@ class TimeSeriesRiskAnalyzer:
             report.severity = 'critical'
             return report
         
-        # Get datetime index and series
+        # Get datetime index and series (normalize mixed-offset/DST timestamps before sorting)
+        df = df.copy()
+        df[self.datetime_col] = _coerce_datetime_series(df[self.datetime_col])
         df = df.sort_values(self.datetime_col).reset_index(drop=True)
         dt_index = pd.DatetimeIndex(df[self.datetime_col])
         series = df[self.target_col]

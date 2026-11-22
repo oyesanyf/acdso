@@ -166,6 +166,25 @@ class ACDSOMetaOptimizer(BaseEstimator):
         self.pareto_front_: Optional[List[Dict[str, Any]]] = None
         self.audit_trail_: Optional[Dict[str, Any]] = None
         self._task: Optional[str] = None
+        self._effective_scorer_: Optional[str] = None
+
+    def _resolve_scorer(self, y: Any, task: str) -> str:
+        """Resolve effective scorer for target labels without mutating self.scorer."""
+        if task != "classification":
+            return self.scorer
+        from acdso.core import _auto_adjust_scorer
+
+        y_clean = pd.Series(y).dropna().to_numpy()
+        if y_clean.size == 0:
+            return self.scorer
+        try:
+            return _auto_adjust_scorer(self.scorer, y_clean, task)
+        except Exception:
+            if self.scorer in ("f1", "precision", "recall"):
+                return f"{self.scorer}_weighted"
+            if self.scorer == "roc_auc":
+                return "roc_auc_ovr_weighted"
+            return self.scorer
 
     def _log(self, msg: str) -> None:
         """Log message if verbose mode is enabled."""
@@ -240,10 +259,12 @@ class ACDSOMetaOptimizer(BaseEstimator):
         """Generate ACDSO's native candidates."""
         from acdso.core import _ACDSOEngineV3
 
+        effective_scorer = getattr(self, "_effective_scorer_", None) or self._resolve_scorer(y, task)
+
         # Use a mini ACDSO run to generate candidates
         engine = _ACDSOEngineV3(
             task=task,
-            scorer=self.scorer,
+            scorer=effective_scorer,
             cv=self.cv,
             random_state=self.random_state,
             time_budget_s=min(60, self.time_budget_s or 60),
@@ -261,7 +282,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
         risk_report = analyze_risk(
             X, y,
             task=task,
-            scorer=self.scorer,
+            scorer=effective_scorer,
             cv=self.cv,
             random_state=self.random_state,
         )
@@ -300,7 +321,8 @@ class ACDSOMetaOptimizer(BaseEstimator):
             is_prefitted = isinstance(estimator, ExternalModelWrapper)
 
             start = time.time()
-            tracemalloc.start()
+            effective_scorer = getattr(self, "_effective_scorer_", None) or self._resolve_scorer(y, task)
+            scorer = get_scorer(effective_scorer)
 
             if task == "classification":
                 splitter = StratifiedKFold(
@@ -315,40 +337,49 @@ class ACDSOMetaOptimizer(BaseEstimator):
                     random_state=self.random_state,
                 )
 
-            scorer = get_scorer(self.scorer)
+            started_tracemalloc = not tracemalloc.is_tracing()
+            if started_tracemalloc:
+                tracemalloc.start()
+            try:
+                if is_prefitted:
+                    # For pre-fitted models, just score on the data
+                    # (This is an approximation; ideally we'd have held-out data)
+                    try:
+                        score = float(scorer(estimator, X, y))
+                        scores = np.array([score])
+                    except Exception:
+                        # Try manual prediction and scoring
+                        from sklearn.metrics import accuracy_score, r2_score
+                        preds = estimator.predict(X)
+                        if task == "classification":
+                            score = accuracy_score(y, preds)
+                        else:
+                            score = r2_score(y, preds)
+                        scores = np.array([score])
+                else:
+                    # Clone and cross-validate
+                    cloned = clone(estimator)
+                    scores = cross_val_score(
+                        cloned, X, y,
+                        cv=splitter,
+                        scoring=scorer,
+                        n_jobs=None,
+                    )
 
-            if is_prefitted:
-                # For pre-fitted models, just score on the data
-                # (This is an approximation; ideally we'd have held-out data)
-                try:
-                    score = float(scorer(estimator, X, y))
-                    scores = np.array([score])
-                except Exception:
-                    # Try manual prediction and scoring
-                    from sklearn.metrics import accuracy_score, r2_score
-                    preds = estimator.predict(X)
-                    if task == "classification":
-                        score = accuracy_score(y, preds)
-                    else:
-                        score = r2_score(y, preds)
-                    scores = np.array([score])
-            else:
-                # Clone and cross-validate
-                cloned = clone(estimator)
-                scores = cross_val_score(
-                    cloned, X, y,
-                    cv=splitter,
-                    scoring=scorer,
-                    n_jobs=None,
-                )
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                if started_tracemalloc and tracemalloc.is_tracing():
+                    tracemalloc.stop()
 
-            current, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
+            scores_arr = np.asarray(scores, dtype=np.float64)
+            if scores_arr.size == 0 or not np.all(np.isfinite(scores_arr)):
+                self._log(f"Skipping {candidate.name}: non-finite CV scores")
+                return None
 
             train_time_s = float(time.time() - start)
             peak_mem_mb = float(peak / (1024 * 1024))
-            metric = float(np.mean(scores))
-            cv_std = float(np.std(scores)) if len(scores) > 1 else 0.0
+            metric = float(np.mean(scores_arr))
+            cv_std = float(np.std(scores_arr)) if len(scores_arr) > 1 else 0.0
 
             # Compute risk penalty
             risk_pen = compute_risk_penalty(
@@ -366,6 +397,13 @@ class ACDSOMetaOptimizer(BaseEstimator):
                 fitted.fit(X, y)
                 latency = measure_latency_ms_per_row(fitted, X)
                 estimator = fitted  # Use fitted version
+
+            if not all(
+                math.isfinite(float(v))
+                for v in (metric, cv_std, risk_pen, train_time_s, peak_mem_mb, latency)
+            ):
+                self._log(f"Skipping {candidate.name}: non-finite evaluation metrics")
+                return None
 
             # Build objective vector
             objectives = (
@@ -387,7 +425,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
                 objectives=objectives,
                 meta={
                     "source": candidate.source,
-                    "cv_scores": scores.tolist(),
+                    "cv_scores": scores_arr.tolist(),
                     "cv_score_std": cv_std,
                     **candidate.metadata,
                 },
@@ -436,6 +474,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
 
         # Step 1: Infer task
         self._task = self._infer_task(y)
+        self._effective_scorer_ = self._resolve_scorer(y, self._task)
         self._log(f"Task: {self._task}")
 
         # Step 2: Risk analysis
@@ -443,7 +482,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
         risk_report = analyze_risk(
             X, y,
             task=self._task,
-            scorer=self.scorer,
+            scorer=self._effective_scorer_,
             cv=self.cv,
             random_state=self.random_state,
             llm_advisor=self.llm_advisor,
@@ -510,11 +549,58 @@ class ACDSOMetaOptimizer(BaseEstimator):
 
         # Step 6: Construct Pareto front
         self._log("Constructing Pareto front...")
-        front = pareto_front(results)
+        finite_metric_results = [r for r in results if math.isfinite(float(r.metric))]
+        pareto_pool = finite_metric_results if finite_metric_results else results
+        front = pareto_front(pareto_pool)
         self._log(f"Pareto front size: {len(front)}")
 
-        # Step 7: Select best via knee-point
-        best = knee_point_selection(front)
+        # Step 7: Select best via knee-point (or accuracy preference)
+        pref_norm = str(getattr(self, "preference", "balanced") or "balanced").strip().lower()
+        if pref_norm in ("accuracy", "metric"):
+            finite_res = [r for r in results if math.isfinite(float(r.metric))]
+            pool = finite_res if finite_res else results
+            best = max(
+                pool,
+                key=lambda r: (
+                    float(r.metric) if math.isfinite(float(r.metric)) else float("-inf"),
+                    -float(r.risk_penalty) if math.isfinite(float(r.risk_penalty)) else float("-inf"),
+                    -float(r.train_time_s) if math.isfinite(float(r.train_time_s)) else float("-inf"),
+                    str(r.name),
+                ),
+            )
+        else:
+            finite_front = [c for c in front if math.isfinite(float(c.metric))]
+            sel_front = finite_front if finite_front else front
+            max_front_metric = max(float(c.metric) for c in sel_front)
+            rel_cap = 0.03 if pref_norm in ("speed", "fast", "low_risk", "safe") else 0.025
+            if math.isfinite(max_front_metric):
+                scale_base = (
+                    max(1e-12, abs(max_front_metric))
+                    if max_front_metric < 0.0
+                    else max(0.2, abs(max_front_metric))
+                )
+                tol = rel_cap * scale_base
+            else:
+                tol = rel_cap
+            viable_front = [c for c in sel_front if float(c.metric) >= max_front_metric - tol]
+            if not viable_front:
+                viable_front = list(sel_front)
+            m_ref = max(
+                (abs(float(c.metric)) for c in viable_front if math.isfinite(float(c.metric))),
+                default=1.0,
+            )
+            if m_ref <= 0.0:
+                m_ref = 1.0
+            viable_front.sort(
+                key=lambda c: (
+                    -round(float(c.metric) / m_ref, 8) if math.isfinite(float(c.metric)) else float("inf"),
+                    round(float(c.risk_penalty), 4) if math.isfinite(float(c.risk_penalty)) else float("inf"),
+                    round(float(c.robustness_drop), 4) if math.isfinite(float(c.robustness_drop)) else float("inf"),
+                    round(float(c.train_time_s), 1) if math.isfinite(float(c.train_time_s)) else float("inf"),
+                    str(c.name),
+                )
+            )
+            best = knee_point_selection(viable_front, preference=self.preference)
         self._log(f"Selected: {best.name} from {best.meta.get('source', 'unknown')}")
 
         # Store results
@@ -633,7 +719,8 @@ class ACDSOMetaOptimizer(BaseEstimator):
         """
         if self.best_estimator_ is None:
             raise RuntimeError("ACDSOMetaOptimizer is not fitted. Call fit() first.")
-        scorer = get_scorer(self.scorer)
+        scorer_name = getattr(self, "_effective_scorer_", None) or self.scorer
+        scorer = get_scorer(scorer_name)
         return float(scorer(self.best_estimator_, X, y))
 
     def get_source_summary(self) -> Dict[str, Any]:

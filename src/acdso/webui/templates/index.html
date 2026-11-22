@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%235b9dff'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-size='32' font-weight='700' fill='%230f1116' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
-<title>ACDSO — Web GUI</title>
+<title>ACDSO &mdash; Workbench</title>
 <style>
   :root {
     --bg: #0f1116;
@@ -16,57 +16,71 @@
     --accent: #5b9dff;
     --ok: #4fd18b;
     --warn: #ffc860;
-    --err: #ff6b6b;
+    --err: #ff7b7b;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
     font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
   }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   header {
-    padding: 18px 24px; border-bottom: 1px solid var(--line);
+    padding: 16px 24px; border-bottom: 1px solid var(--line);
     display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
   }
   header h1 { margin: 0; font-size: 18px; letter-spacing: .3px; }
   header .sub { color: var(--muted); font-size: 12px; }
-  main { display: grid; grid-template-columns: minmax(420px, 1fr) minmax(480px, 1.2fr); gap: 18px; padding: 18px 24px 40px; }
+  main {
+    display: grid;
+    grid-template-columns: minmax(400px, 1fr) minmax(460px, 1.25fr);
+    gap: 18px; padding: 18px 24px 40px;
+  }
+  main > section { min-width: 0; }
   @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
   .card {
     background: var(--panel); border: 1px solid var(--line);
     border-radius: 10px; padding: 16px; margin-bottom: 18px;
   }
-  .card h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
+  .card h2 {
+    margin: 0 0 12px; font-size: 13px; text-transform: uppercase;
+    letter-spacing: .8px; color: var(--muted);
+  }
   label { display: block; font-weight: 600; margin-bottom: 4px; }
   .hint { color: var(--muted); font-size: 12px; font-weight: 400; margin: 2px 0 8px; }
   .field { margin-bottom: 14px; }
-  input[type=text], input[type=number], select {
+  input[type=text], input[type=number], select, textarea {
     width: 100%; padding: 7px 9px; background: var(--panel-2); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px; font: inherit;
   }
-  select[multiple] { min-height: 118px; }
+  select[multiple] { min-height: 110px; }
   .check { display: flex; gap: 9px; align-items: flex-start; margin-bottom: 10px; }
   .check input { margin-top: 3px; }
   .check label { margin: 0; }
   .drop {
-    border: 1.5px dashed var(--line); border-radius: 10px; padding: 22px;
+    border: 1.5px dashed var(--line); border-radius: 10px; padding: 20px;
     text-align: center; color: var(--muted); cursor: pointer; transition: .15s;
   }
   .drop.over, .drop:hover { border-color: var(--accent); color: var(--text); }
+  .drop.busy { pointer-events: none; opacity: .6; }
   button, a.btn {
-    font: inherit; font-weight: 600; padding: 9px 16px; border-radius: 7px;
-    border: 1px solid var(--line); background: var(--panel-2); color: var(--text); cursor: pointer;
-    text-decoration: none; display: inline-block; box-sizing: border-box;
+    font: inherit; font-weight: 600; padding: 8px 14px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+    cursor: pointer; text-decoration: none; display: inline-flex; align-items: center;
+    gap: 6px; box-sizing: border-box;
   }
+  button.sm { padding: 4px 10px; font-size: 12px; }
   button.primary, a.btn.primary { background: var(--accent); border-color: var(--accent); color: #08111f; }
   button.danger, a.btn.danger { border-color: var(--err); color: var(--err); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
   pre.cmd, pre.log {
     background: #0b0d12; border: 1px solid var(--line); border-radius: 8px;
     padding: 12px; overflow: auto; font: 12px/1.55 Consolas, "SF Mono", monospace;
     white-space: pre-wrap; word-break: break-word; margin: 0;
   }
-  pre.log { height: 460px; }
+  pre.log { height: 380px; }
   .status { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); }
   .status.running { color: var(--warn); border-color: var(--warn); }
   .status.finished { color: var(--ok); border-color: var(--ok); }
@@ -76,55 +90,315 @@
   th { color: var(--muted); font-weight: 600; }
   .scroll-x { overflow-x: auto; }
   .msg { padding: 9px 12px; border-radius: 7px; font-size: 13px; margin-bottom: 12px; display: none; }
-  .msg.err { display: block; background: rgba(255,107,107,.12); border: 1px solid var(--err); color: #ffc9c9; }
+  .msg.err { display: block; background: rgba(255,123,123,.12); border: 1px solid var(--err); color: #ffd2d2; }
+  .msg.warn { display: block; background: rgba(255,200,96,.12); border: 1px solid var(--warn); color: #ffe3a8; }
   .msg.ok { display: block; background: rgba(79,209,139,.12); border: 1px solid var(--ok); color: #c9ffe2; }
   a { color: var(--accent); }
+  .link-danger { color: var(--err); }
   code.inline { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .noop {
-    display: inline-block; background: rgba(255,107,107,.12); color: var(--err);
+    display: inline-block; background: rgba(255,123,123,.12); color: var(--err);
     border: 1px solid var(--err); border-radius: 999px; padding: 0 7px;
     font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
     vertical-align: middle;
   }
+  .pill-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px; font-size: 11px;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  }
+  .segmented {
+    display: inline-flex; border: 1px solid var(--line); border-radius: 8px;
+    overflow: hidden; background: var(--panel-2); margin-bottom: 10px;
+  }
+  .segmented button {
+    border: 0; border-radius: 0; background: transparent; color: var(--muted);
+    padding: 7px 12px; font-size: 13px;
+  }
+  .segmented button.active {
+    background: var(--accent); color: #08111f;
+  }
+  .picker-list {
+    max-height: 220px; overflow-y: auto; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--panel-2); margin-top: 6px;
+  }
+  .picker-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 7px 10px; border-bottom: 1px solid var(--line); cursor: pointer;
+    font-size: 13px;
+  }
+  .picker-item:last-child { border-bottom: 0; }
+  .picker-item:hover { background: rgba(91,157,255,.10); }
+  .picker-item.selected { background: rgba(91,157,255,.20); border-left: 3px solid var(--accent); }
+  .picker-item.disabled { opacity: .55; cursor: not-allowed; }
+  .badge {
+    font-size: 10px; padding: 1px 6px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); background: var(--bg);
+  }
+  .badge-num { border-color: #3f6ca8; color: #9ec5ff; }
+  .badge-cat { border-color: #3f7a62; color: #9be7c2; }
+  .badge-date { border-color: #8f6b2f; color: #ffe09e; }
+  .badge-id, .badge-const { border-color: #6b4349; color: #ffb3b3; }
+  .stepper {
+    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+  }
+  .step {
+    font-size: 11px; padding: 4px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  }
+  .step.done { border-color: var(--ok); color: var(--ok); background: rgba(79,209,139,.10); }
+  .step.running { border-color: var(--accent); color: #d6e6ff; background: rgba(91,157,255,.18); }
+  .step.error { border-color: var(--err); color: var(--err); background: rgba(255,123,123,.12); }
+  .progress-wrap { margin-bottom: 10px; display: none; }
+  .progress-track {
+    width: 100%; height: 8px; border-radius: 999px; background: var(--panel-2);
+    border: 1px solid var(--line); overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; width: 0%; background: var(--accent); transition: width .2s ease;
+  }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+  .tab-btn { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+  .tab-btn[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: #08111f; }
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 12px; }
+  .kpi-card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+  .kpi-card .k-label { font-size: 11px; color: var(--muted); }
+  .kpi-card .k-val { font-size: 16px; font-weight: 700; margin-top: 2px; }
   .check:has(input:disabled), .field:has(select:disabled, input:disabled) { opacity: .55; }
+  .chart-wrap svg { width: 100%; height: auto; display: block; background: #0b0d12; border: 1px solid var(--line); border-radius: 8px; }
 </style>
 </head>
 <body>
 <header>
   <h1>ACDSO</h1>
-  <span class="sub">risk-aware AutoML &mdash; upload a dataset, pick a target, run the pipeline</span>
+  <span class="sub">risk-aware AutoML &mdash; upload a dataset, pick a target, monitor live phases, inspect reports</span>
   <span class="sub" style="margin-left:auto">{{ repo_root }}</span>
 </header>
 
 <main>
-  <!-- ─────────────────────────── left: inputs ─────────────────────────── -->
+  <!-- ─────────────────────────── left: guided workflow ─────────────────────────── -->
   <section>
     <div class="card">
       <h2>1 &middot; Data file</h2>
-      <div id="msg" class="msg"></div>
-      <div id="drop" class="drop">
+      <div id="uploadMsg" class="msg" role="status"></div>
+      <div id="msg" class="msg" role="status"></div>
+
+      <div class="row" style="margin-bottom:10px">
+        <select id="recentUploads" aria-label="Recent uploaded datasets" style="flex:1 1 220px">
+          <option value="">Recent uploads (loading&hellip;)</option>
+        </select>
+        <button type="button" id="loadRecentBtn" class="sm">Load selected</button>
+        <button type="button" id="refreshUploadsBtn" class="sm">Refresh</button>
+      </div>
+
+      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Upload dataset file">
         <strong>Drop a file here</strong> or click to browse<br>
         <span class="hint" style="margin:6px 0 0">{{ allowed | join(' &middot; ') | safe }}</span>
       </div>
       <input id="file" type="file" accept="{{ allowed | join(',') }}" hidden>
+
       <div id="fileinfo" style="display:none; margin-top:12px">
         <div class="row" style="justify-content:space-between">
           <strong id="fname"></strong>
           <span class="hint" id="fmeta" style="margin:0"></span>
         </div>
+        <div id="datasetSummaryPills" class="pill-row"></div>
         <div class="scroll-x" style="margin-top:8px; max-height:200px; overflow-y:auto">
           <table id="preview"></table>
         </div>
       </div>
     </div>
 
-    <div class="card">
-      <h2>Forecast <span class="hint" style="display:inline">&mdash; one button, aggregated to period totals</span></h2>
-      <div class="hint" style="margin-bottom:12px">
-        Collapses the file to one value per period, then projects it forward.
-        Use this for &ldquo;how much next month&rdquo; questions &mdash; the AutoML
-        pipeline below fits at row grain and cannot extrapolate.
+    <form id="form">
+      <div class="card">
+        <h2>2 &middot; Task &amp; Target</h2>
+        <div class="row" style="justify-content:space-between; margin-bottom:8px">
+          <div class="segmented" role="group" aria-label="Target goal mode">
+            <button type="button" id="goalPredictBtn" class="active">Predict &amp; Train (--predict)</button>
+            <button type="button" id="goalTrainBtn">Train Only (--target)</button>
+          </div>
+          <button type="button" id="suggestTargetBtn" class="sm">Suggest target</button>
+        </div>
+
+        <div class="field">
+          <label for="targetSearch">Search &amp; pick target column(s)</label>
+          <input type="text" id="targetSearch" placeholder="Search columns by name or dtype&hellip;">
+          <div id="targetPickerList" class="picker-list">
+            <div class="hint" style="padding:10px; margin:0">Upload or load a dataset to browse columns.</div>
+          </div>
+          <div id="predictHiddenNote" class="hint" style="margin:6px 0 0"></div>
+        </div>
+
+        <div id="predictSelectWrap" class="field">
+          <label for="f_predict">Predict target(s) <code class="inline">--predict</code></label>
+          <div class="hint">Train fresh model(s) and write full-dataset predictions.</div>
+          <select id="f_predict" name="predict" data-kind="columns" data-columns="1" multiple></select>
+          <div id="targetSuggestion" style="display:none; margin-top:8px"></div>
+        </div>
+
+        <div id="trainSelectWrap" class="field" style="display:none">
+          <label for="f_target">Train-only target(s) <code class="inline">--target</code></label>
+          <div class="hint">Train without writing predictions. Leave Predict empty when using Train Only.</div>
+          <select id="f_target" name="target" data-kind="columns" data-columns="1" multiple></select>
+          <div id="trainTargetSuggestion" style="display:none; margin-top:8px"></div>
+        </div>
+
+        <div class="grid-2">
+          <div class="field">
+            <label for="f_task">Task type <code class="inline">--task</code></label>
+            <select id="f_task" name="task" data-kind="choice">
+              <option value="auto" selected>auto</option>
+              <option value="classification">classification</option>
+              <option value="regression">regression</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f_datetime_col">Datetime column <code class="inline">--datetime-col</code></label>
+            <select id="f_datetime_col" name="datetime_col" data-kind="columns" data-columns="1">
+              <option value="">(none)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field" style="margin-bottom:0">
+          <label for="f_exclude">Exclude columns <code class="inline">--exclude</code></label>
+          <input type="text" id="excludeSearch" placeholder="Filter exclude list&hellip;" style="margin-bottom:6px">
+          <select id="f_exclude" name="exclude" data-kind="columns" data-columns="1" multiple></select>
+        </div>
       </div>
+
+      <div class="card">
+        <h2>3 &middot; Run Mode &amp; Options</h2>
+        <div class="field">
+          <label for="runMode">Pipeline Run Mode</label>
+          <select id="runMode">
+            <option value="standard" selected>Standard Autonomous (EDA + Risk + AutoML + Time Series)</option>
+            <option value="quick">Quick AutoML (--simple)</option>
+            <option value="benchmark">Autonomous + Benchmarks (--benchmark)</option>
+            <option value="decision">Decision Intelligence (--decision)</option>
+            <option value="modes">Other Built-in Modes (--timeseries / --policy / --v3 / --all)</option>
+          </select>
+          <div class="hint" id="runModeHint">Runs full EDA, Risk Analysis, AutoML, and Time Series on your dataset.</div>
+        </div>
+
+        <div class="check" style="display:none">
+          <input type="checkbox" id="f_simple" name="simple" data-kind="bool">
+          <label for="f_simple">Quick mode <code class="inline">--simple</code></label>
+        </div>
+        <div class="check" style="display:none">
+          <input type="checkbox" id="f_benchmark" name="benchmark" data-kind="bool">
+          <label for="f_benchmark">Run benchmarks <code class="inline">--benchmark</code></label>
+        </div>
+
+        <div id="modeSwitchesWrap" style="display:none; padding:10px; border:1px solid var(--line); border-radius:8px; margin-bottom:12px">
+          <div class="hint" style="margin-top:0">Built-in mode switches (select one):</div>
+          <div class="check">
+            <input type="checkbox" id="f_timeseries" name="timeseries" data-kind="bool">
+            <label for="f_timeseries">Time series mode <code class="inline">--timeseries</code></label>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="f_decision" name="decision" data-kind="bool">
+            <label for="f_decision">Decision intelligence <code class="inline">--decision</code></label>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="f_policy" name="policy" data-kind="bool">
+            <label for="f_policy">Policy learning (RLlib) <code class="inline">--policy</code></label>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="f_v3" name="v3" data-kind="bool">
+            <label for="f_v3">v3 innovations <code class="inline">--v3</code></label>
+          </div>
+          <div class="check" style="margin-bottom:0">
+            <input type="checkbox" id="f_all" name="all" data-kind="bool">
+            <label for="f_all">Run all built-in demos <code class="inline">--all</code></label>
+          </div>
+        </div>
+
+        <div id="decisionOptsWrap" style="display:none; padding:10px; border:1px solid var(--line); border-radius:8px; margin-bottom:12px">
+          <div class="grid-2">
+            <div class="field" style="margin-bottom:0">
+              <label for="f_treatment">Treatment column <code class="inline">--treatment</code></label>
+              <select id="f_treatment" name="treatment" data-kind="columns" data-columns="1">
+                <option value="">(none)</option>
+              </select>
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label for="f_budget">Budget constraint <code class="inline">--budget</code></label>
+              <input id="f_budget" name="budget" data-kind="float" type="number" step="any" min="0" value="">
+            </div>
+          </div>
+        </div>
+
+        <details id="advancedFlags">
+          <summary style="cursor:pointer; font-weight:600; color:var(--muted)">Advanced CLI Flags</summary>
+          <div style="margin-top:12px">
+            <div class="check">
+              <input type="checkbox" id="f_multi_output" name="multi_output" data-kind="bool">
+              <label for="f_multi_output">Multi-output model <code class="inline">--multi-output</code></label>
+            </div>
+            <div class="check">
+              <input type="checkbox" id="f_no_auto_exclude" name="no_auto_exclude" data-kind="bool">
+              <label for="f_no_auto_exclude">Disable auto-exclusion <code class="inline">--no-auto-exclude</code></label>
+            </div>
+            <div class="check">
+              <input type="checkbox" id="f_skip_benchmark" name="skip_benchmark" data-kind="bool" checked>
+              <label for="f_skip_benchmark">Skip benchmark phase <code class="inline">--skip-benchmark</code></label>
+            </div>
+            <div class="check">
+              <input type="checkbox" id="f_best_score" name="best_score" data-kind="bool">
+              <label for="f_best_score">Select by best CV score <code class="inline">--best-score</code></label>
+            </div>
+            <div class="check">
+              <input type="checkbox" id="f_force" name="force" data-kind="bool">
+              <label for="f_force">Fresh run <code class="inline">--force</code></label>
+            </div>
+            <div class="field">
+              <label for="f_horizon">Forecast horizon <code class="inline">--horizon</code></label>
+              <input id="f_horizon" name="horizon" data-kind="int" type="number" min="1" value="7">
+              <div id="horizonSuggestion" style="display:none; margin-top:8px"></div>
+            </div>
+            <div class="grid-2">
+              <div class="field">
+                <label for="f_time_budget">Time budget (seconds) <code class="inline">--time-budget</code></label>
+                <input id="f_time_budget" name="time_budget" data-kind="int" type="number" min="1" value="21600">
+              </div>
+              <div class="field">
+                <label for="f_datasets">Benchmark datasets <code class="inline">--datasets</code></label>
+                <input id="f_datasets" name="datasets" data-kind="text" type="text" value="">
+              </div>
+            </div>
+            <div class="field">
+              <label for="f_output">Benchmark output JSON <code class="inline">--output</code></label>
+              <input id="f_output" name="output" data-kind="text" type="text" value="">
+            </div>
+            <div class="check">
+              <input type="checkbox" id="f_autonomous" name="autonomous" data-kind="bool" checked disabled>
+              <label for="f_autonomous">Autonomous pipeline <code class="inline">--autonomous</code> <span class="noop">always active</span>
+                <div class="hint">Default fallback mode when no mode-switching flag is selected.</div>
+              </label>
+            </div>
+          </div>
+        </details>
+      </div>
+    </form>
+
+    <div class="card">
+      <h2>Ask in plain English <span class="hint" style="display:inline">(optional &mdash; fills in Task &amp; Target)</span></h2>
+      <div class="row" style="margin-bottom:10px">
+        <textarea id="nlPrompt" rows="2" style="flex:1 1 auto"
+          placeholder="e.g. predict churn from usage and tenure, or predict tip"></textarea>
+      </div>
+      <div class="row">
+        <button type="button" id="nlPlanBtn">Suggest plan</button>
+        <span class="hint" id="nlPlanStatus" style="margin:0"></span>
+      </div>
+      <div id="nlPlanOut" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Period Forecast <span class="hint" style="display:inline">&mdash; aggregates rows per period and projects forward</span></h2>
+      <div id="fcMsg" class="msg" role="status"></div>
       <div class="row" style="gap:12px; align-items:flex-end">
         <div style="flex:1 1 140px">
           <label for="fc_date">Period column</label>
@@ -162,78 +436,15 @@
       </div>
       <div id="fcOut" style="margin-top:14px"></div>
     </div>
-
-    <form id="form">
-      {% for group, flags in groups.items() %}
-      <div class="card">
-        <h2>{{ group }}</h2>
-        {% for flag in flags %}
-          {% if flag.kind == 'bool' %}
-            <div class="check">
-              <input type="checkbox" id="f_{{ flag.name }}" name="{{ flag.name }}"
-                     data-kind="bool" {% if flag.default %}checked{% endif %} {% if flag.dead %}disabled{% endif %}>
-              <label for="f_{{ flag.name }}">
-                {{ flag.label }} <code class="inline">{{ flag.cli }}</code>
-                {% if flag.dead %}<span class="noop">no-op</span>{% endif %}
-                <div class="hint">{{ flag.help }}</div>
-              </label>
-            </div>
-          {% elif flag.kind == 'columns' %}
-            <div class="field">
-              <label for="f_{{ flag.name }}">{{ flag.label }} <code class="inline">{{ flag.cli }}</code>
-                {% if flag.dead %}<span class="noop">no-op</span>{% endif %}</label>
-              <div class="hint">{{ flag.help }}</div>
-              <select id="f_{{ flag.name }}" name="{{ flag.name }}" data-kind="columns" data-columns="1"
-                      {% if flag.name in ('predict', 'target', 'exclude') %}multiple{% endif %}
-                      {% if flag.dead %}disabled{% endif %}>
-                {% if flag.name not in ('predict', 'target', 'exclude') %}<option value="">(none)</option>{% endif %}
-              </select>
-              {% if flag.name == 'predict' %}
-              <div id="predictHiddenNote" class="hint" style="margin:4px 0 0"></div>
-              <div id="targetSuggestion" style="display:none; margin-top:8px"></div>
-              {% elif flag.name == 'target' %}
-              <div id="trainTargetSuggestion" style="display:none; margin-top:8px"></div>
-              {% endif %}
-            </div>
-          {% elif flag.kind == 'choice' %}
-            <div class="field">
-              <label for="f_{{ flag.name }}">{{ flag.label }} <code class="inline">{{ flag.cli }}</code>
-                {% if flag.dead %}<span class="noop">no-op</span>{% endif %}</label>
-              <div class="hint">{{ flag.help }}</div>
-              <select id="f_{{ flag.name }}" name="{{ flag.name }}" data-kind="choice" {% if flag.dead %}disabled{% endif %}>
-                {% for choice in flag.choices %}
-                <option value="{{ choice }}" {% if choice == flag.default %}selected{% endif %}>{{ choice }}</option>
-                {% endfor %}
-              </select>
-            </div>
-          {% else %}
-            <div class="field">
-              <label for="f_{{ flag.name }}">{{ flag.label }} <code class="inline">{{ flag.cli }}</code>
-                {% if flag.dead %}<span class="noop">no-op</span>{% endif %}</label>
-              <div class="hint">{{ flag.help }}</div>
-              <input id="f_{{ flag.name }}" name="{{ flag.name }}"
-                     data-kind="{{ flag.kind }}"
-                     type="{{ 'number' if flag.kind in ('int', 'float') else 'text' }}"
-                     {% if flag.kind == 'float' %}step="any"{% endif %}
-                     {% if flag.dead %}disabled{% endif %}
-                     value="{{ '' if flag.default is none else flag.default }}">
-              {% if flag.name == 'horizon' %}
-              <div id="horizonSuggestion" style="display:none; margin-top:8px"></div>
-              {% endif %}
-            </div>
-          {% endif %}
-        {% endfor %}
-      </div>
-      {% endfor %}
-    </form>
   </section>
 
-  <!-- ─────────────────────────── right: run ─────────────────────────── -->
+  <!-- ─────────────────────────── right: run & inspector ─────────────────────────── -->
   <section>
     <div class="card">
-      <h2>2 &middot; Command</h2>
+      <h2>Command &amp; Run</h2>
       <pre class="cmd" id="cmd">python run_acdso.py</pre>
-      <div id="colCheck"></div>
+      <div id="colCheck" style="margin-top:10px"></div>
+      <div id="runMsg" class="msg" role="status" style="margin-top:10px"></div>
       <div class="row" style="margin-top:12px">
         <button class="primary" id="runBtn" type="button">Run pipeline</button>
         <button class="danger" id="stopBtn" type="button" disabled>Stop</button>
@@ -243,26 +454,67 @@
     </div>
 
     <div class="card">
-      <h2>3 &middot; Live output</h2>
+      <h2>Live Output &amp; Progress</h2>
+      <div id="pipelineStepper" class="stepper">
+        <span class="step" data-step="0" data-match="data loading">1. Data Loading</span>
+        <span class="step" data-step="1" data-match="auto eda">2. Auto EDA</span>
+        <span class="step" data-step="2" data-match="risk analysis">3. Risk Analysis</span>
+        <span class="step" data-step="3" data-match="automl,train,feature preparation,multi-output">4. AutoML</span>
+        <span class="step" data-step="4" data-match="time series">5. Time Series</span>
+        <span class="step" data-step="5" data-match="decision,benchmark,policy,v3">6. Decision / Bench</span>
+        <span class="step" data-step="6" data-match="report,export,predictions">7. Report</span>
+      </div>
+      <div id="progressWrap" class="progress-wrap">
+        <div class="row" style="justify-content:space-between; margin-bottom:4px">
+          <span class="hint" id="progressLabel" style="margin:0">Starting&hellip;</span>
+          <span class="hint" id="progressPct" style="margin:0">0%</span>
+        </div>
+        <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+      </div>
       <pre class="log" id="log">Nothing running yet.</pre>
-      <div class="row" style="margin-top:10px">
-        <label class="row" style="font-weight:400; gap:6px; margin:0">
-          <input type="checkbox" id="autoscroll" checked> follow output
-        </label>
+      <div class="row" style="margin-top:10px; justify-content:space-between">
+        <div class="row">
+          <label class="row" style="font-weight:400; gap:6px; margin:0">
+            <input type="checkbox" id="autoscroll" checked> follow output
+          </label>
+          <button type="button" id="jumpLatestBtn" class="sm">Jump to latest</button>
+          <button type="button" id="clearLogBtn" class="sm">Clear view</button>
+        </div>
         <span class="hint" id="logfile" style="margin:0"></span>
+      </div>
+      <div class="hint" id="logCapNotice" style="margin-top:6px; display:none"></div>
+    </div>
+
+    <div class="card" id="reportInspector">
+      <div class="row" style="justify-content:space-between; margin-bottom:8px">
+        <h2 style="margin:0">Results &amp; Report Inspector</h2>
+        <span class="hint" id="inspectorFile" style="margin:0"></span>
+      </div>
+      <div id="inspectorMsg" class="msg" role="status"></div>
+      <div class="tabs" role="tablist" aria-label="Report inspection views">
+        <button type="button" class="tab-btn" role="tab" data-tab="overview" aria-selected="true">Overview &amp; KPIs</button>
+        <button type="button" class="tab-btn" role="tab" data-tab="models" aria-selected="false">Models &amp; Pareto</button>
+        <button type="button" class="tab-btn" role="tab" data-tab="risk" aria-selected="false">Risk &amp; Warnings</button>
+        <button type="button" class="tab-btn" role="tab" data-tab="eda" aria-selected="false">EDA Summary</button>
+        <button type="button" class="tab-btn" role="tab" data-tab="predictions" aria-selected="false">Predictions Preview</button>
+      </div>
+      <div id="inspectorBody" class="hint" style="margin:0">
+        Select <strong>Inspect</strong> on any JSON or CSV report below, or finish a run to inspect its output automatically.
       </div>
     </div>
 
     <div class="card">
-      <h2>4 &middot; Artifacts <span class="hint" style="display:inline">(files in reports/ written by this run)</span></h2>
+      <h2>Artifacts <span class="hint" style="display:inline">(files in reports/ written by this run)</span></h2>
       <div id="artifacts" class="hint" style="margin:0">None yet.</div>
     </div>
 
     <div class="card">
-      <h2>5 &middot; Report History <span class="hint" style="display:inline">(everything ever written to reports/)</span></h2>
+      <h2>Report History <span class="hint" style="display:inline">(everything in reports/)</span></h2>
+      <div id="reportMsg" class="msg" role="status"></div>
       <div class="row" style="margin-bottom:10px">
         <input type="text" id="reportFilter" placeholder="Filter by filename&hellip;" style="flex:1 1 auto">
-        <button type="button" id="reportRefresh">Refresh</button>
+        <button type="button" id="reportRefresh" class="sm">Refresh</button>
+        <button type="button" id="reportDeleteAll" class="sm danger">Delete all</button>
       </div>
       <div id="reportHistory" class="hint" style="margin:0">Loading&hellip;</div>
     </div>
@@ -271,22 +523,75 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { uploadId: null, columns: [], jobId: null, cursor: 0, poll: null, columnsBlocked: false };
+const MAX_CLIENT_LOG_LINES = 2000;
+const FLAG_META = {{ flag_meta | safe }};
 
-function flash(text, kind) {
-  const el = $('msg');
-  el.textContent = text;
-  el.className = text ? 'msg ' + (kind || 'err') : 'msg';
-}
+const state = {
+  uploadId: null,
+  columns: [],
+  dtypes: {},
+  columnStats: [],
+  predictableSet: new Set(),
+  goalMode: 'predict', // 'predict' | 'train'
+  jobId: null,
+  cursor: 0,
+  poll: null,
+  pollFailures: 0,
+  columnsBlocked: false,
+  logLines: [],
+  inspectorData: null,
+  inspectorTab: 'overview',
+  autoInspectedJob: null,
+};
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-/* ── upload ─────────────────────────────────────────────────────────── */
-const drop = $('drop'), fileInput = $('file');
+function flash(text, kind, targetId = 'uploadMsg') {
+  const el = $(targetId);
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = text ? 'msg ' + (kind || 'err') : 'msg';
+}
+
+async function safeFetchJson(url, opts) {
+  try {
+    const res = await fetch(url, opts);
+    const text = await res.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (_err) {
+        return { ok: false, status: res.status, data: null, error: text.slice(0, 200) };
+      }
+    }
+    if (!res.ok) {
+      return { ok: false, status: res.status, data, error: (data && data.error) || ('HTTP ' + res.status) };
+    }
+    return { ok: true, status: res.status, data, error: null };
+  } catch (err) {
+    return { ok: false, status: 0, data: null, error: String(err) };
+  }
+}
+
+function fmtSize(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+/* ── uploads & recent uploads ──────────────────────────────────────── */
+const drop = $('drop');
+const fileInput = $('file');
+
 drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+});
 drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
 drop.addEventListener('dragleave', () => drop.classList.remove('over'));
 drop.addEventListener('drop', (e) => {
@@ -298,61 +603,260 @@ fileInput.addEventListener('change', () => {
   if (fileInput.files.length) sendFile(fileInput.files[0]);
 });
 
-async function sendFile(file) {
-  flash('Uploading and reading ' + file.name + '…', 'ok');
-  const body = new FormData();
-  body.append('file', file);
-  let res, data;
-  try {
-    res = await fetch('/api/upload', { method: 'POST', body });
-    data = await res.json();
-  } catch (err) {
-    flash('Upload failed: ' + err, 'err');
-    return;
-  }
-  if (!res.ok) { flash(data.error || 'Upload failed', 'err'); return; }
-
+function applyLoadedUpload(data) {
   state.uploadId = data.upload_id;
-  state.columns = data.columns;
-  $('fname').textContent = data.filename;
+  state.columns = data.columns || [];
+  state.dtypes = data.dtypes || {};
+  state.columnStats = data.column_stats || [];
+  state.predictableSet = new Set(data.predictable_columns || state.columns);
+  state.columnsBlocked = false;
+
+  clearTimeout(columnCheckTimer);
+  clearTimeout(horizonCheckTimer);
+  $('colCheck').innerHTML = '';
+  $('horizonSuggestion').innerHTML = '';
+  $('horizonSuggestion').style.display = 'none';
+  $('nlPlanOut').innerHTML = '';
+  $('nlPlanStatus').textContent = '';
+  $('fcOut').innerHTML = '';
+  flash('', 'err', 'runMsg');
+  flash('', 'err', 'fcMsg');
+
+  $('fname').textContent = data.filename || data.stored_as;
   $('fmeta').textContent =
-    data.columns.length + ' columns' + (data.rows != null ? ' · ' + data.rows + ' rows' : '');
-  renderPreview(data.columns, data.preview, data.dtypes);
+    state.columns.length + ' columns' +
+    (data.rows != null ? ' · ' + Number(data.rows).toLocaleString() + ' rows' : '') +
+    (data.size_bytes ? ' · ' + fmtSize(data.size_bytes) : '');
+
+  renderDatasetSummaryPills(state.columnStats, data.rows);
+  renderPreview(state.columns, data.preview || [], state.dtypes);
   $('fileinfo').style.display = 'block';
-  fillColumnSelects(data.columns);
-  restrictPredictTargetOptions(data.predictable_columns || data.columns, data.columns);
-  preselectForecastColumns(data.columns, data.dtypes);
-  flash('Loaded ' + data.filename + '. Pick a target below.', 'ok');
+
+  fillColumnSelects(state.columns);
+  restrictPredictTargetOptions(data.predictable_columns || state.columns, state.columns);
+  renderTargetPicker();
+  preselectForecastColumns(state.columns, state.dtypes);
   refreshCommand();
+  checkColumns();
   loadTargetSuggestion();
 }
 
+function renderDatasetSummaryPills(stats, rows) {
+  const box = $('datasetSummaryPills');
+  if (!stats || !stats.length) { box.innerHTML = ''; return; }
+  const numCols = stats.filter((s) => s.role_hint === 'numeric').length;
+  const catCols = stats.filter((s) => s.role_hint === 'categorical').length;
+  const dtCols = stats.filter((s) => s.role_hint === 'datetime').length;
+  const withNulls = stats.filter((s) => s.null_count > 0).length;
+  box.innerHTML = [
+    rows != null ? '<span class="pill">' + Number(rows).toLocaleString() + ' rows</span>' : '',
+    '<span class="pill">' + stats.length + ' cols</span>',
+    '<span class="pill">' + numCols + ' numeric</span>',
+    '<span class="pill">' + catCols + ' categorical</span>',
+    dtCols ? '<span class="pill">' + dtCols + ' datetime</span>' : '',
+    '<span class="pill">' + withNulls + ' cols with nulls</span>',
+  ].filter(Boolean).join('');
+}
+
+async function sendFile(file) {
+  flash('Uploading and profiling ' + file.name + '…', 'ok', 'uploadMsg');
+  drop.classList.add('busy');
+  $('recentUploads').disabled = true;
+  try {
+    const body = new FormData();
+    body.append('file', file);
+    const r = await safeFetchJson('/api/upload', { method: 'POST', body });
+    if (!r.ok) {
+      flash(r.error || 'Upload failed', 'err', 'uploadMsg');
+      return;
+    }
+    applyLoadedUpload(r.data);
+    flash('Loaded ' + r.data.filename + '. Pick a target below.', 'ok', 'uploadMsg');
+    loadRecentUploads(r.data.upload_id);
+  } finally {
+    drop.classList.remove('busy');
+    $('recentUploads').disabled = false;
+    fileInput.value = '';
+  }
+}
+
+async function loadRecentUploads(selectedId) {
+  const sel = $('recentUploads');
+  const r = await safeFetchJson('/api/uploads');
+  if (!r.ok) {
+    sel.innerHTML = '<option value="">Could not list uploads</option>';
+    return;
+  }
+  const list = (r.data && r.data.uploads) || [];
+  if (!list.length) {
+    sel.innerHTML = '<option value="">No uploaded datasets yet</option>';
+    return;
+  }
+  sel.innerHTML = list.map((u) => {
+    const info = u.rows != null
+      ? Number(u.rows).toLocaleString() + ' rows, ' + (u.columns ? u.columns.length : '?') + ' cols'
+      : fmtSize(u.size_bytes);
+    return '<option value="' + esc(u.upload_id) + '">' + esc(u.filename) + ' (' + esc(info) + ')</option>';
+  }).join('');
+  if (selectedId) sel.value = selectedId;
+  else if (state.uploadId) sel.value = state.uploadId;
+}
+
+async function loadUploadById(uid) {
+  if (!uid) return;
+  flash('Loading saved upload…', 'ok', 'uploadMsg');
+  $('loadRecentBtn').disabled = true;
+  try {
+    const r = await safeFetchJson('/api/uploads/' + encodeURIComponent(uid));
+    if (!r.ok) {
+      flash(r.error || 'Could not load upload', 'err', 'uploadMsg');
+      return;
+    }
+    applyLoadedUpload(r.data);
+    flash('Loaded ' + r.data.filename + '.', 'ok', 'uploadMsg');
+  } finally {
+    $('loadRecentBtn').disabled = false;
+  }
+}
+
+$('loadRecentBtn').addEventListener('click', () => loadUploadById($('recentUploads').value));
+$('refreshUploadsBtn').addEventListener('click', () => loadRecentUploads());
+
+/* ── target goal toggle & searchable picker ────────────────────────── */
+function setGoalMode(mode) {
+  state.goalMode = mode;
+  const isPredict = mode === 'predict';
+  $('goalPredictBtn').classList.toggle('active', isPredict);
+  $('goalTrainBtn').classList.toggle('active', !isPredict);
+  $('predictSelectWrap').style.display = isPredict ? 'block' : 'none';
+  $('trainSelectWrap').style.display = isPredict ? 'none' : 'block';
+  if (isPredict) {
+    Array.from($('f_target').options).forEach((o) => { o.selected = false; });
+  } else {
+    Array.from($('f_predict').options).forEach((o) => { o.selected = false; });
+  }
+  renderTargetPicker();
+  refreshCommand();
+  checkColumns();
+}
+
+$('goalPredictBtn').addEventListener('click', () => setGoalMode('predict'));
+$('goalTrainBtn').addEventListener('click', () => setGoalMode('train'));
+
+function activeTargetSelectId() {
+  return state.goalMode === 'predict' ? 'f_predict' : 'f_target';
+}
+
+function renderTargetPicker() {
+  const listEl = $('targetPickerList');
+  if (!state.columns.length) {
+    listEl.innerHTML = '<div class="hint" style="padding:10px; margin:0">Upload or load a dataset to browse columns.</div>';
+    return;
+  }
+  const term = ($('targetSearch').value || '').trim().toLowerCase();
+  const sel = $(activeTargetSelectId());
+  const selectedVals = new Set(Array.from(sel.selectedOptions).map((o) => o.value));
+  const statsByName = new Map(state.columnStats.map((s) => [s.name, s]));
+
+  const rows = state.columns.filter((col) => {
+    if (!term) return true;
+    const st = statsByName.get(col);
+    const dt = (st ? st.dtype : (state.dtypes[col] || '')).toLowerCase();
+    return col.toLowerCase().includes(term) || dt.includes(term);
+  });
+
+  if (!rows.length) {
+    listEl.innerHTML = '<div class="hint" style="padding:10px; margin:0">No columns match "' + esc(term) + '".</div>';
+    return;
+  }
+
+  listEl.innerHTML = rows.map((col) => {
+    const st = statsByName.get(col) || {
+      name: col, dtype: state.dtypes[col] || '', nunique: null, null_pct: null,
+      role_hint: 'categorical', predictable: state.predictableSet.has(col), exclude_reason: null,
+    };
+    const isPred = st.predictable !== false && state.predictableSet.has(col);
+    const isSel = selectedVals.has(col);
+    const roleClass = st.role_hint === 'numeric' ? 'badge-num'
+      : st.role_hint === 'datetime' ? 'badge-date'
+      : (st.role_hint === 'id' || st.role_hint === 'constant') ? 'badge-id' : 'badge-cat';
+    const metaBadges = [
+      st.dtype ? '<span class="badge ' + roleClass + '">' + esc(st.dtype) + '</span>' : '',
+      st.nunique != null ? '<span class="badge">' + st.nunique + ' uniq</span>' : '',
+      st.null_pct != null && st.null_pct > 0 ? '<span class="badge">' + st.null_pct + '% null</span>' : '',
+      !isPred && st.role_hint ? '<span class="badge badge-id">' + esc(st.role_hint) + '</span>' : '',
+    ].filter(Boolean).join(' ');
+
+    return '<div class="picker-item' + (isSel ? ' selected' : '') + (!isPred ? ' disabled' : '') + '" ' +
+      'data-col="' + esc(col) + '" data-pred="' + (isPred ? '1' : '0') + '" ' +
+      (st.exclude_reason ? 'title="' + esc(st.exclude_reason) + '"' : '') + '>' +
+      '<span><strong>' + esc(col) + '</strong>' +
+      (!isPred && st.exclude_reason ? ' <span class="hint" style="margin:0">(' + esc(st.exclude_reason) + ')</span>' : '') +
+      '</span><span class="row" style="gap:4px">' + metaBadges + '</span></div>';
+  }).join('');
+
+  listEl.querySelectorAll('.picker-item').forEach((row) => {
+    row.addEventListener('click', () => {
+      if (row.dataset.pred !== '1') return;
+      const col = row.dataset.col;
+      const targetSel = $(activeTargetSelectId());
+      Array.from(targetSel.options).forEach((o) => {
+        if (o.value === col) o.selected = !o.selected;
+      });
+      targetSel.dispatchEvent(new Event('change', { bubbles: true }));
+      renderTargetPicker();
+    });
+  });
+}
+
+$('targetSearch').addEventListener('input', renderTargetPicker);
+$('f_predict').addEventListener('change', renderTargetPicker);
+$('f_target').addEventListener('change', renderTargetPicker);
+
+$('excludeSearch').addEventListener('input', () => {
+  const term = ($('excludeSearch').value || '').trim().toLowerCase();
+  Array.from($('f_exclude').options).forEach((opt) => {
+    opt.hidden = Boolean(term) && !opt.value.toLowerCase().includes(term);
+  });
+});
+
+/* ── target suggestion ─────────────────────────────────────────────── */
 async function loadTargetSuggestion() {
   const predictBox = $('targetSuggestion');
   const trainBox = $('trainTargetSuggestion');
-  predictBox.style.display = 'none';
-  trainBox.style.display = 'none';
+  const btn = $('suggestTargetBtn');
   if (!state.uploadId) return;
-  let data;
+  btn.disabled = true;
+  btn.textContent = 'Analyzing targets…';
   try {
-    const res = await fetch('/api/suggest-target', {
+    const r = await safeFetchJson('/api/suggest-target', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ upload_id: state.uploadId }),
     });
-    data = await res.json();
-    if (!res.ok || !data.suggestions || !data.suggestions.length) return;
-  } catch (err) {
-    return; // best-effort suggestion; failing silently is fine, selection still works manually
+    if (!r.ok) {
+      const box = state.goalMode === 'predict' ? predictBox : trainBox;
+      box.style.display = 'block';
+      box.innerHTML = '<div class="msg warn" style="display:block">Could not auto-suggest targets: ' + esc(r.error) + '</div>';
+      return;
+    }
+    const suggestions = (r.data && r.data.suggestions) || [];
+    if (!suggestions.length) {
+      const box = state.goalMode === 'predict' ? predictBox : trainBox;
+      box.style.display = 'block';
+      box.innerHTML = '<div class="msg warn" style="display:block">No predictable target columns were detected automatically. Check the excluded reasons above.</div>';
+      return;
+    }
+    renderSuggestionBox(predictBox, r.data, 'f_predict');
+    renderSuggestionBox(trainBox, r.data, 'f_target');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Suggest target';
   }
-  renderSuggestionBox(predictBox, data, 'f_predict');
-  renderSuggestionBox(trainBox, data, 'f_target');
 }
 
-/* Each suggestion gets its own "Use this", which ADDS that column to the
-   (multi-select) field rather than replacing the selection -- more than
-   one column can be a reasonable target, and a multi-target run can use
-   several at once, so clicking two suggestions should combine them. */
+$('suggestTargetBtn').addEventListener('click', loadTargetSuggestion);
+
 function fmtVotes(votes) {
   if (!votes) return '';
   const parts = [];
@@ -364,13 +868,13 @@ function fmtVotes(votes) {
 
 function renderSuggestionBox(box, data, targetFieldId) {
   const sourceNote = data.source === 'llm'
-    ? 'LLM verdict, weighing the votes below against its own judgment'
-    : 'no LLM configured -- votes combined mechanically';
+    ? 'LLM verdict, weighing votes against column semantics'
+    : 'rules + fast CV learnability';
   box.style.display = 'block';
   box.innerHTML = data.suggestions.map((s, i) =>
     '<div class="msg ok" style="display:block; margin-bottom:6px">' +
     '<strong>Suggested target: ' + esc(s.column) + '</strong> ' +
-    '<button type="button" class="use-suggestion" data-col="' + esc(s.column) + '" style="margin-left:8px">Use this</button>' +
+    '<button type="button" class="sm use-suggestion" data-col="' + esc(s.column) + '" style="margin-left:8px">Use this</button>' +
     '<div class="hint" style="margin:4px 0 0">' + esc(s.reason) + esc(fmtVotes(s.votes)) +
     (i === 0 ? ' (' + sourceNote + ')' : '') + '</div></div>'
   ).join('');
@@ -380,6 +884,7 @@ function renderSuggestionBox(box, data, targetFieldId) {
       const col = btn.dataset.col;
       Array.from(sel.options).forEach((o) => { if (o.value === col) o.selected = true; });
       sel.dispatchEvent(new Event('change', { bubbles: true }));
+      renderTargetPicker();
     });
   });
 }
@@ -389,7 +894,7 @@ function renderPreview(columns, rows, dtypes) {
     (c) => '<th>' + esc(c) + '<br><span class="hint" style="margin:0">' + esc(dtypes[c] || '') + '</span></th>'
   ).join('') + '</tr>';
   const body = rows.map(
-    (r) => '<tr>' + columns.map((c) => '<td>' + esc(r[c] === null ? '' : String(r[c])) + '</td>').join('') + '</tr>'
+    (r) => '<tr>' + columns.map((c) => '<td>' + esc(r[c] === null || r[c] === undefined ? '' : String(r[c])) + '</td>').join('') + '</tr>'
   ).join('');
   $('preview').innerHTML = head + body;
 }
@@ -402,9 +907,6 @@ function fillColumnSelects(columns) {
   });
 }
 
-/* Predict/Target only ever offer columns that could plausibly be
-   predicted -- not a date/period column, not a raw identifier -- rather
-   than listing every column and rejecting the bad ones after the fact. */
 function restrictPredictTargetOptions(predictable, allColumns) {
   const blockedCount = allColumns.length - predictable.length;
   ['f_predict', 'f_target'].forEach((id) => {
@@ -412,21 +914,54 @@ function restrictPredictTargetOptions(predictable, allColumns) {
     if (!sel) return;
     sel.innerHTML = predictable.map((c) => '<option value="' + esc(c) + '">' + esc(c) + '</option>').join('');
   });
-  const note = document.getElementById('predictHiddenNote');
+  const note = $('predictHiddenNote');
   if (note) {
     note.textContent = blockedCount > 0
-      ? blockedCount + ' column(s) hidden here (date/period or identifier-like -- not predictable).'
+      ? blockedCount + ' column(s) marked non-predictable (date/period, constant, ID, or high-cardinality categorical).'
       : '';
   }
 }
 
-/* ── forecast ───────────────────────────────────────────────────────── */
-/* Guess the period and value columns so the button works on first click. */
+/* ── run mode syncing ──────────────────────────────────────────────── */
+const MODE_HINTS = {
+  standard: 'Runs full EDA, Risk Analysis, AutoML, and Time Series on your dataset.',
+  quick: 'Fast EDA + AutoML (--simple). Skips Time Series and benchmark comparisons.',
+  benchmark: 'Compares ACDSO against external AutoML benchmarks (--benchmark).',
+  decision: 'Runs causal uplift & action optimization (--decision) with optional treatment & budget.',
+  modes: 'Select a specialized built-in mode below.',
+};
+
+function syncDecisionOptsVisibility() {
+  $('decisionOptsWrap').style.display = $('f_decision').checked ? 'block' : 'none';
+}
+
+$('runMode').addEventListener('change', () => {
+  const m = $('runMode').value;
+  $('runModeHint').textContent = MODE_HINTS[m] || '';
+  $('modeSwitchesWrap').style.display = m === 'modes' ? 'block' : 'none';
+
+  $('f_simple').checked = (m === 'quick');
+  $('f_benchmark').checked = (m === 'benchmark');
+  $('f_skip_benchmark').checked = (m !== 'benchmark');
+  $('f_decision').checked = (m === 'decision');
+  if (m !== 'modes') {
+    $('f_timeseries').checked = false;
+    $('f_policy').checked = false;
+    $('f_v3').checked = false;
+    $('f_all').checked = false;
+  }
+  syncDecisionOptsVisibility();
+  refreshCommand();
+});
+
+$('f_decision').addEventListener('change', () => {
+  syncDecisionOptsVisibility();
+  refreshCommand();
+});
+
+/* ── forecast + SVG chart ──────────────────────────────────────────── */
 function preselectForecastColumns(columns, dtypes) {
   const isNumeric = (c) => /int|float/i.test(dtypes[c] || '');
-  // A period column is never the numeric measurement itself -- exclude
-  // numeric columns up front so a name like "Total Data Transfer (B)"
-  // can never win the date slot.
   const dateCandidates = columns.filter((c) => !isNumeric(c));
   const dateGuess = dateCandidates.find((c) => /^(date|month|period|day|time|timestamp)$/i.test(c))
     || dateCandidates.find((c) => /date|month|period|time/i.test(c));
@@ -438,52 +973,106 @@ function preselectForecastColumns(columns, dtypes) {
 }
 
 function fmtValue(n, col) {
-  // Byte-valued columns are unreadable in raw units; show GB alongside.
+  if (n == null || Number.isNaN(Number(n))) return '-';
+  const num = Number(n);
   if (/\(B\)|bytes?\b/i.test(col || '')) {
-    return (n / 1e9).toLocaleString(undefined, { maximumFractionDigits: 1 }) + ' GB';
+    return (num / 1e9).toLocaleString(undefined, { maximumFractionDigits: 1 }) + ' GB';
   }
-  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return n.toFixed(2);
+  if (Math.abs(num) >= 1e9) return (num / 1e9).toFixed(2) + 'B';
+  if (Math.abs(num) >= 1e6) return (num / 1e6).toFixed(2) + 'M';
+  if (Math.abs(num) >= 1e3) return (num / 1e3).toFixed(1) + 'K';
+  return num.toFixed(2);
+}
+
+function renderForecastChart(d) {
+  const hist = d.history || [];
+  const fc = d.forecast || [];
+  const all = hist.concat(fc);
+  if (all.length < 2) return '';
+
+  const W = 640, H = 190, padL = 62, padR = 16, padT = 16, padB = 28;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const vals = all.map((p) => Number(p.value));
+  let minV = Math.min(...vals);
+  let maxV = Math.max(...vals);
+  if (maxV === minV) { maxV = minV + 1; minV = Math.max(0, minV - 1); }
+
+  const xAt = (i) => padL + (i / Math.max(all.length - 1, 1)) * plotW;
+  const yAt = (v) => padT + (1 - (v - minV) / (maxV - minV)) * plotH;
+
+  const histPts = hist.map((p, i) => xAt(i).toFixed(1) + ',' + yAt(p.value).toFixed(1)).join(' ');
+  const fcStart = Math.max(hist.length - 1, 0);
+  const fcSeries = (hist.length ? [hist[hist.length - 1]] : []).concat(fc);
+  const fcPts = fcSeries.map((p, i) => xAt(fcStart + i).toFixed(1) + ',' + yAt(p.value).toFixed(1)).join(' ');
+  const splitX = xAt(fcStart).toFixed(1);
+
+  const circles = all.map((p, i) => {
+    const isFc = i >= hist.length;
+    const color = isFc ? '#4fd18b' : '#5b9dff';
+    return '<circle cx="' + xAt(i).toFixed(1) + '" cy="' + yAt(p.value).toFixed(1) + '" r="3.5" fill="' + color + '">' +
+      '<title>' + esc(p.period) + ': ' + esc(fmtValue(p.value, d.value_col)) + (isFc ? ' (forecast)' : ' (actual)') + '</title></circle>';
+  }).join('');
+
+  const midV = (minV + maxV) / 2;
+  const splitLabel = hist.length ? hist[hist.length - 1].period : '';
+  return '<div class="chart-wrap" style="margin:10px 0">' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="History and forecast chart">' +
+    '<rect x="' + splitX + '" y="' + padT + '" width="' + Math.max(0, W - padR - Number(splitX)).toFixed(1) + '" height="' + plotH + '" fill="rgba(79,209,139,0.08)" />' +
+    '<line x1="' + padL + '" y1="' + padT + '" x2="' + (W - padR) + '" y2="' + padT + '" stroke="#2a2f3a" stroke-dasharray="3,3" />' +
+    '<line x1="' + padL + '" y1="' + (padT + plotH / 2).toFixed(1) + '" x2="' + (W - padR) + '" y2="' + (padT + plotH / 2).toFixed(1) + '" stroke="#2a2f3a" stroke-dasharray="3,3" />' +
+    '<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (W - padR) + '" y2="' + (padT + plotH) + '" stroke="#2a2f3a" />' +
+    '<text x="' + (padL - 6) + '" y="' + (padT + 4) + '" fill="#98a1b3" font-size="10" text-anchor="end">' + esc(fmtValue(maxV, d.value_col)) + '</text>' +
+    '<text x="' + (padL - 6) + '" y="' + (padT + plotH / 2 + 4).toFixed(1) + '" fill="#98a1b3" font-size="10" text-anchor="end">' + esc(fmtValue(midV, d.value_col)) + '</text>' +
+    '<text x="' + (padL - 6) + '" y="' + (padT + plotH + 4) + '" fill="#98a1b3" font-size="10" text-anchor="end">' + esc(fmtValue(minV, d.value_col)) + '</text>' +
+    '<text x="' + padL + '" y="' + (H - 8) + '" fill="#98a1b3" font-size="10">' + esc(all[0].period) + '</text>' +
+    (splitLabel ? '<text x="' + splitX + '" y="' + (H - 8) + '" fill="#98a1b3" font-size="10" text-anchor="middle">' + esc(splitLabel) + '</text>' : '') +
+    '<text x="' + (W - padR) + '" y="' + (H - 8) + '" fill="#4fd18b" font-size="10" text-anchor="end">' + esc(all[all.length - 1].period) + '</text>' +
+    (hist.length > 1 ? '<polyline fill="none" stroke="#5b9dff" stroke-width="2" points="' + histPts + '" />' : '') +
+    (fcSeries.length > 1 ? '<polyline fill="none" stroke="#4fd18b" stroke-width="2" stroke-dasharray="5,4" points="' + fcPts + '" />' : '') +
+    circles + '</svg></div>';
 }
 
 $('fcBtn').addEventListener('click', async () => {
-  if (!state.uploadId) { flash('Upload a file first.', 'err'); return; }
+  flash('', 'err', 'fcMsg');
+  if (!state.uploadId) { flash('Upload or load a dataset first.', 'err', 'fcMsg'); return; }
+  const rawH = $('fc_horizon').value;
+  const hNum = Number(rawH);
+  if (!rawH || !Number.isInteger(hNum) || hNum < 1 || hNum > 36) {
+    flash('Forecast periods must be a whole number between 1 and 36.', 'err', 'fcMsg');
+    return;
+  }
   const body = {
     upload_id: state.uploadId,
     date_col: $('fc_date').value,
     value_col: $('fc_value').value,
     agg: $('fc_agg').value,
-    horizon: Number($('fc_horizon').value),
+    horizon: hNum,
     drop_first: $('fc_drop_first').checked,
     drop_last: $('fc_drop_last').checked,
   };
   if (!body.date_col || !body.value_col) {
-    flash('Pick a period column and a value column.', 'err');
+    flash('Pick both a period column and a value column.', 'err', 'fcMsg');
     return;
   }
   $('fcBtn').disabled = true;
   $('fcStatus').textContent = 'aggregating and forecasting…';
-  let res, data;
   try {
-    res = await fetch('/api/forecast', {
+    const r = await safeFetchJson('/api/forecast', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    data = await res.json();
-  } catch (err) {
-    $('fcStatus').textContent = '';
+    if (!r.ok) {
+      flash(r.error || 'Forecast failed', 'err', 'fcMsg');
+      $('fcOut').innerHTML = '';
+      return;
+    }
+    renderForecast(r.data);
+  } finally {
     $('fcBtn').disabled = false;
-    flash('Forecast failed: ' + err, 'err');
-    return;
+    $('fcStatus').textContent = '';
   }
-  $('fcBtn').disabled = false;
-  $('fcStatus').textContent = '';
-  if (!res.ok) { flash(data.error || 'Forecast failed', 'err'); $('fcOut').innerHTML = ''; return; }
-  flash('');
-  renderForecast(data);
 });
 
 function renderForecast(d) {
@@ -516,33 +1105,41 @@ function renderForecast(d) {
     '</div>' +
     '<div class="hint">' + agg.rows_used.toLocaleString() + ' of ' +
       agg.rows_in.toLocaleString() + ' rows aggregated by ' + esc(agg.agg) +
-      (agg.dropped_periods.length ? ' &middot; dropped ' + agg.dropped_periods.join(', ') : '') +
+      (agg.dropped_periods.length ? ' &middot; dropped ' + agg.dropped_periods.map((p) => esc(p)).join(', ') : '') +
     '</div>' +
+    renderForecastChart(d) +
     '<div class="row" style="margin:10px 0">' +
-      '<a class="btn primary" href="/api/artifact?path=' + encodeURIComponent(d.csv_path) + '">' +
-      'Download CSV</a>' +
+      '<a class="btn primary" href="/api/artifact?path=' + encodeURIComponent(d.csv_path) + '">Download CSV</a>' +
+      '<button type="button" class="sm inspect-btn" data-path="' + esc(d.csv_path) + '">Inspect CSV</button>' +
       '<span class="hint" style="margin:0">' + esc(d.csv_path) + '</span>' +
     '</div>' +
-    '<div class="scroll-x" style="max-height:260px; overflow-y:auto">' +
+    '<div class="scroll-x" style="max-height:240px; overflow-y:auto">' +
       '<table><tr><th>period</th><th>' + esc(col) + '</th><th></th></tr>' + hist + fc + '</table></div>' +
     '<details style="margin-top:12px"><summary class="hint" style="cursor:pointer">' +
       'method comparison (one-step-ahead backtest)</summary>' +
       '<table><tr><th>method</th><th>MAE</th><th></th></tr>' + methods + '</table></details>' +
-    (d.warnings.length
-      ? '<div class="msg err" style="display:block; margin-top:12px"><strong>Read before quoting:</strong><ul style="margin:6px 0 0 18px">' +
+    (d.warnings && d.warnings.length
+      ? '<div class="msg warn" style="display:block; margin-top:12px"><strong>Notes:</strong><ul style="margin:6px 0 0 18px">' +
         d.warnings.map((w) => '<li>' + esc(w) + '</li>').join('') + '</ul></div>'
       : '');
+  $('fcOut').querySelectorAll('.inspect-btn').forEach((b) => {
+    b.addEventListener('click', () => inspectReport(b.dataset.path));
+  });
 }
 
 /* ── payload + command preview ──────────────────────────────────────── */
 function collectPayload() {
   const payload = { upload_id: state.uploadId };
+  const decisionActive = $('f_decision') ? $('f_decision').checked : false;
   $('form').querySelectorAll('[data-kind]').forEach((el) => {
+    if ((el.name === 'treatment' || el.name === 'budget') && !decisionActive) {
+      return;
+    }
     const kind = el.dataset.kind;
     if (kind === 'bool') {
       payload[el.name] = el.checked;
     } else if (el.multiple) {
-      payload[el.name] = Array.from(el.selectedOptions).map((o) => o.value);
+      payload[el.name] = Array.from(el.selectedOptions).map((o) => o.value).filter(Boolean);
     } else if (kind === 'int' || kind === 'float') {
       payload[el.name] = el.value === '' ? null : Number(el.value);
     } else {
@@ -552,8 +1149,6 @@ function collectPayload() {
   return payload;
 }
 
-/* Mirrors build_argv() in app.py so the preview matches what actually runs. */
-const FLAG_META = {{ flag_meta | safe }};
 function refreshCommand() {
   const p = collectPayload();
   const parts = ['python', 'run_acdso.py'];
@@ -576,9 +1171,10 @@ function refreshCommand() {
 $('form').addEventListener('input', refreshCommand);
 $('form').addEventListener('change', refreshCommand);
 
-/* ── column-role validation (rules always; LLM on top when configured) ─ */
-const ROLE_FIELDS = ['f_predict', 'f_target', 'f_exclude', 'f_datetime_col'];
+/* ── column-role validation ────────────────────────────────────────── */
+const ROLE_FIELDS = ['f_predict', 'f_target', 'f_exclude', 'f_datetime_col', 'f_treatment'];
 let columnCheckTimer = null;
+let horizonCheckTimer = null;
 
 function renderColumnCheck(result) {
   state.columnsBlocked = !result.ok;
@@ -588,10 +1184,10 @@ function renderColumnCheck(result) {
     return;
   }
   const rows = result.issues.map((i) =>
-    '<div class="msg ' + (i.severity === 'block' ? 'err' : 'ok') + '" style="display:block; margin-bottom:6px">' +
+    '<div class="msg ' + (i.severity === 'block' ? 'err' : 'warn') + '" style="display:block; margin-bottom:6px">' +
     (i.severity === 'block' ? '&#10060; ' : '&#9888; ') + esc(i.message) + '</div>'
   ).join('');
-  const sourceNote = result.source === 'llm' ? 'rules + LLM check' : 'rule-based check (no LLM configured)';
+  const sourceNote = result.source === 'llm' ? 'rules + LLM check' : 'rule-based check';
   box.innerHTML = rows + '<div class="hint" style="margin:0">' + sourceNote + '</div>';
 }
 
@@ -603,21 +1199,21 @@ async function checkColumns() {
     target: collectColumnValues('f_target'),
     exclude: collectColumnValues('f_exclude'),
     datetime_col: collectColumnValues('f_datetime_col'),
+    treatment: collectColumnValues('f_treatment'),
   };
-  if (!roles.predict.length && !roles.target.length && !roles.exclude.length && !roles.datetime_col.length) {
+  if (!roles.predict.length && !roles.target.length && !roles.exclude.length && !roles.datetime_col.length && !roles.treatment.length) {
     renderColumnCheck({ ok: true, issues: [] });
     return;
   }
-  try {
-    const res = await fetch('/api/validate-columns', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(roles),
-    });
-    const data = await res.json();
-    if (res.ok) renderColumnCheck(data);
-  } catch (err) {
-    // best-effort live check; the server re-validates on Run regardless
+  const r = await safeFetchJson('/api/validate-columns', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(roles),
+  });
+  if (r.ok && r.data) {
+    renderColumnCheck(r.data);
+  } else {
+    $('colCheck').innerHTML = '<div class="msg warn" style="display:block">Column validation check unavailable: ' + esc(r.error) + '</div>';
   }
 }
 
@@ -633,15 +1229,13 @@ ROLE_FIELDS.forEach((id) => {
   if (!el) return;
   el.addEventListener('change', () => {
     clearTimeout(columnCheckTimer);
-    columnCheckTimer = setTimeout(checkColumns, 500);
+    columnCheckTimer = setTimeout(checkColumns, 300);
     clearTimeout(horizonCheckTimer);
-    horizonCheckTimer = setTimeout(loadHorizonSuggestion, 500);
+    horizonCheckTimer = setTimeout(loadHorizonSuggestion, 350);
   });
 });
 
-/* ── horizon suggestion: needs a datetime column AND a target picked ─── */
-let horizonCheckTimer = null;
-
+/* ── horizon suggestion ────────────────────────────────────────────── */
 async function loadHorizonSuggestion() {
   const box = $('horizonSuggestion');
   box.style.display = 'none';
@@ -649,22 +1243,20 @@ async function loadHorizonSuggestion() {
   const targetCol = collectColumnValues('f_predict')[0] || collectColumnValues('f_target')[0];
   if (!state.uploadId || !datetimeCol || !targetCol) return;
 
-  let data;
-  try {
-    const res = await fetch('/api/suggest-horizon', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ upload_id: state.uploadId, datetime_col: datetimeCol, target_col: targetCol }),
-    });
-    data = await res.json();
-    if (!res.ok || data.horizon == null) return;
-  } catch (err) {
-    return; // best-effort; manual entry still works
+  const r = await safeFetchJson('/api/suggest-horizon', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upload_id: state.uploadId, datetime_col: datetimeCol, target_col: targetCol }),
+  });
+  if (!r.ok) {
+    box.style.display = 'block';
+    box.innerHTML = '<div class="msg warn" style="display:block">Could not suggest horizon: ' + esc(r.error) + '</div>';
+    return;
   }
+  const data = r.data;
+  if (!data || data.horizon == null) return;
 
-  const sourceNote = data.source === 'llm'
-    ? 'LLM verdict, weighing detected seasonality against its own judgment'
-    : 'no LLM configured -- data vote used directly';
+  const sourceNote = data.source === 'llm' ? 'LLM + seasonality' : 'seasonality data vote';
   let voteText = '';
   if (data.votes && data.votes.data) {
     const dv = data.votes.data;
@@ -676,74 +1268,301 @@ async function loadHorizonSuggestion() {
   box.innerHTML =
     '<div class="msg ok" style="display:block">' +
     '<strong>Suggested horizon: ' + esc(String(data.horizon)) + '</strong> ' +
-    '<button type="button" id="useSuggestedHorizon" style="margin-left:8px">Use this</button>' +
+    '<button type="button" class="sm" id="useSuggestedHorizon" style="margin-left:8px">Use this</button>' +
     '<div class="hint" style="margin:4px 0 0">' + esc(data.reason) + esc(voteText) +
     ' (' + sourceNote + ')</div></div>';
-  document.getElementById('useSuggestedHorizon').addEventListener('click', () => {
+  $('useSuggestedHorizon').addEventListener('click', () => {
     $('f_horizon').value = data.horizon;
     $('f_horizon').dispatchEvent(new Event('input', { bubbles: true }));
   });
 }
 
-/* ── run / poll ─────────────────────────────────────────────────────── */
-$('runBtn').addEventListener('click', async () => {
-  flash('');
-  if (state.columnsBlocked) {
-    flash('Resolve the column selection conflict above before running.', 'err');
-    return;
-  }
-  let res, data;
+/* ── natural-language plan ─────────────────────────────────────────── */
+$('nlPlanBtn').addEventListener('click', async () => {
+  const prompt = $('nlPrompt').value.trim();
+  const status = $('nlPlanStatus');
+  $('nlPlanOut').innerHTML = '';
+  if (!state.uploadId) { status.textContent = 'Upload or load a dataset first.'; return; }
+  if (!prompt) { status.textContent = 'Type a request first.'; return; }
+  $('nlPlanBtn').disabled = true;
+  status.textContent = 'Thinking…';
   try {
-    res = await fetch('/api/run', {
+    const r = await safeFetchJson('/api/nl-plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(collectPayload()),
+      body: JSON.stringify({ upload_id: state.uploadId, prompt }),
     });
-    data = await res.json();
-  } catch (err) {
-    flash('Could not start the run: ' + err, 'err');
+    if (!r.ok) {
+      status.textContent = r.error || 'Could not build a plan.';
+      return;
+    }
+    status.textContent = '';
+    renderNlPlan(r.data);
+  } finally {
+    $('nlPlanBtn').disabled = false;
+  }
+});
+
+function renderNlPlan(plan) {
+  const sourceNote = plan.method === 'llm' ? 'LLM-parsed' : 'keyword match';
+  const warnings = (plan.warnings || []).map((w) =>
+    '<div class="msg warn" style="display:block; margin-bottom:6px">&#9888; ' + esc(w) + '</div>'
+  ).join('');
+  $('nlPlanOut').innerHTML =
+    warnings +
+    '<div class="msg ok" style="display:block">' +
+    '<strong>Predict:</strong> ' + esc((plan.predict || []).join(', ') || '(none found)') + '<br>' +
+    '<strong>Task:</strong> ' + esc(plan.task) + '<br>' +
+    (plan.exclude && plan.exclude.length ? '<strong>Exclude:</strong> ' + esc(plan.exclude.join(', ')) + '<br>' : '') +
+    (plan.datetime_col && plan.datetime_col.length ? '<strong>Datetime column:</strong> ' + esc(plan.datetime_col.join(', ')) + '<br>' : '') +
+    '<div class="hint" style="margin:6px 0 0">' + esc(plan.explanation) + ' (' + sourceNote + ')</div>' +
+    '<div class="row" style="margin-top:10px">' +
+    '<button type="button" class="sm" id="nlApply">Use this plan</button>' +
+    '<span class="hint" style="margin:0">Applies to Task &amp; Target above &mdash; review, then press Run.</span>' +
+    '</div></div>';
+  $('nlApply').addEventListener('click', () => applyNlPlan(plan));
+}
+
+function setColumnSelect(id, values) {
+  const sel = $(id);
+  if (!sel) return;
+  const wanted = new Set(values || []);
+  Array.from(sel.options).forEach((o) => { o.selected = wanted.has(o.value); });
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function applyNlPlan(plan) {
+  setGoalMode('predict');
+  const rawPred = plan.predict || [];
+  const allowedPred = state.predictableSet && state.predictableSet.size
+    ? rawPred.filter((c) => state.predictableSet.has(c))
+    : rawPred;
+  const skipped = rawPred.filter((c) => !allowedPred.includes(c));
+  setColumnSelect('f_predict', allowedPred);
+  setColumnSelect('f_exclude', plan.exclude);
+  setColumnSelect('f_datetime_col', plan.datetime_col);
+  if ($('f_task')) {
+    $('f_task').value = plan.task || 'auto';
+    $('f_task').dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (skipped.length && $('nlPlanStatus')) {
+    $('nlPlanStatus').textContent = 'Skipped non-predictable target(s): ' + skipped.join(', ');
+  }
+  renderTargetPicker();
+  refreshCommand();
+}
+
+/* ── preflight, run, stop, live progress & log ring buffer ─────────── */
+function validateRunPreflight(payload) {
+  if (state.columnsBlocked) {
+    return 'Resolve the column selection conflict above before running.';
+  }
+  const noFileMode = Boolean(
+    payload.all || payload.v3 || payload.policy || payload.timeseries || payload.decision ||
+    (payload.benchmark && !state.uploadId)
+  );
+  if (!state.uploadId && !noFileMode) {
+    return 'Upload or select a dataset first (or pick a built-in demo mode).';
+  }
+  const predict = payload.predict || [];
+  const target = payload.target || [];
+  if (state.uploadId && !noFileMode && !predict.length && !target.length) {
+    return 'Pick at least one target column to predict or train on.';
+  }
+  const exSet = new Set(payload.exclude || []);
+  const overlap = [...predict, ...target].filter((c) => exSet.has(c));
+  if (overlap.length) {
+    return 'Column conflict: ' + overlap.join(', ') + ' cannot be both target/predict and excluded.';
+  }
+  if (predict.length && target.length) {
+    const pSet = new Set(predict);
+    const tSet = new Set(target);
+    const same = pSet.size === tSet.size && [...pSet].every((x) => tSet.has(x));
+    if (!same) {
+      return 'Predict target(s) and Train-only target(s) differ; use the Goal toggle or clear one.';
+    }
+  }
+  if (payload.horizon != null && (!Number.isInteger(payload.horizon) || payload.horizon < 1)) {
+    return 'Forecast horizon (--horizon) must be a positive integer (>= 1).';
+  }
+  if (payload.budget != null && (!Number.isFinite(payload.budget) || payload.budget < 0)) {
+    return 'Budget constraint (--budget) must be a finite number >= 0.';
+  }
+  if (payload.time_budget != null && (!Number.isInteger(payload.time_budget) || payload.time_budget < 1)) {
+    return 'Time budget (--time-budget) must be a positive integer (>= 1).';
+  }
+  return null;
+}
+
+function resetLogView(initialText) {
+  state.logLines = [];
+  $('log').textContent = initialText || '';
+  $('logCapNotice').style.display = 'none';
+  $('logCapNotice').textContent = '';
+}
+
+function appendLogChunk(lines) {
+  if (!lines || !lines.length) return;
+  const logEl = $('log');
+  if (!state.logLines.length && logEl.textContent === 'Nothing running yet.') {
+    logEl.textContent = '';
+  }
+  for (const l of lines) state.logLines.push(l);
+  if (state.logLines.length > MAX_CLIENT_LOG_LINES) {
+    state.logLines.splice(0, state.logLines.length - MAX_CLIENT_LOG_LINES);
+    logEl.textContent = state.logLines.join('\n') + '\n';
+    $('logCapNotice').style.display = 'block';
+    $('logCapNotice').textContent = 'Showing last ' + MAX_CLIENT_LOG_LINES.toLocaleString() + ' lines (full log saved on disk).';
+  } else {
+    logEl.appendChild(document.createTextNode(lines.join('\n') + '\n'));
+  }
+  if ($('autoscroll').checked) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function renderProgress(prog, jobStatus) {
+  const wrap = $('progressWrap');
+  const steps = Array.from($('pipelineStepper').querySelectorAll('.step'));
+  if (!prog) {
+    if (jobStatus === 'running') {
+      wrap.style.display = 'block';
+      $('progressLabel').textContent = 'Running pipeline…';
+      $('progressPct').textContent = '…';
+      $('progressFill').style.width = '10%';
+    } else {
+      wrap.style.display = 'none';
+    }
+    steps.forEach((el) => { el.className = 'step'; });
     return;
   }
-  if (!res.ok) {
-    flash(data.error || 'Could not start the run', 'err');
-    if (data.column_issues) renderColumnCheck(data.column_issues);
+  wrap.style.display = 'block';
+  const pct = prog.percent != null ? prog.percent : 0;
+  $('progressFill').style.width = pct + '%';
+  $('progressPct').textContent = pct + '%';
+  $('progressLabel').textContent =
+    (prog.name || 'Pipeline') + (prog.detail ? ' — ' + prog.detail : '');
+
+  const nameLower = String(prog.name || '').toLowerCase();
+  let activeIdx = -1;
+  if (nameLower) {
+    activeIdx = steps.findIndex((el) => {
+      const tokens = String(el.dataset.match || '').split(',').map((s) => s.trim()).filter(Boolean);
+      return tokens.some((tok) => nameLower.includes(tok));
+    });
+  }
+  if (activeIdx < 0 && steps.length > 0) {
+    const total = Number(prog.total || 0);
+    const phase = Number(prog.phase || 0);
+    const ratio = total > 0
+      ? Math.min(1, Math.max(0, phase / total))
+      : Math.min(1, Math.max(0, pct / 100));
+    activeIdx = Math.min(steps.length - 1, Math.max(0, Math.round(ratio * (steps.length - 1))));
+  }
+
+  steps.forEach((el, idx) => {
+    el.className = 'step';
+    if (jobStatus === 'finished') {
+      el.classList.add('done');
+    } else if (prog.status === 'error' && idx === activeIdx) {
+      el.classList.add('error');
+    } else if (idx < activeIdx || (idx === activeIdx && prog.status === 'done')) {
+      el.classList.add('done');
+    } else if (idx === activeIdx) {
+      el.classList.add('running');
+    }
+  });
+}
+
+$('jumpLatestBtn').addEventListener('click', () => {
+  $('log').scrollTop = $('log').scrollHeight;
+});
+$('clearLogBtn').addEventListener('click', () => {
+  resetLogView('');
+});
+
+$('runBtn').addEventListener('click', async () => {
+  flash('', 'err', 'runMsg');
+  const payload = collectPayload();
+  const errMsg = validateRunPreflight(payload);
+  if (errMsg) {
+    flash(errMsg, 'err', 'runMsg');
+    return;
+  }
+  $('runBtn').disabled = true;
+  $('runBtn').textContent = 'Starting…';
+  const r = await safeFetchJson('/api/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  $('runBtn').textContent = 'Run pipeline';
+  if (!r.ok) {
+    $('runBtn').disabled = false;
+    flash(r.error || 'Could not start the run', 'err', 'runMsg');
+    if (r.data && r.data.column_issues) renderColumnCheck(r.data.column_issues);
     return;
   }
 
-  state.jobId = data.job_id;
+  startJobTracking(r.data.job_id, r.data.command);
+});
+
+function startJobTracking(jobId, command) {
+  if (state.poll) clearInterval(state.poll);
+  state.jobId = jobId;
   state.cursor = 0;
-  $('log').textContent = '';
-  $('cmd').textContent = data.command;
+  state.pollFailures = 0;
+  state.autoInspectedJob = null;
+  resetLogView('');
+  if (command) $('cmd').textContent = command;
   $('runBtn').disabled = true;
   $('stopBtn').disabled = false;
+  $('stopBtn').textContent = 'Stop';
   setStatus('running');
+  renderProgress(null, 'running');
   poll();
   state.poll = setInterval(poll, 1200);
-});
+}
 
 $('stopBtn').addEventListener('click', async () => {
   if (!state.jobId) return;
-  await fetch('/api/job/' + state.jobId + '/stop', { method: 'POST' });
+  $('stopBtn').disabled = true;
+  $('stopBtn').textContent = 'Stopping…';
+  const r = await safeFetchJson('/api/job/' + encodeURIComponent(state.jobId) + '/stop', { method: 'POST' });
+  if (!r.ok) {
+    flash('Stop failed: ' + r.error, 'err', 'runMsg');
+    $('stopBtn').disabled = false;
+    $('stopBtn').textContent = 'Stop';
+    return;
+  }
+  poll();
 });
 
 async function poll() {
   if (!state.jobId) return;
-  let data;
-  try {
-    const res = await fetch('/api/job/' + state.jobId + '?cursor=' + state.cursor);
-    data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'poll failed');
-  } catch (err) {
-    return; // transient; the next tick retries
+  const r = await safeFetchJson('/api/job/' + encodeURIComponent(state.jobId) + '?cursor=' + state.cursor);
+  if (!r.ok) {
+    state.pollFailures += 1;
+    if (r.status === 404 || state.pollFailures >= 5) {
+      clearInterval(state.poll);
+      state.poll = null;
+      $('runBtn').disabled = false;
+      $('stopBtn').disabled = true;
+      $('stopBtn').textContent = 'Stop';
+      setStatus('failed');
+      flash('Job polling stopped: ' + r.error, 'err', 'runMsg');
+    }
+    return;
   }
-  if (data.lines.length) {
-    $('log').textContent += data.lines.join('\n') + '\n';
+  state.pollFailures = 0;
+  const data = r.data;
+  if (data.command) $('cmd').textContent = data.command;
+  if (data.lines && data.lines.length) {
+    appendLogChunk(data.lines);
     state.cursor = data.cursor;
-    if ($('autoscroll').checked) $('log').scrollTop = $('log').scrollHeight;
   }
   $('elapsed').textContent = data.elapsed + 's elapsed';
   $('logfile').textContent = 'log: ' + data.log_file;
   setStatus(data.status, data.returncode);
+  renderProgress(data.progress, data.status);
   renderArtifacts(data.artifacts);
 
   if (data.status !== 'running') {
@@ -751,7 +1570,18 @@ async function poll() {
     state.poll = null;
     $('runBtn').disabled = false;
     $('stopBtn').disabled = true;
+    $('stopBtn').textContent = 'Stop';
     loadReportHistory();
+    if (data.status === 'finished' && state.autoInspectedJob !== state.jobId && data.artifacts && data.artifacts.length) {
+      const preferred =
+        data.artifacts.find((a) => /_combined\.json$/i.test(a.path)) ||
+        data.artifacts.find((a) => /^audit_.*\.json$/i.test(a.name || a.path)) ||
+        data.artifacts.find((a) => /^predictions_.*\.csv$/i.test(a.name || a.path));
+      if (preferred) {
+        state.autoInspectedJob = state.jobId;
+        inspectReport(preferred.path);
+      }
+    }
   }
 }
 
@@ -762,38 +1592,226 @@ function setStatus(status, code) {
   el.textContent = status + (code != null && status !== 'running' ? ' (exit ' + code + ')' : '');
 }
 
+/* ── artifacts & report inspector ──────────────────────────────────── */
+const INSPECTABLE_KINDS = new Set(['json', 'csv']);
+const VIEWABLE_KINDS = new Set(['html', 'json', 'csv', 'txt', 'md', 'png', 'svg']);
+
 function renderArtifacts(items) {
   const box = $('artifacts');
   if (!items || !items.length) { box.textContent = 'None yet.'; return; }
-  const viewable = new Set(['html', 'json', 'csv', 'txt', 'md', 'png', 'svg']);
   box.innerHTML = '<div class="scroll-x"><table><tr><th>file</th><th>size</th><th></th></tr>' +
     items.map((a) => {
       const q = encodeURIComponent(a.path);
-      const view = viewable.has(a.kind)
-        ? '<a href="/api/artifact?path=' + q + '&inline=1" target="_blank">view</a>' : '';
+      const inspect = INSPECTABLE_KINDS.has(a.kind)
+        ? '<button type="button" class="sm inspect-btn" data-path="' + esc(a.path) + '">Inspect</button> '
+        : '';
+      const view = VIEWABLE_KINDS.has(a.kind)
+        ? '<a href="/api/artifact?path=' + q + '&inline=1" target="_blank">view</a> ' : '';
       return '<tr><td>' + esc(a.path) + '</td><td>' + fmtSize(a.size) + '</td>' +
-             '<td>' + view + ' <a href="/api/artifact?path=' + q + '">download</a></td></tr>';
+             '<td>' + inspect + view + '<a href="/api/artifact?path=' + q + '">download</a></td></tr>';
     }).join('') + '</table></div>';
+  box.querySelectorAll('.inspect-btn').forEach((b) => {
+    b.addEventListener('click', () => inspectReport(b.dataset.path));
+  });
 }
 
-function fmtSize(n) {
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  return (n / 1048576).toFixed(1) + ' MB';
+async function inspectReport(path) {
+  if (!path) return;
+  flash('', 'err', 'inspectorMsg');
+  $('inspectorFile').textContent = path;
+  $('inspectorBody').innerHTML = 'Loading report summary…';
+  const r = await safeFetchJson('/api/report-summary?path=' + encodeURIComponent(path) + '&limit=50');
+  if (!r.ok) {
+    flash('Could not inspect report: ' + r.error, 'err', 'inspectorMsg');
+    $('inspectorBody').textContent = 'Unable to inspect "' + path + '".';
+    return;
+  }
+  state.inspectorData = r.data;
+  if (r.data.kind === 'csv') state.inspectorTab = 'predictions';
+  else if (r.data.kind === 'audit') state.inspectorTab = 'models';
+  else state.inspectorTab = 'overview';
+  renderInspector();
 }
 
-/* ── report history: every file ever written to reports/, not just this run ── */
-const VIEWABLE_KINDS = new Set(['html', 'json', 'csv', 'txt', 'md', 'png', 'svg']);
+function setInspectorTab(tab) {
+  state.inspectorTab = tab;
+  document.querySelectorAll('#reportInspector .tab-btn').forEach((btn) => {
+    btn.setAttribute('aria-selected', btn.dataset.tab === tab ? 'true' : 'false');
+  });
+  renderInspector();
+}
+
+document.querySelectorAll('#reportInspector .tab-btn').forEach((btn) => {
+  btn.addEventListener('click', () => setInspectorTab(btn.dataset.tab));
+});
+
+function renderInspector() {
+  document.querySelectorAll('#reportInspector .tab-btn').forEach((btn) => {
+    btn.setAttribute('aria-selected', btn.dataset.tab === state.inspectorTab ? 'true' : 'false');
+  });
+  const d = state.inspectorData;
+  const body = $('inspectorBody');
+  if (!d) {
+    body.innerHTML = 'Select <strong>Inspect</strong> on any JSON or CSV report below.';
+    return;
+  }
+  const tab = state.inspectorTab;
+
+  if (d.kind === 'csv') {
+    if (tab !== 'predictions') {
+      body.innerHTML = '<div class="hint">CSV reports show row previews under the <strong>Predictions Preview</strong> tab.</div>';
+      return;
+    }
+    const cols = d.columns || [];
+    const rows = d.rows || [];
+    const head = '<tr>' + cols.map((c) => '<th>' + esc(c) + '</th>').join('') + '</tr>';
+    const trs = rows.map((r) =>
+      '<tr>' + cols.map((c) => {
+        const hl = /_predicted$|_probability$|^type$/i.test(c) ? ' style="background:rgba(91,157,255,.12); font-weight:600"' : '';
+        return '<td' + hl + '>' + esc(r[c] == null ? '' : r[c]) + '</td>';
+      }).join('') + '</tr>'
+    ).join('');
+    body.innerHTML =
+      '<div class="row" style="justify-content:space-between; margin-bottom:8px">' +
+        '<span class="hint" style="margin:0">Showing ' + rows.length + ' of ' + Number(d.total_rows || 0).toLocaleString() + ' rows</span>' +
+        '<a class="btn sm" href="/api/artifact?path=' + encodeURIComponent(d.path) + '">Download full CSV</a>' +
+      '</div>' +
+      '<div class="scroll-x" style="max-height:320px; overflow-y:auto"><table>' + head + trs + '</table></div>';
+    return;
+  }
+
+  const fmtNum = (v, digits) => {
+    if (v == null || v === '') return 'n/a';
+    const n = Number(v);
+    return Number.isFinite(n) ? n.toFixed(digits) : 'n/a';
+  };
+
+  if (tab === 'overview') {
+    const sel = d.selected_model || {};
+    const metrics = sel.metrics || {};
+    const tp = d.test_performance || {};
+    const sum = d.summary || {};
+    const ds = d.dataset_info || {};
+    const phases = d.phases || [];
+    const targetReports = d.target_reports && typeof d.target_reports === 'object' ? d.target_reports : null;
+    const mtRows = targetReports
+      ? Object.entries(targetReports).map(([tname, tr]) => {
+          const ts = (tr && tr.selected_model) || {};
+          const tm = ts.metrics || {};
+          const sc = tm.metric != null ? tm.metric : ts.metric;
+          const tt = tm.train_time_s != null ? tm.train_time_s : ts.train_time_s;
+          return '<tr><td><strong>' + esc(tname) + '</strong></td><td>' +
+            esc(ts.name || ts.model_name || 'None') + '</td><td>' +
+            fmtNum(sc, 4) + '</td><td>' +
+            (tt != null && Number.isFinite(Number(tt)) ? fmtNum(tt, 2) + 's' : 'n/a') +
+            '</td></tr>';
+        }).join('')
+      : '';
+    const dsRowsNum = ds.rows != null ? Number(ds.rows) : NaN;
+    body.innerHTML =
+      '<div class="kpi-grid">' +
+        '<div class="kpi-card"><div class="k-label">Selected Model</div><div class="k-val">' + esc(sel.name || sel.model_name || 'None') + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">CV Score</div><div class="k-val">' + (metrics.metric != null ? fmtNum(metrics.metric, 4) : fmtNum(sel.metric, 4)) + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Train Time</div><div class="k-val">' + (metrics.train_time_s != null && Number.isFinite(Number(metrics.train_time_s)) ? fmtNum(metrics.train_time_s, 2) + 's' : (sum.total_time != null && Number.isFinite(Number(sum.total_time)) ? fmtNum(sum.total_time, 1) + 's' : 'n/a')) + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Peak Memory</div><div class="k-val">' + (metrics.peak_mem_mb != null && Number.isFinite(Number(metrics.peak_mem_mb)) ? fmtNum(metrics.peak_mem_mb, 1) + ' MB' : 'n/a') + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Dataset</div><div class="k-val">' + (Number.isFinite(dsRowsNum) ? dsRowsNum.toLocaleString() + ' x ' + esc(ds.columns || '?') : 'n/a') + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Phases OK</div><div class="k-val">' + (sum.successful != null ? esc(sum.successful + '/' + sum.total_phases) : (phases.length || 'n/a')) + '</div></div>' +
+      '</div>' +
+      (mtRows
+        ? '<div class="scroll-x" style="max-height:220px; overflow-y:auto; margin-bottom:8px"><table><tr><th>Target</th><th>Selected Model</th><th>CV Score</th><th>Train (s)</th></tr>' +
+          mtRows + '</table></div>'
+        : '') +
+      (Object.keys(tp).length ? '<div class="hint"><strong>Test performance:</strong> ' + esc(JSON.stringify(tp)) + '</div>' : '') +
+      (phases.length
+        ? '<div class="scroll-x" style="max-height:220px; overflow-y:auto"><table><tr><th>Phase</th><th>Status</th><th>Time (s)</th></tr>' +
+          phases.map((p) => '<tr><td>' + esc(p.name || '') + '</td><td>' + esc(p.status || '') + '</td><td>' + (p.time != null && Number.isFinite(Number(p.time)) ? fmtNum(p.time, 2) : '') + '</td></tr>').join('') +
+          '</table></div>'
+        : '');
+  } else if (tab === 'models') {
+    const cands = d.candidates_evaluated || [];
+    const paretoNames = new Set((d.pareto_front || []).map((p) => p.model_name || p.name || p));
+    const selName = (d.selected_model && (d.selected_model.name || d.selected_model.model_name)) || '';
+    if (!cands.length) {
+      body.innerHTML = '<div class="hint">No candidate model evaluation table in this report.</div>';
+      return;
+    }
+    body.innerHTML = '<div class="scroll-x" style="max-height:300px; overflow-y:auto"><table>' +
+      '<tr><th>Model</th><th>Score</th><th>Train (s)</th><th>Mem (MB)</th><th>Risk</th><th>Flags</th></tr>' +
+      cands.map((c) => {
+        const name = c.model_name || c.name || '';
+        const badges = [
+          name === selName ? '<span class="badge badge-cat">selected</span>' : '',
+          paretoNames.has(name) ? '<span class="badge badge-num">pareto</span>' : '',
+        ].filter(Boolean).join(' ');
+        return '<tr><td><strong>' + esc(name) + '</strong></td>' +
+          '<td>' + fmtNum(c.metric, 4) + '</td>' +
+          '<td>' + fmtNum(c.train_time_s, 2) + '</td>' +
+          '<td>' + fmtNum(c.peak_mem_mb, 1) + '</td>' +
+          '<td>' + fmtNum(c.risk_penalty, 3) + '</td>' +
+          '<td>' + badges + '</td></tr>';
+      }).join('') + '</table></div>';
+  } else if (tab === 'risk') {
+    const rr = d.risk_report || {};
+    if (!Object.keys(rr).length) {
+      body.innerHTML = '<div class="hint">No risk_report section in this report.</div>';
+      return;
+    }
+    const notes = rr.notes || [];
+    const missPct = rr.missing_ratio != null && Number.isFinite(Number(rr.missing_ratio)) ? (Number(rr.missing_ratio) * 100).toFixed(1) + '%' : 'n/a';
+    body.innerHTML =
+      '<div class="kpi-grid">' +
+        '<div class="kpi-card"><div class="k-label">Task</div><div class="k-val">' + esc(rr.task || 'n/a') + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Missing Ratio</div><div class="k-val">' + missPct + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Max VIF</div><div class="k-val">' + fmtNum(rr.vif_max, 2) + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Leakage Score</div><div class="k-val">' + fmtNum(rr.leakage_proxy_score_max, 3) + '</div></div>' +
+      '</div>' +
+      (notes.length
+        ? '<ul style="margin:6px 0 0 18px">' + notes.map((n) => '<li>' + esc(n) + '</li>').join('') + '</ul>'
+        : '<div class="hint">No risk warnings recorded.</div>');
+  } else if (tab === 'eda') {
+    const eda = d.eda_report || {};
+    const htmlPath = d.meta && d.meta.html_report_path ? d.meta.html_report_path.split(/[\\/]/).pop() : '';
+    const edaRowsNum = eda.n_rows != null ? Number(eda.n_rows) : NaN;
+    body.innerHTML =
+      '<div class="kpi-grid">' +
+        '<div class="kpi-card"><div class="k-label">Quality Score</div><div class="k-val">' + (eda.quality_score != null && Number.isFinite(Number(eda.quality_score)) ? fmtNum(eda.quality_score, 1) + '/100' : 'n/a') + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Rows</div><div class="k-val">' + (Number.isFinite(edaRowsNum) ? edaRowsNum.toLocaleString() : 'n/a') + '</div></div>' +
+        '<div class="kpi-card"><div class="k-label">Columns</div><div class="k-val">' + (eda.n_cols != null ? esc(eda.n_cols) : 'n/a') + '</div></div>' +
+      '</div>' +
+      (htmlPath ? '<a class="btn sm" href="/api/artifact?path=' + encodeURIComponent(htmlPath) + '&inline=1" target="_blank">Open full HTML report</a>' : '');
+  } else if (tab === 'predictions') {
+    const pred = d.predictions;
+    body.innerHTML = pred
+      ? '<div class="hint">' + esc(JSON.stringify(pred, null, 2)) + '</div>'
+      : '<div class="hint">Inspect a <code class="inline">predictions_*.csv</code> or <code class="inline">forecast_*.csv</code> file in Report History to preview predicted rows.</div>';
+  }
+}
+
+/* ── report history ────────────────────────────────────────────────── */
 let reportCache = [];
+
+function fmtDuration(seconds) {
+  if (!seconds || seconds < 1) return '<1s';
+  const m = Math.floor(seconds / 60), s = Math.round(seconds % 60);
+  return m ? m + 'm ' + s + 's' : s + 's';
+}
 
 function reportRow(a) {
   const q = encodeURIComponent(a.path);
+  const inspect = INSPECTABLE_KINDS.has(a.kind)
+    ? '<button type="button" class="sm inspect-btn" data-path="' + esc(a.path) + '">Inspect</button> '
+    : '';
   const view = VIEWABLE_KINDS.has(a.kind)
-    ? '<a href="/api/artifact?path=' + q + '&inline=1" target="_blank">view</a>' : '';
+    ? '<a href="/api/artifact?path=' + q + '&inline=1" target="_blank">view</a> ' : '';
   const when = new Date(a.modified * 1000).toLocaleString();
+  const start = new Date(a.run_start * 1000).toLocaleTimeString();
+  const end = new Date(a.run_end * 1000).toLocaleTimeString();
+  const runtime = '<span title="' + esc(start + ' -> ' + end) + '">' + fmtDuration(a.run_seconds) + '</span>';
   return '<tr><td>' + esc(a.path) + '</td><td class="hint" style="margin:0">' + when + '</td>' +
+         '<td>' + runtime + '</td>' +
          '<td>' + fmtSize(a.size) + '</td>' +
-         '<td>' + view + ' <a href="/api/artifact?path=' + q + '">download</a></td></tr>';
+         '<td>' + inspect + view + '<a href="/api/artifact?path=' + q + '">download</a> ' +
+         '<a href="#" class="report-delete link-danger" data-path="' + esc(a.path) + '">delete</a></td></tr>';
 }
 
 function renderReportHistory() {
@@ -802,34 +1820,70 @@ function renderReportHistory() {
   const items = term ? reportCache.filter((a) => a.path.toLowerCase().includes(term)) : reportCache;
   if (!items.length) { box.textContent = term ? 'No files match "' + term + '".' : 'No reports yet.'; return; }
   box.innerHTML = '<div class="scroll-x" style="max-height:360px; overflow-y:auto">' +
-    '<table><tr><th>file</th><th>modified</th><th>size</th><th></th></tr>' +
+    '<table><tr><th>file</th><th>modified</th><th>runtime</th><th>size</th><th></th></tr>' +
     items.map(reportRow).join('') + '</table></div>';
+  box.querySelectorAll('.inspect-btn').forEach((b) => {
+    b.addEventListener('click', () => inspectReport(b.dataset.path));
+  });
+  box.querySelectorAll('.report-delete').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      deleteReport(el.dataset.path);
+    });
+  });
 }
 
 async function loadReportHistory() {
-  try {
-    const res = await fetch('/api/reports?limit=500');
-    const data = await res.json();
-    if (!res.ok) return;
-    reportCache = data.reports;
-    renderReportHistory();
-    if (data.total > data.shown) {
-      $('reportHistory').insertAdjacentHTML(
-        'beforeend',
-        '<div class="hint" style="margin-top:8px">Showing ' + data.shown + ' of ' + data.total +
-        ' files -- narrow with the filter box to find older ones.</div>'
-      );
-    }
-  } catch (err) {
+  flash('', 'err', 'reportMsg');
+  const r = await safeFetchJson('/api/reports?limit=500');
+  if (!r.ok) {
+    flash('Could not load report history: ' + r.error, 'err', 'reportMsg');
     $('reportHistory').textContent = 'Could not load report history.';
+    return;
   }
+  reportCache = (r.data && r.data.reports) || [];
+  renderReportHistory();
+  if (r.data && r.data.total > r.data.shown) {
+    $('reportHistory').insertAdjacentHTML(
+      'beforeend',
+      '<div class="hint" style="margin-top:8px">Showing ' + r.data.shown + ' of ' + r.data.total +
+      ' files &mdash; narrow with the filter box to find older ones.</div>'
+    );
+  }
+}
+
+async function deleteReport(path) {
+  if (!confirm('Delete "' + path + '"? This cannot be undone.')) return;
+  const r = await safeFetchJson('/api/reports?path=' + encodeURIComponent(path), { method: 'DELETE' });
+  if (!r.ok) { flash(r.error || 'Delete failed', 'err', 'reportMsg'); return; }
+  await loadReportHistory();
+}
+
+async function deleteAllReports() {
+  if (!confirm('Delete ALL ' + reportCache.length + ' report files? This cannot be undone.')) return;
+  const r = await safeFetchJson('/api/reports?all=1', { method: 'DELETE' });
+  if (!r.ok) { flash(r.error || 'Delete failed', 'err', 'reportMsg'); return; }
+  await loadReportHistory();
 }
 
 $('reportFilter').addEventListener('input', renderReportHistory);
 $('reportRefresh').addEventListener('click', loadReportHistory);
-loadReportHistory();
+$('reportDeleteAll').addEventListener('click', deleteAllReports);
 
-refreshCommand();
+/* ── workbench initialization & active-job reconnect ───────────────── */
+async function initWorkbench() {
+  refreshCommand();
+  const [healthRes] = await Promise.all([
+    safeFetchJson('/api/health'),
+    loadRecentUploads(),
+    loadReportHistory(),
+  ]);
+  if (healthRes.ok && healthRes.data && healthRes.data.active_job) {
+    startJobTracking(healthRes.data.active_job);
+  }
+}
+
+initWorkbench();
 </script>
 </body>
 </html>

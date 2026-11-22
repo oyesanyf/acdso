@@ -23,9 +23,13 @@ Key features (v3):
 from __future__ import annotations
 
 import math
+import os
+import pickle
+import sys
 import time
 import tracemalloc
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -42,7 +46,7 @@ from sklearn.pipeline import Pipeline
 
 from acdso.pareto import CandidateResult, knee_point_selection, pareto_front
 from acdso.risk import RiskReport, analyze_risk, compute_risk_penalty
-from acdso.utils import build_preprocessor, measure_latency_ms_per_row, split_columns
+from acdso.utils import build_preprocessor, measure_latency_ms_per_row, sanitize_features, split_columns
 
 # Optional boosting libraries
 try:
@@ -80,33 +84,82 @@ def _safe_numpy(X: Any) -> np.ndarray:
         return np.array(X)
 
 
-def _apply_missingness_noise(X: np.ndarray, missing_frac: float, rng: np.random.RandomState) -> np.ndarray:
-    """Inject missing values into X."""
-    Xn = X.copy()
+def _apply_missingness_noise(X: Any, missing_frac: float, rng: np.random.RandomState) -> Any:
+    """Inject missing values into X while preserving DataFrame columns or array shape."""
+    if isinstance(X, pd.DataFrame):
+        df_out = X.copy()
+        for col in df_out.columns:
+            if pd.api.types.is_bool_dtype(df_out[col]) or pd.api.types.is_integer_dtype(df_out[col]):
+                df_out[col] = df_out[col].astype("float64")
+        n, d = df_out.shape
+        if n == 0 or d == 0:
+            return df_out
+        k = int(min(n * d, max(1, missing_frac * n * d)))
+        flat_idx = rng.choice(n * d, size=k, replace=False)
+        rows, cols = np.unravel_index(flat_idx, (n, d))
+        for c_idx in np.unique(cols):
+            r_sel = rows[cols == c_idx]
+            df_out.iloc[r_sel, int(c_idx)] = np.nan
+        return df_out
+
+    Xn = _safe_numpy(X).copy()
     if Xn.ndim == 1:
         Xn = Xn.reshape(-1, 1)
+    if np.issubdtype(Xn.dtype, np.integer) or np.issubdtype(Xn.dtype, np.bool_):
+        Xn = Xn.astype(np.float64)
     n, d = Xn.shape
-    k = int(max(1, missing_frac * n * d))
+    if n == 0 or d == 0:
+        return Xn
+    k = int(min(n * d, max(1, missing_frac * n * d)))
     idx = rng.choice(n * d, size=k, replace=False)
-    # Use np.nan as missing marker; preprocessor should handle imputation
     Xn.flat[idx] = np.nan
     return Xn
 
 
-def _apply_feature_jitter(X: np.ndarray, frac: float, rng: np.random.RandomState) -> np.ndarray:
-    """Small gaussian jitter on a subset of numeric cells."""
-    Xn = X.copy()
+def _apply_feature_jitter(X: Any, frac: float, rng: np.random.RandomState) -> Any:
+    """Small gaussian jitter on a subset of numeric cells while preserving DataFrame structure."""
+    if isinstance(X, pd.DataFrame):
+        df_out = X.copy()
+        num_cols = [
+            c for c in df_out.columns
+            if pd.api.types.is_numeric_dtype(df_out[c]) and not pd.api.types.is_bool_dtype(df_out[c])
+        ]
+        if not num_cols or len(df_out) == 0:
+            return df_out
+        sub = df_out[num_cols].astype(np.float64, copy=False).to_numpy(dtype=np.float64, copy=True)
+        n, d_num = sub.shape
+        k = int(min(n * d_num, max(1, frac * n * d_num)))
+        flat_idx = rng.choice(n * d_num, size=k, replace=False)
+        rows, cols = np.unravel_index(flat_idx, (n, d_num))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            col_stds = np.nanstd(sub, axis=0)
+        col_stds = np.where(np.isfinite(col_stds) & (col_stds > 0), col_stds, 1.0)
+        noise = rng.normal(loc=0.0, scale=1.0, size=k) * (0.01 * col_stds[cols])
+        sub[rows, cols] = sub[rows, cols] + noise
+        for j, col in enumerate(num_cols):
+            df_out[col] = sub[:, j]
+        return df_out
+
+    Xn = _safe_numpy(X).copy()
     if Xn.ndim == 1:
         Xn = Xn.reshape(-1, 1)
-    # Only jitter if numeric
-    if not np.issubdtype(Xn.dtype, np.number):
+    if not np.issubdtype(Xn.dtype, np.number) or np.issubdtype(Xn.dtype, np.bool_):
         return Xn
+    if np.issubdtype(Xn.dtype, np.integer):
+        Xn = Xn.astype(np.float64)
     n, d = Xn.shape
-    k = int(max(1, frac * n * d))
-    idx = rng.choice(n * d, size=k, replace=False)
-    std = np.nanstd(Xn) if np.isfinite(np.nanstd(Xn)) else 1.0
-    noise = rng.normal(loc=0.0, scale=0.01 * (std if std > 0 else 1.0), size=k)
-    Xn.flat[idx] = Xn.flat[idx] + noise
+    if n == 0 or d == 0:
+        return Xn
+    k = int(min(n * d, max(1, frac * n * d)))
+    flat_idx = rng.choice(n * d, size=k, replace=False)
+    rows, cols = np.unravel_index(flat_idx, (n, d))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        col_stds = np.nanstd(Xn, axis=0)
+    col_stds = np.where(np.isfinite(col_stds) & (col_stds > 0), col_stds, 1.0)
+    noise = rng.normal(loc=0.0, scale=1.0, size=k) * (0.01 * col_stds[cols])
+    Xn[rows, cols] = Xn[rows, cols] + noise
     return Xn
 
 
@@ -114,14 +167,15 @@ def _apply_label_noise(y: np.ndarray, frac: float, rng: np.random.RandomState) -
     """Flip a small percentage of labels to different classes."""
     yn = y.copy()
     n = len(yn)
-    k = int(max(1, frac * n))
+    if n == 0:
+        return yn
+    k = int(min(n, max(1, frac * n)))
     idx = rng.choice(n, size=k, replace=False)
 
     classes = np.unique(yn)
     if len(classes) <= 1:
         return yn
 
-    # For each selected label, swap to a different class
     for i in idx:
         current = yn[i]
         choices = classes[classes != current]
@@ -140,56 +194,36 @@ def run_stress_tests(
 ) -> Tuple[float, List[StressTestResult], float]:
     """
     Run stress tests to measure robustness under perturbations (v3).
-    
-    Uses validation data (held-out from training) to get more realistic
-    estimates of robustness degradation on unseen data.
-    
-    Parameters
-    ----------
-    fitted_pipe : Pipeline
-        Already fitted sklearn Pipeline.
-    X_val : array-like
-        Validation features (held-out from training).
-    y_val : array-like
-        Validation targets (held-out from training).
-    task : str
-        Task type ("classification" or "regression").
-    scorer_name : str
-        Name of the scorer to use.
-    random_state : int
-        Random seed for reproducibility.
-    
-    Returns
-    -------
-    Tuple[float, List[StressTestResult], float]
-        (baseline_metric, stress_results, worst_case_drop)
+
+    Uses validation data (held-out from training) to get realistic
+    estimates of robustness degradation on unseen data, preserving DataFrame
+    columns and index when DataFrames are supplied.
     """
     scorer = get_scorer(scorer_name)
     baseline = float(scorer(fitted_pipe, X_val, y_val))
 
     rng = np.random.RandomState(random_state)
-    Xnp = _safe_numpy(X_val)
     ynp = np.asarray(y_val)
 
     tests: List[StressTestResult] = []
 
     # 1) Missingness injection
     try:
-        Xm = _apply_missingness_noise(Xnp, missing_frac=0.02, rng=rng)
+        Xm = _apply_missingness_noise(X_val, missing_frac=0.02, rng=rng)
         m_score = float(scorer(fitted_pipe, Xm, y_val))
         tests.append(StressTestResult("missingness_2pct", m_score, baseline - m_score))
     except Exception:
-        pass  # Skip if fails
+        pass
 
     # 2) Feature jitter (numeric)
     try:
-        Xj = _apply_feature_jitter(Xnp, frac=0.02, rng=rng)
+        Xj = _apply_feature_jitter(X_val, frac=0.02, rng=rng)
         j_score = float(scorer(fitted_pipe, Xj, y_val))
         tests.append(StressTestResult("feature_jitter_2pct", j_score, baseline - j_score))
     except Exception:
         pass
 
-    # 3) Label noise (classification only) - tests robustness to potential label errors
+    # 3) Label noise (classification only)
     if task == "classification":
         try:
             y_noisy = _apply_label_noise(ynp, frac=0.02, rng=rng)
@@ -200,6 +234,74 @@ def run_stress_tests(
 
     worst_drop = float(max(0.0, max(t.delta for t in tests))) if tests else 0.0
     return baseline, tests, worst_drop
+
+
+def _estimate_array_nbytes(arr: Any) -> int:
+    """Estimate memory footprint of an array, sparse matrix, or DataFrame in bytes."""
+    if arr is None:
+        return 0
+    if isinstance(arr, np.ndarray):
+        return int(arr.nbytes)
+    if hasattr(arr, "data") and hasattr(arr, "indices") and hasattr(arr, "indptr"):
+        return int(
+            getattr(arr.data, "nbytes", 0)
+            + getattr(arr.indices, "nbytes", 0)
+            + getattr(arr.indptr, "nbytes", 0)
+        )
+    if isinstance(arr, pd.DataFrame):
+        try:
+            return int(arr.memory_usage(deep=False).sum())
+        except Exception:
+            return sys.getsizeof(arr)
+    if isinstance(arr, pd.Series):
+        try:
+            return int(arr.memory_usage(deep=False))
+        except Exception:
+            return sys.getsizeof(arr)
+    return int(sys.getsizeof(arr))
+
+
+def _estimate_model_nbytes(model: Any) -> int:
+    """Estimate deep memory footprint of a fitted estimator in bytes."""
+    if model is None:
+        return 0
+    base = sys.getsizeof(model)
+    try:
+        if hasattr(model, "estimators_"):
+            ests = model.estimators_
+            if isinstance(ests, np.ndarray):
+                ests_iter = ests.ravel().tolist()
+            else:
+                ests_iter = list(ests)
+            tree_bytes = 0
+            for t in ests_iter:
+                tree_obj = getattr(t, "tree_", None)
+                if tree_obj is not None:
+                    tree_bytes += int(getattr(tree_obj, "node_count", 0)) * 64
+            if tree_bytes > 0:
+                return max(base, tree_bytes)
+    except Exception:
+        pass
+    try:
+        return max(base, len(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)))
+    except Exception:
+        return base
+
+
+@dataclass
+class _FoldCacheEntry:
+    """Cached leak-free per-fold preprocessed data and fitted transforms."""
+    train_idx: np.ndarray
+    val_idx: np.ndarray
+    X_tr_raw: Any
+    X_val_raw: Any
+    y_tr: np.ndarray
+    y_val: np.ndarray
+    X_tr_proc: Any
+    X_val_proc: Any
+    pre_f: Any
+    sel_f: Any
+    data_mem_bytes: int
 
 
 def _auto_adjust_scorer(
@@ -320,6 +422,7 @@ class _ACDSOEngineV3:
         llm_advisor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]],
         verbose: int,
         selection_mode: str = "knee_point",
+        n_jobs: Optional[int] = None,
     ):
         self.task = task
         self.scorer = scorer  # Will be adjusted in fit() based on y
@@ -330,6 +433,7 @@ class _ACDSOEngineV3:
         self.max_candidates = max_candidates
         self.preference = preference
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
+        self.n_jobs = n_jobs
 
         self.max_train_time_s = max_train_time_s
         self.max_peak_mem_mb = max_peak_mem_mb
@@ -351,6 +455,32 @@ class _ACDSOEngineV3:
         if self.verbose:
             print(f"[ACDSO v3] {msg}")
 
+    def _resolve_max_workers(self, n_tasks: int, n_rows: Optional[int] = None) -> int:
+        """Resolve bounded worker count to prevent thread/GIL/tracemalloc contention."""
+        cpu_cnt = os.cpu_count() or 4
+        if self.n_jobs == 1:
+            cap = 1
+        elif self.n_jobs is None:
+            if tracemalloc.is_tracing():
+                cap = 1
+            elif n_rows is not None and n_rows < 300:
+                cap = 1
+            else:
+                cap = min(cpu_cnt, 4)
+        elif self.n_jobs == -1:
+            cap = 1 if tracemalloc.is_tracing() else min(cpu_cnt, 8)
+        elif self.n_jobs < -1:
+            cap = max(1, min(cpu_cnt + 1 + self.n_jobs, 8))
+        else:
+            cap = min(int(self.n_jobs), cpu_cnt, 12)
+        return max(1, min(max(1, n_tasks), cap))
+
+    def _build_preprocessor(self, X: Any) -> Any:
+        """Build a preprocessing ColumnTransformer from X (used by fallback paths)."""
+        df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        num_cols, cat_cols = split_columns(df)
+        return build_preprocessor(num_cols, cat_cols)
+
     def _generate_candidates(
         self,
         X: Any,
@@ -368,7 +498,7 @@ class _ACDSOEngineV3:
         - Very few features → skip feature selection, simpler models
         - More features than samples → increased regularization
         """
-        df = pd.DataFrame(X)
+        df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
         num_cols, cat_cols = split_columns(df)
 
         pre = build_preprocessor(num_cols, cat_cols)
@@ -376,7 +506,14 @@ class _ACDSOEngineV3:
         # Dataset size detection for adaptive model configuration
         n_samples = rr.n_rows
         n_features = rr.n_cols
-        
+
+        # Prevent 72-core joblib/OpenMP thrashing on Windows during parallel or small fits
+        cpu_cnt = os.cpu_count() or 4
+        if self.n_jobs != 1 or n_samples < 5000:
+            inner_n_jobs = 1
+        else:
+            inner_n_jobs = min(cpu_cnt, 4)
+
         # Edge case flags
         very_few_features = n_features <= 3
         very_few_samples = n_samples < 50
@@ -427,6 +564,8 @@ class _ACDSOEngineV3:
             n_est_small, n_est_med, n_est_large = 50, 80, 100
         elif small:
             n_est_small, n_est_med, n_est_large = 80, 100, 150
+        elif not large and n_samples < 5000:
+            n_est_small, n_est_med, n_est_large = 60, 100, 150
         else:
             n_est_small, n_est_med, n_est_large = 100, 150, 250
         
@@ -481,20 +620,20 @@ class _ACDSOEngineV3:
                 max_depth=max_depth_shallow,
                 min_samples_leaf=min_samples_leaf,
                 random_state=self.random_state,
-                n_jobs=-1,
+                n_jobs=inner_n_jobs,
             )
             rf_medium = RandomForestClassifier(
                 n_estimators=n_est_med,
                 max_depth=max_depth_medium,
                 min_samples_leaf=min_samples_leaf,
                 random_state=self.random_state,
-                n_jobs=-1,
+                n_jobs=inner_n_jobs,
             )
             rf_deep = RandomForestClassifier(
                 n_estimators=n_est_large,
                 min_samples_leaf=min_samples_leaf,
                 random_state=self.random_state,
-                n_jobs=-1,
+                n_jobs=inner_n_jobs,
             )
 
             # Handle class imbalance
@@ -516,20 +655,20 @@ class _ACDSOEngineV3:
                     except Exception:
                         pass
 
-            # For linear data, prioritize linear models (add them first)
+            # For linear data, prioritize linear models and keep non-linear check in top 6
             if is_linear:
                 models.append(("LogisticRegression_C10", lr_strong))
                 models.append(("LogisticRegression", lr_l2))
                 models.append(("LogisticRegression_ElasticNet", lr_elastic))
                 models.append(("LogisticRegression_C0.1", lr_weak))
-                # Still add some tree models for comparison
+                models.append(("RandomForest_d10", rf_medium))
                 models.append(("RandomForest_d5", rf_shallow))
             else:
                 models.append(("LogisticRegression", lr_l2))
                 models.append(("LogisticRegression_C0.1", lr_weak))
                 models.append(("RandomForest_d5", rf_shallow))
-            models.append(("RandomForest_d10", rf_medium))
-            models.append(("RandomForest", rf_deep))
+                models.append(("RandomForest_d10", rf_medium))
+                models.append(("RandomForest", rf_deep))
 
             # Add boosting for medium+ datasets with enough features
             # Skip LightGBM if <5 features, skip XGBoost if <3 features
@@ -541,6 +680,7 @@ class _ACDSOEngineV3:
                 lgbm_min_data = max(5, n_samples // 50) if few_samples else 20
                 models.append(("LightGBM", LGBMClassifier(
                     random_state=self.random_state,
+                    n_jobs=inner_n_jobs,
                     verbose=-1,
                     n_estimators=n_est_med,
                     feature_pre_filter=False,  # Prevent "Forced splits" error
@@ -549,7 +689,7 @@ class _ACDSOEngineV3:
             if can_use_xgb:
                 models.append(("XGBoost", XGBClassifier(
                     random_state=self.random_state,
-                    n_jobs=-1,
+                    n_jobs=inner_n_jobs,
                     verbosity=0,
                     n_estimators=n_est_med,
                     max_depth=max_depth_medium,
@@ -572,52 +712,55 @@ class _ACDSOEngineV3:
             else:
                 elastic_max_iter, elastic_tol = 500, 1e-3
             
-            # For linear datasets, prioritize linear models with more variety
+            # For linear datasets, prioritize linear models while keeping RandomForest_d10 in top 6
             if is_linear:
-                from sklearn.linear_model import LinearRegression, SGDRegressor, HuberRegressor
-                
+                from sklearn.linear_model import LinearRegression, HuberRegressor
+
                 # LinearRegression (OLS) - best for truly linear data
                 models.append(("LinearRegression", LinearRegression()))
-                
-                # Ridge variants with different alphas
-                models.append(("Ridge_alpha0.01", Ridge(alpha=0.01, random_state=self.random_state)))
+
+                # Ridge variants with core alphas
                 models.append(("Ridge_alpha0.1", Ridge(alpha=alpha_low, random_state=self.random_state)))
                 models.append(("Ridge_alpha1.0", Ridge(alpha=alpha_mid, random_state=self.random_state)))
                 models.append(("Ridge_alpha10", Ridge(alpha=alpha_high, random_state=self.random_state)))
-                
-                # ElasticNet with different l1_ratios
-                models.append(("ElasticNet_l1_0.2", ElasticNet(
-                    l1_ratio=0.2, random_state=self.random_state, 
-                    max_iter=elastic_max_iter, tol=elastic_tol
-                )))
+
                 models.append(("ElasticNet", ElasticNet(
-                    random_state=self.random_state, 
-                    max_iter=elastic_max_iter, 
-                    tol=elastic_tol
+                    random_state=self.random_state,
+                    max_iter=elastic_max_iter,
+                    tol=elastic_tol,
+                )))
+
+                # Retain a capable non-linear baseline within the top 6 candidates
+                models.append(("RandomForest_d10", RandomForestRegressor(
+                    n_estimators=n_est_med,
+                    max_depth=max_depth_medium,
+                    min_samples_leaf=min_samples_leaf,
+                    random_state=self.random_state,
+                    n_jobs=inner_n_jobs,
+                )))
+
+                models.append(("Ridge_alpha0.01", Ridge(alpha=0.01, random_state=self.random_state)))
+                models.append(("ElasticNet_l1_0.2", ElasticNet(
+                    l1_ratio=0.2, random_state=self.random_state,
+                    max_iter=elastic_max_iter, tol=elastic_tol,
                 )))
                 models.append(("ElasticNet_l1_0.8", ElasticNet(
-                    l1_ratio=0.8, random_state=self.random_state, 
-                    max_iter=elastic_max_iter, tol=elastic_tol
+                    l1_ratio=0.8, random_state=self.random_state,
+                    max_iter=elastic_max_iter, tol=elastic_tol,
                 )))
-                
-                # Lasso for sparse linear relationships
                 models.append(("Lasso", Lasso(
-                    random_state=self.random_state, 
-                    max_iter=elastic_max_iter, 
-                    tol=elastic_tol
+                    random_state=self.random_state,
+                    max_iter=elastic_max_iter,
+                    tol=elastic_tol,
                 )))
-                
-                # Huber for robust linear regression
                 if not very_few_samples:
                     models.append(("HuberRegressor", HuberRegressor(max_iter=500)))
-                
-                # Add one tree model for comparison
                 models.append(("RandomForest_d5", RandomForestRegressor(
                     n_estimators=n_est_small,
                     max_depth=max_depth_shallow,
                     min_samples_leaf=min_samples_leaf,
                     random_state=self.random_state,
-                    n_jobs=-1,
+                    n_jobs=inner_n_jobs,
                 )))
             else:
                 # Standard model selection for non-linear data
@@ -642,20 +785,20 @@ class _ACDSOEngineV3:
                     max_depth=max_depth_shallow,
                     min_samples_leaf=min_samples_leaf,
                     random_state=self.random_state,
-                    n_jobs=-1,
+                    n_jobs=inner_n_jobs,
                 )))
                 models.append(("RandomForest_d10", RandomForestRegressor(
                     n_estimators=n_est_med,
                     max_depth=max_depth_medium,
                     min_samples_leaf=min_samples_leaf,
                     random_state=self.random_state,
-                    n_jobs=-1,
+                    n_jobs=inner_n_jobs,
                 )))
                 models.append(("RandomForestRegressor", RandomForestRegressor(
                     n_estimators=n_est_large,
                     min_samples_leaf=min_samples_leaf,
                     random_state=self.random_state,
-                    n_jobs=-1,
+                    n_jobs=inner_n_jobs,
                 )))
 
             # Add boosting for medium+ datasets with enough features (unless linear)
@@ -670,6 +813,7 @@ class _ACDSOEngineV3:
                     lgbm_min_data = max(5, n_samples // 50) if few_samples else 20
                     models.append(("LightGBMRegressor", LGBMRegressor(
                         random_state=self.random_state,
+                        n_jobs=inner_n_jobs,
                         verbose=-1,
                         n_estimators=n_est_med,
                         feature_pre_filter=False,  # Prevent "Forced splits" error
@@ -678,7 +822,7 @@ class _ACDSOEngineV3:
                 if can_use_xgb:
                     models.append(("XGBoostRegressor", XGBRegressor(
                         random_state=self.random_state,
-                        n_jobs=-1,
+                        n_jobs=inner_n_jobs,
                         verbosity=0,
                         n_estimators=n_est_med,
                         max_depth=max_depth_medium,
@@ -716,24 +860,56 @@ class _ACDSOEngineV3:
     def _subsample_rows(self, X: Any, y: Any, frac: float) -> Tuple[Any, Any]:
         """
         Subsample rows for multi-fidelity evaluation.
-        
-        For frac >= 1.0, returns the original data unchanged (full evaluation).
+
+        For frac >= 1.0, small datasets (n < 100), or imbalanced classification
+        datasets with < 8 minority samples, returns the original data unchanged
+        so minority classes are never starved.
         """
-        # Explicit check for full data (no subsampling)
         if frac >= 1.0:
             return X, y
-        
+
         n = len(y)
-        rng = np.random.RandomState(self.random_state)
+        if n < 100:
+            return X, y
+
+        y_arr = np.asarray(y)
+        if self.task == "classification":
+            uniq, counts = np.unique(y_arr, return_counts=True)
+            if len(uniq) >= 2 and int(counts.min()) < 8:
+                return X, y
+
         sample_size = max(10, int(n * frac))
-        idx = rng.choice(n, size=sample_size, replace=False)
-        
-        # Support pandas/numpy/list
+        if sample_size >= n:
+            return X, y
+
+        idx = None
+        if self.task == "classification":
+            try:
+                uniq, counts = np.unique(y_arr, return_counts=True)
+                min_strat = max(sample_size, len(uniq) * 4)
+                if min_strat >= n:
+                    return X, y
+                if len(uniq) >= 2 and int(counts.min()) >= 2 and min_strat >= len(uniq):
+                    from sklearn.model_selection import StratifiedShuffleSplit
+                    sss = StratifiedShuffleSplit(
+                        n_splits=1, train_size=min_strat, random_state=self.random_state
+                    )
+                    cand_idx, _ = next(sss.split(np.zeros(n), y_arr))
+                    _, sub_counts = np.unique(y_arr[cand_idx], return_counts=True)
+                    if len(sub_counts) == len(uniq) and int(sub_counts.min()) >= 2:
+                        idx = cand_idx
+            except Exception:
+                idx = None
+
+        if idx is None:
+            rng = np.random.RandomState(self.random_state)
+            idx = rng.choice(n, size=sample_size, replace=False)
+
         if hasattr(X, "iloc"):
             Xs = X.iloc[idx]
         else:
             Xs = _safe_numpy(X)[idx]
-        ys = np.asarray(y)[idx]
+        ys = y_arr[idx]
         return Xs, ys
 
     def _evaluate_candidate(
@@ -745,38 +921,30 @@ class _ACDSOEngineV3:
         cv_override: Optional[int] = None,
     ) -> CandidateResult:
         """
-        Evaluate a single candidate pipeline.
-
-        Measures:
-        - Predictive performance (via cross-validation)
-        - Training time
-        - Peak memory usage
-        - Inference latency
-        - Risk penalty
+        Evaluate a single candidate pipeline (sequential fallback / direct helper).
         """
         start = time.time()
-        
-        # Memory measurement: try psutil for better native allocation tracking,
-        # fall back to tracemalloc (which doesn't capture NumPy/BLAS/LightGBM/XGBoost native allocations)
-        use_psutil = False
-        try:
-            import psutil
-            import os
-            process = psutil.Process(os.getpid())
-            mem_before = process.memory_info().rss / (1024 * 1024)  # MB
-            use_psutil = True
-        except ImportError:
-            tracemalloc.start()
+        y_arr = np.asarray(y)
 
-        # Cross-validation (use override if provided for multi-fidelity)
         cv_used = int(cv_override or self.cv)
         if self.task == "classification":
-            splitter = StratifiedKFold(
-                n_splits=cv_used,
-                shuffle=True,
-                random_state=self.random_state,
-            )
+            uniq, counts = np.unique(y_arr, return_counts=True)
+            if len(uniq) >= 2 and int(counts.min()) >= 2:
+                cv_used = max(2, min(cv_used, int(counts.min())))
+                splitter = StratifiedKFold(
+                    n_splits=cv_used,
+                    shuffle=True,
+                    random_state=self.random_state,
+                )
+            else:
+                cv_used = max(2, min(cv_used, len(y_arr) // 2))
+                splitter = KFold(
+                    n_splits=cv_used,
+                    shuffle=True,
+                    random_state=self.random_state,
+                )
         else:
+            cv_used = max(2, min(cv_used, len(y_arr) // 2))
             splitter = KFold(
                 n_splits=cv_used,
                 shuffle=True,
@@ -784,29 +952,32 @@ class _ACDSOEngineV3:
             )
 
         scorer = get_scorer(self.scorer)
-        
-        # Suppress sklearn warnings during cross-validation (constant features, etc.)
+
+        rss_before = 0.0
+        rss_after = 0.0
+        proc = None
+        try:
+            import psutil
+            proc = psutil.Process(os.getpid())
+            rss_before = proc.memory_info().rss / (1024 * 1024)
+        except Exception:
+            proc = None
+
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=RuntimeWarning)
-            scores = cross_val_score(pipe, X, y, cv=splitter, scoring=scorer, n_jobs=None)
+            scores = cross_val_score(pipe, X, y_arr, cv=splitter, scoring=scorer, n_jobs=None)
 
-        # Measure peak memory
-        if use_psutil:
-            mem_after = process.memory_info().rss / (1024 * 1024)  # MB
-            peak_mem_mb = float(mem_after - mem_before)
-            # Ensure non-negative (memory might have been freed)
-            peak_mem_mb = max(0.0, peak_mem_mb)
-        else:
-            current, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
-            peak_mem_mb = float(peak / (1024 * 1024))
+        if proc is not None:
+            try:
+                rss_after = proc.memory_info().rss / (1024 * 1024)
+            except Exception:
+                rss_after = rss_before
 
         train_time_s = float(time.time() - start)
         metric = float(np.mean(scores))
         cv_std = float(np.std(scores))
 
-        # Compute risk penalty
         assert self.risk_report_ is not None
         risk_pen = compute_risk_penalty(
             self.risk_report_,
@@ -814,18 +985,19 @@ class _ACDSOEngineV3:
             preference=self.preference,
         )
 
-        # Create train/validation split for stress testing (v3 validation-based)
-        # This ensures stress tests measure degradation on held-out data, not training data
-        n_samples = len(y)
-        val_size = max(10, int(n_samples * 0.2))  # 20% for validation
-        
+        # Validation split for stress testing
+        n_samples = len(y_arr)
+        val_size = max(10, int(n_samples * 0.2))
+        if val_size >= n_samples:
+            val_size = max(1, n_samples // 2)
+
         rng = np.random.RandomState(self.random_state)
         all_idx = np.arange(n_samples)
         rng.shuffle(all_idx)
-        
+
         train_idx = all_idx[val_size:]
         val_idx = all_idx[:val_size]
-        
+
         if hasattr(X, "iloc"):
             X_train_stress = X.iloc[train_idx]
             X_val_stress = X.iloc[val_idx]
@@ -833,24 +1005,25 @@ class _ACDSOEngineV3:
             X_arr = _safe_numpy(X)
             X_train_stress = X_arr[train_idx]
             X_val_stress = X_arr[val_idx]
-        
-        y_arr = np.asarray(y)
+
         y_train_stress = y_arr[train_idx]
         y_val_stress = y_arr[val_idx]
-        
-        # Fit the pipeline for latency measurement and stress testing
-        # NOTE: This fits on the train portion, not full data, to match stress test setup
+
         fitted = clone(pipe)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             fitted.fit(X_train_stress, y_train_stress)
-        
-        # Measure latency on validation data (simulates production inference)
+
+        det_bytes = (
+            _estimate_array_nbytes(X) * 2
+            + _estimate_array_nbytes(y_arr)
+            + _estimate_model_nbytes(fitted)
+        )
+        peak_mem_mb = float(max(det_bytes / (1024 * 1024), max(0.0, rss_after - rss_before), 0.01))
+
         latency = measure_latency_ms_per_row(fitted, X_val_stress)
 
-        # Stress tests (robustness) - v3 validation-based innovation
-        # Tests are run on held-out validation data for realistic robustness estimates
         baseline_fit_metric, stress_results, worst_drop = run_stress_tests(
             fitted_pipe=fitted,
             X_val=X_val_stress,
@@ -860,16 +1033,13 @@ class _ACDSOEngineV3:
             random_state=self.random_state,
         )
 
-        # Build objective vector:
-        # - metric: maximize
-        # - time/mem/latency/risk/robustness_drop: minimize
         objectives = (
             metric,
             math.log1p(train_time_s),
             math.log1p(peak_mem_mb),
             math.log1p(latency),
             risk_pen,
-            worst_drop,  # v3: robustness objective
+            worst_drop,
         )
 
         return CandidateResult(
@@ -889,6 +1059,372 @@ class _ACDSOEngineV3:
                 "stress_worst_drop": worst_drop,
             },
         )
+
+    def _evaluate_stage(
+        self,
+        Xs: Any,
+        ys: Any,
+        survivors: List[Tuple[str, Pipeline]],
+        stage: Dict[str, Any],
+        t0: float,
+    ) -> Tuple[List[CandidateResult], List[Dict[str, Any]], bool]:
+        """
+        Evaluate a stage with leak-free fold preprocessor caching and bounded
+        parallelism across (candidate, fold) tasks.
+        """
+        stage_name = stage["name"]
+        is_full = stage_name == "full"
+        stage_results: List[CandidateResult] = []
+        stage_failures: List[Dict[str, Any]] = []
+        budget_exhausted = False
+
+        if not survivors:
+            return stage_results, stage_failures, budget_exhausted
+
+        # Check standard Pipeline structure ("pre", optional "select", "model")
+        can_cache = all(
+            isinstance(p, Pipeline)
+            and "pre" in p.named_steps
+            and "model" in p.named_steps
+            for _, p in survivors
+        )
+        if not can_cache:
+            for name, pipe in survivors:
+                if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
+                    self._log("Time budget reached; stopping evaluation.")
+                    budget_exhausted = True
+                    break
+                try:
+                    res = self._evaluate_candidate(Xs, ys, name, pipe, cv_override=stage["cv"])
+                    if is_full and not self._passes_constraints(res):
+                        stage_failures.append({
+                            "name": name,
+                            "reason": "constraints",
+                            "metrics": {
+                                "train_time_s": res.train_time_s,
+                                "peak_mem_mb": res.peak_mem_mb,
+                                "latency_ms_per_row": res.latency_ms_per_row,
+                                "risk_penalty": res.risk_penalty,
+                                "metric": res.metric,
+                                "stress_worst_drop": res.meta.get("stress_worst_drop"),
+                            },
+                        })
+                        continue
+                    stage_results.append(res)
+                except Exception as e:
+                    stage_failures.append({"name": name, "reason": f"error:{type(e).__name__}", "detail": str(e)})
+                    self._log(f"Failed: {name} ({type(e).__name__})")
+            return stage_results, stage_failures, budget_exhausted
+
+        ys_arr = np.asarray(ys)
+        n_rows = len(ys_arr)
+        cv_used = int(stage["cv"])
+        if self.task == "classification":
+            uniq, counts = np.unique(ys_arr, return_counts=True)
+            if len(uniq) >= 2 and int(counts.min()) >= 2:
+                cv_used = max(2, min(cv_used, int(counts.min())))
+                splitter = StratifiedKFold(n_splits=cv_used, shuffle=True, random_state=self.random_state)
+            else:
+                cv_used = max(2, min(cv_used, max(2, n_rows // 2)))
+                splitter = KFold(n_splits=cv_used, shuffle=True, random_state=self.random_state)
+        else:
+            cv_used = max(2, min(cv_used, max(2, n_rows // 2)))
+            splitter = KFold(n_splits=cv_used, shuffle=True, random_state=self.random_state)
+
+        splits = list(splitter.split(Xs, ys_arr))
+        n_folds = len(splits)
+
+        base_pre = survivors[0][1].named_steps["pre"]
+        base_sel = survivors[0][1].named_steps.get("select")
+        is_df = hasattr(Xs, "iloc")
+        Xs_np = None if is_df else _safe_numpy(Xs)
+
+        def _build_fold_entry(fold_idx: int, train_idx: np.ndarray, val_idx: np.ndarray) -> Optional[_FoldCacheEntry]:
+            if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
+                return None
+            if is_df:
+                X_tr_raw = Xs.iloc[train_idx]
+                X_val_raw = Xs.iloc[val_idx]
+            else:
+                X_tr_raw = Xs_np[train_idx]
+                X_val_raw = Xs_np[val_idx]
+            y_tr = ys_arr[train_idx]
+            y_val = ys_arr[val_idx]
+
+            pre_f = clone(base_pre)
+            X_tr_proc = pre_f.fit_transform(X_tr_raw, y_tr)
+            X_val_proc = pre_f.transform(X_val_raw)
+
+            sel_f = None
+            if base_sel is not None:
+                sel_f = clone(base_sel)
+                X_tr_proc = sel_f.fit_transform(X_tr_proc, y_tr)
+                X_val_proc = sel_f.transform(X_val_proc)
+
+            data_mem_bytes = _estimate_array_nbytes(X_tr_proc) * 2 + _estimate_array_nbytes(y_tr)
+            return _FoldCacheEntry(
+                train_idx=train_idx,
+                val_idx=val_idx,
+                X_tr_raw=X_tr_raw,
+                X_val_raw=X_val_raw,
+                y_tr=y_tr,
+                y_val=y_val,
+                X_tr_proc=X_tr_proc,
+                X_val_proc=X_val_proc,
+                pre_f=pre_f,
+                sel_f=sel_f,
+                data_mem_bytes=data_mem_bytes,
+            )
+
+        fold_cache: List[Optional[_FoldCacheEntry]] = [None] * n_folds
+        prep_workers = self._resolve_max_workers(n_folds, n_rows=n_rows)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            if prep_workers == 1:
+                for fi, (tr_idx, va_idx) in enumerate(splits):
+                    fold_cache[fi] = _build_fold_entry(fi, tr_idx, va_idx)
+                    if fold_cache[fi] is None:
+                        budget_exhausted = True
+                        break
+            else:
+                with ThreadPoolExecutor(max_workers=prep_workers) as prep_pool:
+                    fut_map = {
+                        prep_pool.submit(_build_fold_entry, fi, tr_idx, va_idx): fi
+                        for fi, (tr_idx, va_idx) in enumerate(splits)
+                    }
+                    for fut in as_completed(fut_map):
+                        fi = fut_map[fut]
+                        entry = fut.result()
+                        if entry is None:
+                            budget_exhausted = True
+                        else:
+                            fold_cache[fi] = entry
+
+        if any(e is None for e in fold_cache):
+            self._log("Time budget reached during fold preparation; stopping evaluation.")
+            return stage_results, stage_failures, True
+
+        entries: List[_FoldCacheEntry] = [e for e in fold_cache if e is not None]
+        scorer_fn = get_scorer(self.scorer)
+
+        n_cands = len(survivors)
+        fold_scores: List[List[Optional[float]]] = [[None] * n_folds for _ in range(n_cands)]
+        fold_times: List[List[float]] = [[0.0] * n_folds for _ in range(n_cands)]
+        fold_mems: List[List[float]] = [[0.0] * n_folds for _ in range(n_cands)]
+        fold0_models: List[Any] = [None] * n_cands
+        cand_errors: Dict[int, Exception] = {}
+
+        def _eval_pair(cand_idx: int, fold_idx: int) -> Tuple[int, int, Optional[float], float, float, Any, Optional[Exception]]:
+            if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
+                return cand_idx, fold_idx, None, 0.0, 0.0, None, None
+            entry = entries[fold_idx]
+            try:
+                model_step = clone(survivors[cand_idx][1].named_steps["model"])
+                t_start = time.perf_counter()
+                model_step.fit(entry.X_tr_proc, entry.y_tr)
+                score = float(scorer_fn(model_step, entry.X_val_proc, entry.y_val))
+                elapsed = float(time.perf_counter() - t_start)
+                total_bytes = entry.data_mem_bytes + _estimate_model_nbytes(model_step)
+                mem_mb = float(max(0.01, total_bytes / (1024 * 1024)))
+                keep_model = model_step if fold_idx == 0 else None
+                return cand_idx, fold_idx, score, elapsed, mem_mb, keep_model, None
+            except Exception as exc:
+                return cand_idx, fold_idx, None, 0.0, 0.0, None, exc
+
+        n_tasks = n_cands * n_folds
+        eval_workers = self._resolve_max_workers(n_tasks, n_rows=n_rows)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            if eval_workers == 1:
+                for ci in range(n_cands):
+                    if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
+                        budget_exhausted = True
+                        break
+                    for fi in range(n_folds):
+                        c_i, f_i, sc, el, mb, mod0, exc = _eval_pair(ci, fi)
+                        if exc is not None:
+                            cand_errors[c_i] = exc
+                            break
+                        if sc is None:
+                            budget_exhausted = True
+                            break
+                        fold_scores[c_i][f_i] = sc
+                        fold_times[c_i][f_i] = el
+                        fold_mems[c_i][f_i] = mb
+                        if f_i == 0 and mod0 is not None:
+                            fold0_models[c_i] = mod0
+                    if budget_exhausted:
+                        break
+            else:
+                with ThreadPoolExecutor(max_workers=eval_workers) as pool:
+                    futures = [
+                        pool.submit(_eval_pair, ci, fi)
+                        for ci in range(n_cands)
+                        for fi in range(n_folds)
+                    ]
+                    for fut in as_completed(futures):
+                        c_i, f_i, sc, el, mb, mod0, exc = fut.result()
+                        if exc is not None:
+                            if c_i not in cand_errors:
+                                cand_errors[c_i] = exc
+                        elif sc is None:
+                            budget_exhausted = True
+                        else:
+                            fold_scores[c_i][f_i] = sc
+                            fold_times[c_i][f_i] = el
+                            fold_mems[c_i][f_i] = mb
+                            if f_i == 0 and mod0 is not None:
+                                fold0_models[c_i] = mod0
+                        if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
+                            budget_exhausted = True
+                            for rem in futures:
+                                rem.cancel()
+                            break
+
+        if budget_exhausted:
+            self._log("Time budget reached; stopping evaluation.")
+
+        # Precompute Fold 0's perturbed validation matrices ONCE for Stage 1
+        e0 = entries[0]
+        Xm_proc = None
+        Xj_proc = None
+        y_noisy = None
+        if is_full:
+            rng_stress = np.random.RandomState(self.random_state)
+            try:
+                Xm_raw = _apply_missingness_noise(e0.X_val_raw, missing_frac=0.02, rng=rng_stress)
+                Xm_proc = e0.pre_f.transform(Xm_raw)
+                if e0.sel_f is not None:
+                    Xm_proc = e0.sel_f.transform(Xm_proc)
+            except Exception:
+                Xm_proc = None
+            try:
+                Xj_raw = _apply_feature_jitter(e0.X_val_raw, frac=0.02, rng=rng_stress)
+                Xj_proc = e0.pre_f.transform(Xj_raw)
+                if e0.sel_f is not None:
+                    Xj_proc = e0.sel_f.transform(Xj_proc)
+            except Exception:
+                Xj_proc = None
+            if self.task == "classification":
+                try:
+                    y_noisy = _apply_label_noise(np.asarray(e0.y_val), frac=0.02, rng=rng_stress)
+                except Exception:
+                    y_noisy = None
+
+        assert self.risk_report_ is not None
+        for ci, (name, raw_pipe) in enumerate(survivors):
+            if ci in cand_errors:
+                exc = cand_errors[ci]
+                stage_failures.append({"name": name, "reason": f"error:{type(exc).__name__}", "detail": str(exc)})
+                self._log(f"Failed: {name} ({type(exc).__name__})")
+                continue
+
+            scores_ci = fold_scores[ci]
+            if any(s is None for s in scores_ci) or fold0_models[ci] is None:
+                continue
+
+            scores_arr = np.asarray(scores_ci, dtype=float)
+            metric = float(np.mean(scores_arr))
+            cv_std = float(np.std(scores_arr))
+            train_time_s = float(sum(fold_times[ci]))
+            peak_mem_mb = float(max(fold_mems[ci])) if fold_mems[ci] else 0.01
+
+            risk_pen = compute_risk_penalty(
+                self.risk_report_,
+                cv_score_std=cv_std,
+                preference=self.preference,
+            )
+
+            model_fold0 = fold0_models[ci]
+            steps_f0 = [("pre", e0.pre_f)]
+            if e0.sel_f is not None:
+                steps_f0.append(("select", e0.sel_f))
+            steps_f0.append(("model", model_fold0))
+            fold0_pipe = Pipeline(steps=steps_f0)
+
+            if is_full:
+                latency = measure_latency_ms_per_row(fold0_pipe, e0.X_val_raw)
+                baseline_f0 = float(scores_arr[0])
+                stress_results: List[StressTestResult] = []
+                if Xm_proc is not None:
+                    try:
+                        m_score = float(scorer_fn(model_fold0, Xm_proc, e0.y_val))
+                        stress_results.append(StressTestResult("missingness_2pct", m_score, baseline_f0 - m_score))
+                    except Exception:
+                        pass
+                if Xj_proc is not None:
+                    try:
+                        j_score = float(scorer_fn(model_fold0, Xj_proc, e0.y_val))
+                        stress_results.append(StressTestResult("feature_jitter_2pct", j_score, baseline_f0 - j_score))
+                    except Exception:
+                        pass
+                if self.task == "classification" and y_noisy is not None:
+                    try:
+                        ln_score = float(scorer_fn(model_fold0, e0.X_val_proc, y_noisy))
+                        stress_results.append(StressTestResult("label_noise_2pct", ln_score, baseline_f0 - ln_score))
+                    except Exception:
+                        pass
+                worst_drop = float(max(0.0, max(t.delta for t in stress_results))) if stress_results else 0.0
+            else:
+                latency = 0.0
+                baseline_f0 = float(scores_arr[0])
+                stress_results = []
+                worst_drop = 0.0
+
+            objectives = (
+                metric,
+                math.log1p(train_time_s),
+                math.log1p(peak_mem_mb),
+                math.log1p(latency),
+                risk_pen,
+                worst_drop,
+            )
+
+            res = CandidateResult(
+                name=name,
+                pipeline=fold0_pipe,
+                metric=metric,
+                train_time_s=train_time_s,
+                peak_mem_mb=peak_mem_mb,
+                latency_ms_per_row=latency,
+                risk_penalty=risk_pen,
+                objectives=objectives,
+                meta={
+                    "cv_scores": scores_arr.tolist(),
+                    "cv_score_std": cv_std,
+                    "stress_baseline_metric": baseline_f0,
+                    "stress_tests": [asdict(r) for r in stress_results],
+                    "stress_worst_drop": worst_drop,
+                },
+            )
+
+            if is_full and not self._passes_constraints(res):
+                self._log(f"Pruned by constraints: {name}")
+                stage_failures.append({
+                    "name": name,
+                    "reason": "constraints",
+                    "metrics": {
+                        "train_time_s": res.train_time_s,
+                        "peak_mem_mb": res.peak_mem_mb,
+                        "latency_ms_per_row": res.latency_ms_per_row,
+                        "risk_penalty": res.risk_penalty,
+                        "metric": res.metric,
+                        "stress_worst_drop": res.meta.get("stress_worst_drop"),
+                    },
+                })
+                continue
+
+            stage_results.append(res)
+            self._log(
+                f"{name}: metric={res.metric:.4f}, time={res.train_time_s:.2f}s, "
+                f"mem={res.peak_mem_mb:.1f}MB, lat={res.latency_ms_per_row:.2f}ms/row, "
+                f"risk={res.risk_penalty:.2f}, robustness_drop={res.meta.get('stress_worst_drop', 0.0):.4f}"
+            )
+
+        return stage_results, stage_failures, budget_exhausted
 
     def _passes_constraints(self, res: CandidateResult) -> bool:
         """Check if a candidate passes all constraint guardrails."""
@@ -1004,32 +1540,58 @@ class _ACDSOEngineV3:
         6. Select knee-point solution
         7. Build audit trail
         """
+        # Start total wall-clock timer BEFORE risk analysis so time_budget_s covers full fit()
+        t0 = time.time()
+
+        # Step 0: Validate X and y upfront and sanitize input features
+        n_x = len(X) if hasattr(X, '__len__') else np.asarray(X).shape[0]
+        y_arr = np.asarray(y)
+        if y_arr.ndim == 0 or len(y_arr) == 0:
+            raise ValueError("Target y cannot be empty.")
+        if n_x == 0:
+            raise ValueError("Input X cannot be empty.")
+        if len(y_arr) != n_x:
+            raise ValueError(f"X and y must have the same number of samples (got {n_x} vs {len(y_arr)}).")
+
+        if np.issubdtype(y_arr.dtype, np.floating):
+            if not np.all(np.isfinite(y_arr)):
+                raise ValueError("Target y contains NaN or infinite values.")
+        elif y_arr.dtype == object or isinstance(y, (pd.Series, pd.Categorical)):
+            y_s = pd.Series(y_arr)
+            if y_s.isna().any():
+                raise ValueError("Target y contains NaN/missing values.")
+            for v in y_arr:
+                if isinstance(v, (float, np.floating)) and not math.isfinite(float(v)):
+                    raise ValueError("Target y contains infinite values.")
+
+        X = sanitize_features(X)
+
         # Step 0a: Adapt CV folds for small datasets
-        n_samples = len(y) if hasattr(y, '__len__') else np.array(y).shape[0]
+        n_samples = len(y_arr)
         original_cv = self.cv
-        
+
         # Ensure we have at least 2 samples per fold
         max_cv_for_data = n_samples // 2
         if self.cv > max_cv_for_data:
             self.cv = max(2, max_cv_for_data)
             self._log(f"Reduced CV folds from {original_cv} to {self.cv} (small dataset: {n_samples} samples)")
-        
+
         # For very small datasets, use leave-one-out style (but cap at 5)
         if n_samples < 20:
             self.cv = min(n_samples - 1, 5)
             self._log(f"Using {self.cv}-fold CV for very small dataset ({n_samples} samples)")
-        
+
         # Step 0b: Auto-adjust scorer for multiclass or non-standard binary labels
         adjusted_scorer = _auto_adjust_scorer(self.scorer, y, self.task)
         if adjusted_scorer != self.scorer:
             self._log(f"Auto-adjusted scorer: {self.scorer} → {adjusted_scorer}")
             self.scorer = adjusted_scorer
-            # Store the adjusted scorer for persistence to public estimator
             self._adjusted_scorer = adjusted_scorer
         else:
             self._adjusted_scorer = self.scorer
-        
-        # Step 1: Risk analysis
+
+        # Step 1: Risk analysis (time-bounded)
+        risk_budget = min(self.time_budget_s * 0.25, 10.0) if self.time_budget_s is not None else None
         self.risk_report_ = analyze_risk(
             X, y,
             task=self.task,
@@ -1037,20 +1599,26 @@ class _ACDSOEngineV3:
             cv=self.cv,
             random_state=self.random_state,
             llm_advisor=self.llm_advisor,
+            time_budget_s=risk_budget,
         )
         self._log(f"Risk report: {asdict(self.risk_report_)}")
 
         # Step 2: Generate candidates
         candidates = self._generate_candidates(X, y, self.risk_report_)
         self._log(f"Generated {len(candidates)} candidates.")
+        raw_templates: Dict[str, Pipeline] = {name: pipe for name, pipe in candidates}
 
         # Step 3: Evaluate candidates with successive halving (v3 innovation)
-        t0 = time.time()
         results: List[CandidateResult] = []
+        stage0_results: List[CandidateResult] = []
         failures: List[Dict[str, Any]] = []
 
         plan = self._successive_halving_plan(len(candidates))
         survivors = candidates[:]
+
+        def _rank_key(r: CandidateResult) -> float:
+            worst_drop = float(r.meta.get("stress_worst_drop", 0.0))
+            return float(r.metric - 0.5 * worst_drop)
 
         for stage in plan:
             if not survivors:
@@ -1058,90 +1626,55 @@ class _ACDSOEngineV3:
 
             self._log(f"Halving stage: {stage['name']} | row_frac={stage['row_frac']} cv={stage['cv']} keep={stage['keep']}")
 
-            stage_results: List[CandidateResult] = []
-            stage_failures: List[Dict[str, Any]] = []
-
             Xs, ys = self._subsample_rows(X, y, stage["row_frac"])
-
-            for name, pipe in survivors:
-                # Check time budget
-                if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
-                    self._log("Time budget reached; stopping evaluation.")
-                    break
-
-                self._log(f"Evaluating ({stage['name']}): {name}")
-
-                try:
-                    res = self._evaluate_candidate(Xs, ys, name, pipe, cv_override=stage["cv"])
-
-                    # Constraints apply only on full stage
-                    if stage["name"] == "full" and not self._passes_constraints(res):
-                        self._log(f"Pruned by constraints: {name}")
-                        stage_failures.append({
-                            "name": name,
-                            "reason": "constraints",
-                            "metrics": {
-                                "train_time_s": res.train_time_s,
-                                "peak_mem_mb": res.peak_mem_mb,
-                                "latency_ms_per_row": res.latency_ms_per_row,
-                                "risk_penalty": res.risk_penalty,
-                                "metric": res.metric,
-                                "stress_worst_drop": res.meta.get("stress_worst_drop"),
-                            },
-                        })
-                        continue
-
-                    stage_results.append(res)
-                    self._log(
-                        f"{name}: metric={res.metric:.4f}, time={res.train_time_s:.2f}s, "
-                        f"mem={res.peak_mem_mb:.1f}MB, lat={res.latency_ms_per_row:.2f}ms/row, "
-                        f"risk={res.risk_penalty:.2f}, robustness_drop={res.meta.get('stress_worst_drop', 0.0):.4f}"
-                    )
-
-                except Exception as e:
-                    stage_failures.append({"name": name, "reason": f"error:{type(e).__name__}", "detail": str(e)})
-                    self._log(f"Failed: {name} ({type(e).__name__})")
-
-            # Rank survivors by composite that favors accuracy + robustness
-            def _rank_key(r: CandidateResult) -> float:
-                worst_drop = float(r.meta.get("stress_worst_drop", 0.0))
-                return float(r.metric - 0.5 * worst_drop)
+            stage_results, stage_failures, budget_exhausted = self._evaluate_stage(
+                Xs, ys, survivors, stage, t0
+            )
 
             stage_results.sort(key=_rank_key, reverse=True)
 
-            # Keep top K pipelines for next stage
             keep = min(stage["keep"], len(stage_results))
-            survivors = [(r.name, clone(r.pipeline)) for r in stage_results[:keep]]
+            survivors = [
+                (r.name, clone(raw_templates[r.name]) if r.name in raw_templates else clone(r.pipeline))
+                for r in stage_results[:keep]
+            ]
 
-            # Keep failures for audit
             failures.extend(stage_failures)
 
-            # If this is the full stage, these are your final results
-            if stage["name"] == "full":
-                results = stage_results
+            if stage["name"] == "cheap":
+                stage0_results = stage_results
+            elif stage["name"] == "full":
+                if stage_results:
+                    results = stage_results
+                elif budget_exhausted and stage0_results and not any(
+                    f.get("reason") == "constraints" for f in stage_failures
+                ):
+                    # Budget expired during full stage; preserve Stage 0 survivors that pass constraints
+                    passing_s0 = [r for r in stage0_results if self._passes_constraints(r)]
+                    if passing_s0:
+                        results = passing_s0
 
         if not results:
             # Fallback: Create a simple baseline model that always works
             self._log("WARNING: All candidates failed. Using fallback baseline model.")
             from sklearn.dummy import DummyRegressor, DummyClassifier
-            from sklearn.pipeline import Pipeline
-            
+
             if self.task == "classification":
                 fallback_model = DummyClassifier(strategy="most_frequent")
             else:
                 fallback_model = DummyRegressor(strategy="mean")
-            
+
             fallback_pipe = Pipeline([("pre", self._build_preprocessor(X)), ("model", fallback_model)])
-            
+            raw_templates["Baseline_Fallback"] = clone(fallback_pipe)
+
             try:
                 fallback_res = self._evaluate_candidate(X, y, "Baseline_Fallback", fallback_pipe)
                 results = [fallback_res]
                 self._log(f"Fallback model: metric={fallback_res.metric:.4f}")
             except Exception as fallback_e:
-                # If even the fallback fails, raise the original error with more context
                 raise RuntimeError(
                     f"No candidates passed evaluation/constraints, and fallback also failed: {fallback_e}. "
-                    f"Failures: {failures[:5]}"  # Show first 5 failures
+                    f"Failures: {failures[:5]}"
                 )
 
         self.all_results_ = results
@@ -1150,7 +1683,6 @@ class _ACDSOEngineV3:
         calibrator = self._fit_risk_calibrator(self.risk_report_, results)
         for r in results:
             r.risk_penalty = self._calibrated_risk_penalty(self.risk_report_, r, calibrator)
-            # Update objective vector's risk slot (index 4) while keeping rest
             obj = list(r.objectives)
             if len(obj) >= 5:
                 obj[4] = r.risk_penalty
@@ -1161,20 +1693,81 @@ class _ACDSOEngineV3:
         self.risk_report_.cv_score_std = best_std
 
         # Step 5: Construct Pareto front
-        front = pareto_front(results)
+        finite_metric_results = [r for r in results if math.isfinite(float(r.metric))]
+        pareto_pool = finite_metric_results if finite_metric_results else results
+        front = pareto_front(pareto_pool)
         self.pareto_front_ = front
         self._log(f"Pareto front size: {len(front)}")
 
         # Step 6: Select best model based on selection_mode
-        if self.selection_mode == "best_score":
-            # Select purely by CV score (highest metric value)
-            best = max(results, key=lambda r: r.metric)
+        pref_norm = str(getattr(self, "preference", "balanced") or "balanced").strip().lower()
+        if self.selection_mode == "best_score" or pref_norm in ("accuracy", "metric"):
+            finite_res = [r for r in results if math.isfinite(float(r.metric))]
+            pool = finite_res if finite_res else results
+            best = max(
+                pool,
+                key=lambda r: (
+                    float(r.metric) if math.isfinite(float(r.metric)) else float("-inf"),
+                    -float(r.risk_penalty) if math.isfinite(float(r.risk_penalty)) else float("-inf"),
+                    -float(r.train_time_s) if math.isfinite(float(r.train_time_s)) else float("-inf"),
+                    str(r.name),
+                ),
+            )
             self._log(f"Selected: {best.name} (best-score: {best.metric:.4f})")
         else:
-            # Default: knee-point selection (multi-objective trade-off)
-            best = knee_point_selection(front)
+            # Exclude catastrophically weak baseline models from distorting the knee anchor
+            finite_front = [c for c in front if math.isfinite(float(c.metric))]
+            sel_front = finite_front if finite_front else front
+            max_front_metric = max(float(c.metric) for c in sel_front)
+            rel_cap = 0.03 if pref_norm in ("speed", "fast", "low_risk", "safe") else 0.025
+            if math.isfinite(max_front_metric):
+                scale_base = (
+                    max(1e-12, abs(max_front_metric))
+                    if max_front_metric < 0.0
+                    else max(0.2, abs(max_front_metric))
+                )
+                tol = rel_cap * scale_base
+            else:
+                tol = rel_cap
+            viable_front = [c for c in sel_front if float(c.metric) >= max_front_metric - tol]
+            if not viable_front:
+                viable_front = list(sel_front)
+            m_ref = max(
+                (abs(float(c.metric)) for c in viable_front if math.isfinite(float(c.metric))),
+                default=1.0,
+            )
+            if m_ref <= 0.0:
+                m_ref = 1.0
+            viable_front.sort(
+                key=lambda c: (
+                    -round(float(c.metric) / m_ref, 8) if math.isfinite(float(c.metric)) else float("inf"),
+                    round(float(c.risk_penalty), 4) if math.isfinite(float(c.risk_penalty)) else float("inf"),
+                    round(float(c.robustness_drop), 4) if math.isfinite(float(c.robustness_drop)) else float("inf"),
+                    round(float(c.train_time_s), 1) if math.isfinite(float(c.train_time_s)) else float("inf"),
+                    str(c.name),
+                )
+            )
+            best = knee_point_selection(viable_front, preference=self.preference)
             self._log(f"Selected: {best.name} (knee-point)")
-        
+
+        # Step 6.5: Refit ONLY the winning pipeline on 100% of (X, y)
+        refitted_full = False
+        try:
+            template = raw_templates.get(best.name)
+            final_pipe = clone(template) if template is not None else clone(best.pipeline)
+            if n_samples >= 5000 and self.n_jobs != 1 and isinstance(final_pipe, Pipeline):
+                model_step = final_pipe.named_steps.get("model")
+                if model_step is not None and hasattr(model_step, "n_jobs"):
+                    model_step.set_params(n_jobs=min(os.cpu_count() or 4, 4))
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning)
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                final_pipe.fit(X, y)
+            best.pipeline = final_pipe
+            refitted_full = True
+        except Exception:
+            refitted_full = False
+
         self.best_result_ = best
 
         # Step 7: Build audit trail
@@ -1220,6 +1813,7 @@ class _ACDSOEngineV3:
                 "latency_ms_per_row": best.latency_ms_per_row,
                 "risk_penalty": best.risk_penalty,
                 "stress_worst_drop": best.meta.get("stress_worst_drop"),
+                "refitted_full": refitted_full,
             },
             "risk_calibrator": {
                 "type": "ridge" if calibrator is not None else None,
@@ -1333,6 +1927,7 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         llm_advisor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         verbose: int = 0,
         selection_mode: str = "knee_point",
+        n_jobs: Optional[int] = None,
     ) -> None:
         self.scorer = scorer
         self.cv = cv
@@ -1347,6 +1942,7 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         self.llm_advisor = llm_advisor
         self.verbose = verbose
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
+        self.n_jobs = n_jobs
 
         # Fitted attributes
         self.best_estimator_: Optional[Pipeline] = None
@@ -1392,6 +1988,7 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
             llm_advisor=self.llm_advisor,
             verbose=self.verbose,
             selection_mode=self.selection_mode,
+            n_jobs=self.n_jobs,
         ).fit(X, y)
 
         assert self._engine.best_result_ is not None
@@ -1400,9 +1997,8 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         self.pareto_front_ = self._engine.audit_trail_.get("pareto_front")
         self.audit_trail_ = self._engine.audit_trail_
         
-        # Persist the adjusted scorer back to public estimator
-        if hasattr(self._engine, '_adjusted_scorer'):
-            self.scorer = self._engine._adjusted_scorer
+        # Store adjusted scorer internally without mutating public estimator param `scorer`
+        self._effective_scorer_ = getattr(self._engine, "_adjusted_scorer", self.scorer)
 
         return self
 
@@ -1467,7 +2063,8 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         """
         if self.best_estimator_ is None:
             raise RuntimeError("ACDSOClassifier is not fitted. Call fit() first.")
-        scorer = get_scorer(self.scorer)
+        scorer_name = getattr(self, "_effective_scorer_", self.scorer)
+        scorer = get_scorer(scorer_name)
         return float(scorer(self.best_estimator_, X, y))
 
 
@@ -1565,6 +2162,7 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         llm_advisor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         verbose: int = 0,
         selection_mode: str = "knee_point",
+        n_jobs: Optional[int] = None,
     ) -> None:
         self.scorer = scorer
         self.cv = cv
@@ -1579,6 +2177,7 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         self.llm_advisor = llm_advisor
         self.verbose = verbose
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
+        self.n_jobs = n_jobs
 
         # Fitted attributes
         self.best_estimator_: Optional[Pipeline] = None
@@ -1618,6 +2217,7 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
             llm_advisor=self.llm_advisor,
             verbose=self.verbose,
             selection_mode=self.selection_mode,
+            n_jobs=self.n_jobs,
         ).fit(X, y)
 
         assert self._engine.best_result_ is not None
@@ -1626,9 +2226,8 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         self.pareto_front_ = self._engine.audit_trail_.get("pareto_front")
         self.audit_trail_ = self._engine.audit_trail_
         
-        # Persist the adjusted scorer back to public estimator
-        if hasattr(self._engine, '_adjusted_scorer'):
-            self.scorer = self._engine._adjusted_scorer
+        # Store adjusted scorer internally without mutating public estimator param `scorer`
+        self._effective_scorer_ = getattr(self._engine, "_adjusted_scorer", self.scorer)
 
         return self
 
@@ -1668,6 +2267,7 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         """
         if self.best_estimator_ is None:
             raise RuntimeError("ACDSORegressor is not fitted. Call fit() first.")
-        scorer = get_scorer(self.scorer)
+        scorer_name = getattr(self, "_effective_scorer_", self.scorer)
+        scorer = get_scorer(scorer_name)
         return float(scorer(self.best_estimator_, X, y))
 

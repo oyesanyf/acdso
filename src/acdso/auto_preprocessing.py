@@ -51,6 +51,7 @@ Usage:
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -151,101 +152,203 @@ class PreprocessingPlan:
 class TargetEncoder(BaseEstimator, TransformerMixin):
     """
     Target encoder for high-cardinality categorical features.
-    
+
     Encodes categories by their target mean, with smoothing.
+    Supports both pandas DataFrames and NumPy arrays.
     """
-    
+
     def __init__(self, smoothing: float = 10.0, min_samples: int = 1):
         self.smoothing = smoothing
         self.min_samples = min_samples
-        self.encodings_: Dict[str, Dict[Any, float]] = {}
+        self.encodings_: Dict[Any, Dict[Any, float]] = {}
         self.global_mean_: float = 0.0
-    
-    def fit(self, X: pd.DataFrame, y: np.ndarray) -> "TargetEncoder":
-        self.global_mean_ = np.mean(y)
+
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Any) -> "TargetEncoder":
+        if (
+            isinstance(y, (pd.Series, pd.Index))
+            and pd.api.types.is_numeric_dtype(y.dtype)
+            and not pd.api.types.is_bool_dtype(y.dtype)
+        ):
+            y_arr = y.to_numpy(dtype=float, na_value=np.nan)
+        else:
+            try:
+                y_arr = np.asarray(y, dtype=float)
+            except (TypeError, ValueError):
+                y_raw = (
+                    y.to_numpy(dtype=object)
+                    if hasattr(y, "to_numpy")
+                    else np.asarray(y, dtype=object)
+                )
+                y_1d = np.asarray(y_raw, dtype=object).ravel()
+                try:
+                    y_codes, _ = pd.factorize(y_1d, sort=True)
+                except TypeError:
+                    y_codes, _ = pd.factorize(y_1d, sort=False)
+                y_arr = y_codes.astype(float)
+                y_arr[y_codes < 0] = np.nan
+        if y_arr.ndim > 1:
+            y_arr = y_arr.ravel()
+        finite_y = np.isfinite(y_arr)
+        self.global_mean_ = float(np.mean(y_arr[finite_y])) if np.any(finite_y) else 0.0
         self.encodings_ = {}
-        
-        for col in X.columns:
-            self.encodings_[col] = {}
-            df = pd.DataFrame({'val': X[col], 'target': y})
-            
-            for val, group in df.groupby('val'):
-                n = len(group)
-                if n >= self.min_samples:
-                    # Smoothed mean
-                    smooth = (n * group['target'].mean() + self.smoothing * self.global_mean_) / (n + self.smoothing)
-                    self.encodings_[col][val] = smooth
-        
+
+        is_df = isinstance(X, pd.DataFrame)
+        if is_df:
+            cols_iter = [(i, col) for i, col in enumerate(X.columns)]
+        else:
+            X_arr = np.asarray(X)
+            if X_arr.ndim == 1:
+                X_arr = X_arr.reshape(-1, 1)
+            cols_iter = [(i, i) for i in range(X_arr.shape[1])]
+
+        for i, key in cols_iter:
+            col_vals = X[key] if is_df else X_arr[:, i]
+            codes, uniques = pd.factorize(col_vals, sort=False)
+            n_uniq = len(uniques)
+            if n_uniq == 0:
+                self.encodings_[key] = {}
+                continue
+
+            valid = codes >= 0
+            valid_y = valid & finite_y
+            counts = np.bincount(codes[valid], minlength=n_uniq)
+            counts_y = np.bincount(codes[valid_y], minlength=n_uniq)
+            sums_y = np.bincount(codes[valid_y], weights=y_arr[valid_y], minlength=n_uniq)
+
+            means = np.divide(
+                sums_y,
+                counts_y,
+                out=np.full(n_uniq, self.global_mean_, dtype=float),
+                where=counts_y > 0,
+            )
+            smooth = (counts * means + self.smoothing * self.global_mean_) / np.maximum(
+                counts + self.smoothing, 1e-12
+            )
+            keep = counts >= self.min_samples
+            uniques_list = uniques.tolist() if hasattr(uniques, "tolist") else list(uniques)
+            self.encodings_[key] = {
+                u: float(s) for u, s, k in zip(uniques_list, smooth.tolist(), keep.tolist()) if k
+            }
+
         return self
-    
-    def transform(self, X: pd.DataFrame) -> np.ndarray:
-        result = np.zeros((len(X), len(X.columns)))
-        
-        for i, col in enumerate(X.columns):
-            result[:, i] = X[col].map(self.encodings_.get(col, {})).fillna(self.global_mean_)
-        
+
+    def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        is_df = isinstance(X, pd.DataFrame)
+        if is_df:
+            n_rows, n_cols = X.shape
+            col_keys = list(X.columns)
+        else:
+            X_arr = np.asarray(X)
+            if X_arr.ndim == 1:
+                X_arr = X_arr.reshape(-1, 1)
+            n_rows, n_cols = X_arr.shape
+            col_keys = list(range(n_cols))
+
+        result = np.empty((n_rows, n_cols), dtype=float)
+        if n_rows == 0 or n_cols == 0:
+            return result
+
+        enc_values = list(self.encodings_.values()) if self.encodings_ else []
+        for i, key in enumerate(col_keys):
+            enc = self.encodings_.get(key)
+            if enc is None:
+                enc = self.encodings_.get(i)
+            if enc is None and i < len(enc_values):
+                enc = enc_values[i]
+            if not enc:
+                result[:, i] = self.global_mean_
+                continue
+
+            series = X.iloc[:, i] if is_df else pd.Series(X_arr[:, i])
+            mapped = pd.to_numeric(series.map(enc), errors="coerce").to_numpy(dtype=float)
+            result[:, i] = np.where(np.isnan(mapped), self.global_mean_, mapped)
+
         return result
 
 
 class SkewnessTransformer(BaseEstimator, TransformerMixin):
     """
-    Transforms skewed features using log, sqrt, or Box-Cox.
+    Transforms skewed features using log, sqrt, or auto selection.
     """
-    
+
     def __init__(self, threshold: float = 1.0, method: str = 'auto'):
         self.threshold = threshold
         self.method = method
         self.transforms_: Dict[int, str] = {}
         self.lambdas_: Dict[int, float] = {}
         self.shifts_: Dict[int, float] = {}
-    
-    def fit(self, X: np.ndarray, y: np.ndarray = None) -> "SkewnessTransformer":
-        for i in range(X.shape[1]):
-            col = X[:, i]
-            skew = stats.skew(col[~np.isnan(col)])
-            
-            if abs(skew) > self.threshold:
-                # Determine best transform
-                min_val = np.nanmin(col)
-                
-                if min_val <= 0:
-                    # Need to shift for log/boxcox
-                    self.shifts_[i] = abs(min_val) + 1
+
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: np.ndarray = None) -> "SkewnessTransformer":
+        self.transforms_ = {}
+        self.lambdas_ = {}
+        self.shifts_ = {}
+
+        X_arr = np.asarray(X, dtype=float)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(-1, 1)
+        if X_arr.shape[0] == 0 or X_arr.shape[1] == 0:
+            return self
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            skews = np.asarray(np.ma.filled(stats.skew(X_arr, axis=0, nan_policy="omit"), np.nan), dtype=float)
+
+        skew_idx = np.flatnonzero(np.isfinite(skews) & (np.abs(skews) > self.threshold))
+        if skew_idx.size == 0:
+            return self
+
+        X_sub = X_arr[:, skew_idx]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            min_vals = np.nanmin(X_sub, axis=0)
+        min_vals = np.where(np.isfinite(min_vals), min_vals, 0.0)
+        shifts = np.where(min_vals <= 0.0, np.abs(min_vals) + 1.0, 0.0)
+        shifted = np.maximum(X_sub + shifts, 0.0)
+
+        if self.method == 'auto':
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                log_skews = np.abs(
+                    np.asarray(np.ma.filled(stats.skew(np.log1p(shifted), axis=0, nan_policy="omit"), np.nan), dtype=float)
+                )
+                sqrt_skews = np.abs(
+                    np.asarray(np.ma.filled(stats.skew(np.sqrt(shifted), axis=0, nan_policy="omit"), np.nan), dtype=float)
+                )
+            orig_abs = np.abs(skews[skew_idx])
+            for pos, col_i in enumerate(skew_idx.tolist()):
+                self.shifts_[col_i] = float(shifts[pos])
+                ls = log_skews[pos]
+                ss = sqrt_skews[pos]
+                oa = orig_abs[pos]
+                if np.isfinite(ls) and (not np.isfinite(ss) or ls < ss) and ls < oa:
+                    self.transforms_[col_i] = 'log'
+                elif np.isfinite(ss) and ss < oa:
+                    self.transforms_[col_i] = 'sqrt'
                 else:
-                    self.shifts_[i] = 0
-                
-                shifted = col + self.shifts_[i]
-                
-                if self.method == 'auto':
-                    # Try log first
-                    log_skew = abs(stats.skew(np.log1p(shifted[~np.isnan(shifted)])))
-                    sqrt_skew = abs(stats.skew(np.sqrt(shifted[~np.isnan(shifted)])))
-                    
-                    if log_skew < sqrt_skew and log_skew < abs(skew):
-                        self.transforms_[i] = 'log'
-                    elif sqrt_skew < abs(skew):
-                        self.transforms_[i] = 'sqrt'
-                    else:
-                        self.transforms_[i] = 'none'
-                else:
-                    self.transforms_[i] = self.method
-        
+                    self.transforms_[col_i] = 'none'
+        else:
+            for pos, col_i in enumerate(skew_idx.tolist()):
+                self.shifts_[col_i] = float(shifts[pos])
+                self.transforms_[col_i] = self.method
+
         return self
-    
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        result = X.copy()
-        
-        for i, transform in self.transforms_.items():
-            if i >= result.shape[1]:
-                continue
-                
-            col = result[:, i] + self.shifts_.get(i, 0)
-            
-            if transform == 'log':
-                result[:, i] = np.log1p(np.maximum(col, 0))
-            elif transform == 'sqrt':
-                result[:, i] = np.sqrt(np.maximum(col, 0))
-        
+
+    def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        result = np.array(X, dtype=float, copy=True)
+        if result.ndim == 1:
+            result = result.reshape(-1, 1)
+        n_cols = result.shape[1]
+
+        log_cols = [i for i, t in self.transforms_.items() if t == 'log' and i < n_cols]
+        sqrt_cols = [i for i, t in self.transforms_.items() if t == 'sqrt' and i < n_cols]
+
+        if log_cols:
+            shifts = np.array([self.shifts_.get(i, 0.0) for i in log_cols], dtype=float)
+            result[:, log_cols] = np.log1p(np.maximum(result[:, log_cols] + shifts, 0.0))
+        if sqrt_cols:
+            shifts = np.array([self.shifts_.get(i, 0.0) for i in sqrt_cols], dtype=float)
+            result[:, sqrt_cols] = np.sqrt(np.maximum(result[:, sqrt_cols] + shifts, 0.0))
+
         return result
 
 
@@ -253,24 +356,48 @@ class OutlierClipper(BaseEstimator, TransformerMixin):
     """
     Clips outliers to percentile bounds.
     """
-    
+
     def __init__(self, lower_percentile: float = 1, upper_percentile: float = 99):
         self.lower_percentile = lower_percentile
         self.upper_percentile = upper_percentile
         self.bounds_: Dict[int, Tuple[float, float]] = {}
-    
-    def fit(self, X: np.ndarray, y: np.ndarray = None) -> "OutlierClipper":
-        for i in range(X.shape[1]):
-            col = X[:, i]
-            lower = np.nanpercentile(col, self.lower_percentile)
-            upper = np.nanpercentile(col, self.upper_percentile)
-            self.bounds_[i] = (lower, upper)
+        self._lower_arr: Optional[np.ndarray] = None
+        self._upper_arr: Optional[np.ndarray] = None
+
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: np.ndarray = None) -> "OutlierClipper":
+        self.bounds_ = {}
+        X_arr = np.asarray(X, dtype=float)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(-1, 1)
+        if X_arr.shape[0] == 0 or X_arr.shape[1] == 0:
+            self._lower_arr = np.empty(0, dtype=float)
+            self._upper_arr = np.empty(0, dtype=float)
+            return self
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            bounds = np.nanpercentile(X_arr, [self.lower_percentile, self.upper_percentile], axis=0)
+        self._lower_arr = np.asarray(bounds[0], dtype=float)
+        self._upper_arr = np.asarray(bounds[1], dtype=float)
+        for i in range(X_arr.shape[1]):
+            self.bounds_[i] = (float(self._lower_arr[i]), float(self._upper_arr[i]))
         return self
-    
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        result = X.copy()
+
+    def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+        result = np.array(X, dtype=float, copy=True)
+        if result.ndim == 1:
+            result = result.reshape(-1, 1)
+        n_cols = result.shape[1]
+        if (
+            self._lower_arr is not None
+            and self._upper_arr is not None
+            and len(self._lower_arr) >= n_cols
+            and len(self.bounds_) >= n_cols
+        ):
+            np.clip(result, self._lower_arr[:n_cols], self._upper_arr[:n_cols], out=result)
+            return result
         for i, (lower, upper) in self.bounds_.items():
-            if i < result.shape[1]:
+            if i < n_cols:
                 result[:, i] = np.clip(result[:, i], lower, upper)
         return result
 
@@ -407,120 +534,133 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
     def _analyze_columns(self, X: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
         """Categorize columns by type."""
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-        categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+        categorical_cols = X.select_dtypes(
+            include=['object', 'category', 'bool', 'boolean', 'string']
+        ).columns.tolist()
         datetime_cols = X.select_dtypes(include=['datetime64']).columns.tolist()
-        
-        # Check for boolean columns (treat as categorical)
-        for col in numeric_cols.copy():
-            if X[col].nunique() <= 2:
-                # Could be boolean encoded as 0/1
-                pass
-        
         return numeric_cols, categorical_cols, datetime_cols
-    
+
     def _detect_issues(
-        self, 
-        X: pd.DataFrame, 
-        y: np.ndarray = None
+        self,
+        X: pd.DataFrame,
+        y: np.ndarray = None,
+        missing_pcts: Optional[pd.Series] = None,
     ) -> Tuple[List[str], List[str], List[str], List[str], Dict[int, List[str]]]:
-        """Detect preprocessing issues in each column."""
-        missing_cols = []
-        skewed_cols = []
-        outlier_cols = []
-        drop_cols = []
-        correlated_groups = {}
-        
+        """Detect preprocessing issues in each column (vectorized)."""
+        missing_cols: List[str] = []
+        skewed_cols: List[str] = []
+        outlier_cols: List[str] = []
+        drop_cols: List[str] = []
+        correlated_groups: Dict[int, List[str]] = {}
+
         numeric_cols, categorical_cols, _ = self._analyze_columns(X)
-        
-        # Check for missing values
-        for col in X.columns:
-            missing_pct = X[col].isna().mean()
+
+        if missing_pcts is None:
+            missing_pcts = X.isna().mean()
+        for col, missing_pct in missing_pcts.items():
             if missing_pct > 0:
                 if missing_pct > self.missing_threshold:
                     drop_cols.append(col)
                 else:
                     missing_cols.append(col)
-        
-        # Check for skewness (numeric only)
-        for col in numeric_cols:
-            if col in drop_cols:
-                continue
-            try:
-                skew = abs(stats.skew(X[col].dropna()))
-                if skew > self.skewness_threshold:
+
+        drop_set = set(drop_cols)
+        active_num = [c for c in numeric_cols if c not in drop_set]
+        if active_num and len(X) > 0:
+            X_num_arr = X[active_num].astype(float, copy=False).to_numpy(dtype=float, copy=False)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                skews = np.asarray(
+                    np.ma.filled(stats.skew(X_num_arr, axis=0, nan_policy="omit"), np.nan),
+                    dtype=float,
+                )
+                q25, q75 = np.nanpercentile(X_num_arr, [25.0, 75.0], axis=0)
+                col_mins = np.nanmin(X_num_arr, axis=0)
+                col_maxs = np.nanmax(X_num_arr, axis=0)
+
+            for idx_col, col in enumerate(active_num):
+                if np.isfinite(skews[idx_col]) and abs(skews[idx_col]) > self.skewness_threshold:
                     skewed_cols.append(col)
-            except Exception:
-                pass
-        
-        # Check for outliers (numeric only)
-        for col in numeric_cols:
-            if col in drop_cols:
-                continue
-            try:
-                clean = X[col].dropna()
-                q1, q3 = clean.quantile([0.25, 0.75])
-                iqr = q3 - q1
-                outlier_pct = ((clean < q1 - 1.5 * iqr) | (clean > q3 + 1.5 * iqr)).mean()
-                if outlier_pct > 0.01:  # More than 1% outliers
-                    outlier_cols.append(col)
-            except Exception:
-                pass
-        
-        # Check for multicollinearity
-        if self.handle_multicollinearity and len(numeric_cols) > 1:
-            numeric_df = X[numeric_cols].dropna()
+
+                iqr = q75[idx_col] - q25[idx_col]
+                if np.isfinite(iqr):
+                    col_vals = X_num_arr[:, idx_col]
+                    valid_mask = np.isfinite(col_vals)
+                    n_valid = int(np.sum(valid_mask))
+                    if n_valid > 0:
+                        out_mask = (col_vals[valid_mask] < q25[idx_col] - 1.5 * iqr) | (
+                            col_vals[valid_mask] > q75[idx_col] + 1.5 * iqr
+                        )
+                        if float(np.mean(out_mask)) > 0.01:
+                            outlier_cols.append(col)
+
+                # Constant numeric column check
+                cmin, cmax = col_mins[idx_col], col_maxs[idx_col]
+                if not np.isfinite(cmin) or not np.isfinite(cmax) or cmin == cmax:
+                    if col not in drop_set:
+                        drop_cols.append(col)
+                        drop_set.add(col)
+
+        # Check for multicollinearity (pairwise complete correlation so scattered NaNs do not drop all rows)
+        if self.handle_multicollinearity and len(active_num) > 1:
+            numeric_df = X[active_num].astype(float)
             if len(numeric_df) > 10:
                 try:
                     corr_matrix = numeric_df.corr().abs()
                     np.fill_diagonal(corr_matrix.values, 0)
-                    
-                    # Find highly correlated pairs
+
                     group_id = 0
                     assigned = set()
-                    
-                    for i, col1 in enumerate(numeric_cols):
-                        if col1 in assigned or col1 in drop_cols:
+
+                    for i, col1 in enumerate(active_num):
+                        if col1 in assigned or col1 in drop_set:
                             continue
-                        
+
                         group = [col1]
-                        for j, col2 in enumerate(numeric_cols[i+1:], i+1):
-                            if col2 in assigned or col2 in drop_cols:
+                        for col2 in active_num[i + 1 :]:
+                            if col2 in assigned or col2 in drop_set:
                                 continue
                             if corr_matrix.loc[col1, col2] >= self.correlation_threshold:
                                 group.append(col2)
                                 assigned.add(col2)
-                        
+
                         if len(group) > 1:
                             correlated_groups[group_id] = group
                             group_id += 1
                             assigned.update(group)
-                            # Keep first, drop rest
-                            drop_cols.extend(group[1:])
+                            for c_drop in group[1:]:
+                                if c_drop not in drop_set:
+                                    drop_cols.append(c_drop)
+                                    drop_set.add(c_drop)
                 except Exception:
                     pass
-        
-        # Check for constant columns
+
+        # Check for constant non-numeric columns
+        active_num_set = set(active_num)
         for col in X.columns:
-            if col in drop_cols:
+            if col in drop_set or col in active_num_set:
                 continue
             if X[col].nunique() <= 1:
                 drop_cols.append(col)
-        
+                drop_set.add(col)
+
         # Use EDA insights if available
         if 'profiles' in self._eda_insights:
+            skewed_set = set(skewed_cols)
+            num_set = set(numeric_cols)
             for profile in self._eda_insights['profiles']:
                 col = profile.name if hasattr(profile, 'name') else profile.get('name')
                 if col is None:
                     continue
-                
-                # Check for high skewness from EDA
+
                 skewness = profile.skewness if hasattr(profile, 'skewness') else profile.get('skewness', 0)
-                if abs(skewness or 0) > self.skewness_threshold and col not in skewed_cols:
-                    if col in numeric_cols:
+                if abs(skewness or 0) > self.skewness_threshold and col not in skewed_set:
+                    if col in num_set:
                         skewed_cols.append(col)
-        
+                        skewed_set.add(col)
+
         return missing_cols, skewed_cols, outlier_cols, drop_cols, correlated_groups
-    
+
     def _create_plan(
         self,
         X: pd.DataFrame,
@@ -528,36 +668,41 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
     ) -> PreprocessingPlan:
         """Create preprocessing plan based on data analysis."""
         numeric_cols, categorical_cols, datetime_cols = self._analyze_columns(X)
-        missing_cols, skewed_cols, outlier_cols, drop_cols, correlated_groups = self._detect_issues(X, y)
-        
+        missing_pcts = X.isna().mean()
+        missing_cols, skewed_cols, outlier_cols, drop_cols, correlated_groups = self._detect_issues(
+            X, y, missing_pcts=missing_pcts
+        )
+        drop_set = set(drop_cols)
+
         actions = []
         target_encode_cols = []
-        
+
         # Plan actions for each issue
         for col in drop_cols:
+            mp = float(missing_pcts.get(col, 0.0))
             actions.append(PreprocessingAction(
                 column=col,
                 action="drop",
-                reason="Too many missing values or constant" if col in X.columns and X[col].isna().mean() > self.missing_threshold 
+                reason="Too many missing values or constant" if mp > self.missing_threshold
                        else "Redundant (high correlation)" if any(col in g for g in correlated_groups.values())
                        else "Constant column",
                 priority="high",
             ))
-        
+
         for col in missing_cols:
-            if col in drop_cols:
+            if col in drop_set:
                 continue
             strategy = "median" if col in numeric_cols else "most_frequent"
             actions.append(PreprocessingAction(
                 column=col,
                 action="impute",
-                reason=f"Has {X[col].isna().mean()*100:.1f}% missing values",
+                reason=f"Has {float(missing_pcts.get(col, 0.0))*100:.1f}% missing values",
                 priority="critical",
                 params={"strategy": strategy},
             ))
-        
+
         for col in skewed_cols:
-            if col in drop_cols:
+            if col in drop_set:
                 continue
             actions.append(PreprocessingAction(
                 column=col,
@@ -566,9 +711,9 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
                 priority="medium",
                 params={"method": "auto"},
             ))
-        
+
         for col in outlier_cols:
-            if col in drop_cols:
+            if col in drop_set:
                 continue
             actions.append(PreprocessingAction(
                 column=col,
@@ -577,9 +722,9 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
                 priority="medium",
                 params={"lower_pct": 1, "upper_pct": 99},
             ))
-        
+
         for col in categorical_cols:
-            if col in drop_cols:
+            if col in drop_set:
                 continue
             n_unique = X[col].nunique()
             if n_unique > self.high_cardinality_threshold:
@@ -622,6 +767,8 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         y: np.ndarray = None,
     ) -> ColumnTransformer:
         """Build sklearn transformer based on plan."""
+        from acdso.utils import _CategoricalSanitizer, _NumericSanitizer
+
         plan = self.plan_
         
         transformers = []
@@ -629,7 +776,7 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         # Numeric pipeline
         numeric_cols = plan.numeric_columns
         if numeric_cols:
-            numeric_steps = []
+            numeric_steps = [("sanitize", _NumericSanitizer())]
             
             # Imputation
             if self.handle_missing and any(c in plan.missing_columns for c in numeric_cols):
@@ -650,26 +797,32 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
                 else:
                     numeric_steps.append(("scale", StandardScaler()))
             
-            if numeric_steps:
-                transformers.append(("numeric", Pipeline(numeric_steps), numeric_cols))
-            else:
-                transformers.append(("numeric", "passthrough", numeric_cols))
+            transformers.append(("numeric", Pipeline(numeric_steps), numeric_cols))
         
         # Categorical pipeline (one-hot)
         onehot_cols = [c for c in plan.categorical_columns if c not in plan.target_encode_columns]
         if onehot_cols and self.handle_categoricals:
             cat_steps = [
+                ("sanitize", _CategoricalSanitizer()),
                 ("impute", SimpleImputer(strategy="most_frequent")),
                 ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
             ]
             transformers.append(("categorical", Pipeline(cat_steps), onehot_cols))
         
         # Target encoding pipeline
-        if plan.target_encode_columns and self.handle_categoricals and y is not None:
-            # Target encoding needs special handling
-            target_steps = [
-                ("impute", SimpleImputer(strategy="most_frequent")),
-            ]
+        if plan.target_encode_columns and self.handle_categoricals:
+            if y is not None:
+                target_steps = [
+                    ("sanitize", _CategoricalSanitizer()),
+                    ("impute", SimpleImputer(strategy="most_frequent")),
+                    ("encode", TargetEncoder()),
+                ]
+            else:
+                target_steps = [
+                    ("sanitize", _CategoricalSanitizer()),
+                    ("impute", SimpleImputer(strategy="most_frequent")),
+                    ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+                ]
             transformers.append(("target_encoded", Pipeline(target_steps), plan.target_encode_columns))
         
         # Build transformer

@@ -22,15 +22,20 @@ boosted-tree score nobody can explain.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
-import pandas as pd
+if TYPE_CHECKING:
+    import numpy as np
+    import pandas as pd
 
 #: Below this many periods, a fitted trend is not meaningfully better than
 #: eyeballing it, and we say so in the warnings.
 MIN_POINTS_FOR_TREND = 6
+
+VALID_AGGS = ("sum", "mean", "max", "count")
+VALID_GRAINS = ("auto", "D", "W", "M", "Q", "Y")
 
 
 @dataclass
@@ -44,6 +49,38 @@ class SeriesSpec:
     group_filters: dict[str, list[str]] = field(default_factory=dict)
     drop_first: bool = False
     drop_last: bool = False
+
+
+def _parse_dates(series: pd.Series) -> pd.Series:
+    import pandas as pd
+
+    if isinstance(series.dtype, pd.DatetimeTZDtype):
+        return series.dt.tz_convert("UTC").dt.tz_localize(None)
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        warnings.simplefilter("ignore", FutureWarning)
+        try:
+            parsed = pd.to_datetime(series, format="mixed", errors="coerce")
+        except TypeError:
+            parsed = pd.to_datetime(series, errors="coerce")
+
+    if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+        return parsed.dt.tz_convert("UTC").dt.tz_localize(None)
+
+    if not pd.api.types.is_datetime64_any_dtype(parsed):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            try:
+                parsed = pd.to_datetime(series, format="mixed", utc=True, errors="coerce")
+            except TypeError:
+                parsed = pd.to_datetime(series, utc=True, errors="coerce")
+        if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+            return parsed.dt.tz_convert("UTC").dt.tz_localize(None)
+
+    return parsed
 
 
 def _infer_grain(dates: pd.Series) -> str:
@@ -74,27 +111,63 @@ def aggregate_series(df: pd.DataFrame, spec: SeriesSpec) -> tuple[pd.Series, dic
     including how many raw rows fed each period so partial periods are
     visible rather than silently blended into the trend.
     """
+    import pandas as pd
+
+    if spec.agg not in VALID_AGGS:
+        raise ValueError(f"Unsupported aggregation: {spec.agg!r}. Choose from {', '.join(VALID_AGGS)}.")
+    if spec.grain not in VALID_GRAINS:
+        raise ValueError(f"Unsupported grain: {spec.grain!r}. Choose from {', '.join(VALID_GRAINS)}.")
+
     missing = [c for c in (spec.date_col, spec.value_col) if c not in df.columns]
     if missing:
         raise ValueError(f"Column(s) not in the file: {', '.join(missing)}")
 
-    work = df.copy()
+    if spec.group_filters is not None and not isinstance(spec.group_filters, dict):
+        raise ValueError("group_filters must be a mapping of column name to allowed values.")
+
+    cols_needed = list(
+        dict.fromkeys(
+            [spec.date_col, spec.value_col]
+            + [c for c in (spec.group_filters or {}).keys() if c in df.columns]
+        )
+    )
+    work = df[cols_needed].copy()
     applied_filters = {}
     for column, allowed in (spec.group_filters or {}).items():
-        if column in work.columns and allowed:
-            work = work[work[column].astype(str).isin([str(a) for a in allowed])]
-            applied_filters[column] = allowed
+        if allowed is None:
+            continue
+        if isinstance(allowed, (str, int, float, bool)):
+            allowed_list = [str(allowed)]
+        elif isinstance(allowed, (list, tuple, set)):
+            allowed_list = [str(a) for a in allowed]
+        else:
+            raise ValueError(f"Invalid filter values for column '{column}': expected a list or scalar.")
+        if column in work.columns and allowed_list:
+            work = work[work[column].astype(str).isin(allowed_list)]
+            applied_filters[column] = allowed_list
     if work.empty:
         raise ValueError("No rows left after filtering.")
 
-    work[spec.value_col] = pd.to_numeric(work[spec.value_col], errors="coerce")
-    parsed = pd.to_datetime(work[spec.date_col], errors="coerce")
+    if pd.api.types.is_numeric_dtype(work[spec.date_col]) or pd.api.types.is_bool_dtype(work[spec.date_col]):
+        raise ValueError(
+            f"Column '{spec.date_col}' is numeric, not a date/period column. "
+            "Pick a column holding dates or period labels."
+        )
+
+    if spec.agg != "count":
+        work[spec.value_col] = pd.to_numeric(work[spec.value_col], errors="coerce")
+
+    parsed = _parse_dates(work[spec.date_col])
     if parsed.isna().all():
         raise ValueError(
             f"Could not read '{spec.date_col}' as dates. "
             "Pick the column holding the period (e.g. Date)."
         )
     work = work.assign(_parsed=parsed).dropna(subset=["_parsed", spec.value_col])
+    if work.empty:
+        raise ValueError(
+            f"No valid (date, value) rows found for '{spec.date_col}' and '{spec.value_col}'."
+        )
 
     grain = _infer_grain(work["_parsed"]) if spec.grain == "auto" else spec.grain
     periods = work["_parsed"].dt.to_period(grain)
@@ -107,7 +180,17 @@ def aggregate_series(df: pd.DataFrame, spec: SeriesSpec) -> tuple[pd.Series, dic
 
     # Fill gaps so the trend sees real spacing, not compressed time.
     if len(series) > 1:
-        full = pd.period_range(series.index.min(), series.index.max(), freq=grain)
+        p_min, p_max = series.index.min(), series.index.max()
+        try:
+            span = int((p_max - p_min).n) + 1
+        except Exception:
+            span = 0
+        if span > 20_000:
+            raise ValueError(
+                f"Date range spans {span:,} '{grain}' periods (max 20,000 allowed). "
+                "Choose a coarser grain (e.g. 'M' or 'Y') or filter the date range."
+            )
+        full = pd.period_range(p_min, p_max, freq=grain)
         series = series.reindex(full, fill_value=0.0)
         row_counts = row_counts.reindex(full, fill_value=0)
 
@@ -138,14 +221,20 @@ def aggregate_series(df: pd.DataFrame, spec: SeriesSpec) -> tuple[pd.Series, dic
 
 
 def _naive(y: np.ndarray, h: int) -> np.ndarray:
+    import numpy as np
+
     return np.repeat(y[-1], h)
 
 
 def _mean_last3(y: np.ndarray, h: int) -> np.ndarray:
+    import numpy as np
+
     return np.repeat(y[-min(3, len(y)):].mean(), h)
 
 
 def _drift(y: np.ndarray, h: int) -> np.ndarray:
+    import numpy as np
+
     if len(y) < 2:
         return _naive(y, h)
     slope = (y[-1] - y[0]) / (len(y) - 1)
@@ -153,6 +242,8 @@ def _drift(y: np.ndarray, h: int) -> np.ndarray:
 
 
 def _linear_trend(y: np.ndarray, h: int) -> np.ndarray:
+    import numpy as np
+
     if len(y) < 3:
         return _drift(y, h)
     x = np.arange(len(y), dtype=float)
@@ -162,6 +253,8 @@ def _linear_trend(y: np.ndarray, h: int) -> np.ndarray:
 
 def _trend_last6(y: np.ndarray, h: int) -> np.ndarray:
     """Linear trend on the recent window -- ignores an old, flatter regime."""
+    import numpy as np
+
     window = y[-min(6, len(y)):]
     if len(window) < 3:
         return _drift(y, h)
@@ -181,6 +274,8 @@ FORECASTERS: dict[str, Any] = {
 
 def _backtest(y: np.ndarray, fn: Any) -> float | None:
     """One-step-ahead expanding-window MAE. ``None`` if too short to test."""
+    import numpy as np
+
     n = len(y)
     folds = min(4, n - 3)
     if folds < 1:
@@ -195,7 +290,15 @@ def _backtest(y: np.ndarray, fn: Any) -> float | None:
 
 def forecast_series(series: pd.Series, horizon: int = 3) -> dict[str, Any]:
     """Forecast ``horizon`` periods, choosing the method by backtest MAE."""
+    import numpy as np
+
+    if isinstance(horizon, bool) or not isinstance(horizon, (int, np.integer)) or int(horizon) <= 0:
+        raise ValueError("Horizon must be a positive integer (>= 1).")
+    horizon = int(horizon)
+
     y = series.to_numpy(dtype=float)
+    if not np.isfinite(y).all():
+        raise ValueError("Series contains NaN or infinite values.")
     if len(y) < 3:
         raise ValueError(
             f"Only {len(y)} period(s) after aggregation -- need at least 3 to forecast. "
@@ -217,23 +320,23 @@ def forecast_series(series: pd.Series, horizon: int = 3) -> dict[str, Any]:
     last_period = series.index[-1]
     future = [str(last_period + i) for i in range(1, horizon + 1)]
 
-    warnings = []
+    fc_warnings = []
     if len(y) < MIN_POINTS_FOR_TREND:
-        warnings.append(
+        fc_warnings.append(
             f"Only {len(y)} periods of history -- treat this as a direction, not a number."
         )
     if not testable:
-        warnings.append("Series too short to backtest; showing the simplest method untested.")
+        fc_warnings.append("Series too short to backtest; showing the simplest method untested.")
     if clipped:
-        warnings.append("Fitted trend went negative and was clipped to zero.")
+        fc_warnings.append("Fitted trend went negative and was clipped to zero.")
     recent = y[-min(3, len(y)):].mean()
     earlier = y[: max(1, len(y) - 3)].mean()
     if earlier > 0 and recent / earlier > 2:
-        warnings.append(
+        fc_warnings.append(
             f"Recent periods average {recent / earlier:.1f}x the earlier ones -- there is a "
             "level shift in this series, so a single trend line understates the recent regime."
         )
-    warnings.append(
+    fc_warnings.append(
         "First and last periods are partial if the export window does not align to "
         "period boundaries. Use the drop-edge options to exclude them."
     )
@@ -250,7 +353,7 @@ def forecast_series(series: pd.Series, horizon: int = 3) -> dict[str, Any]:
         ],
         "history_total": float(y.sum()),
         "forecast_total": float(sum(values)),
-        "warnings": warnings,
+        "warnings": fc_warnings,
     }
 
 

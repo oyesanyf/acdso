@@ -321,6 +321,20 @@ class CausalAnalyzer:
         
         return self._model
     
+    @staticmethod
+    def _to_numeric_array(series: pd.Series) -> np.ndarray:
+        """Coerce a Series (including nullable/bool extension dtypes) to float64 with NaN for missing."""
+        if pd.api.types.is_bool_dtype(series.dtype):
+            return series.to_numpy(dtype=np.float64, na_value=np.nan)
+        return pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+
+    @classmethod
+    def _to_numeric_matrix(cls, df: pd.DataFrame, cols: List[str]) -> np.ndarray:
+        """Coerce selected columns to a 2D float64 ndarray."""
+        if not cols:
+            return np.empty((len(df), 0), dtype=np.float64)
+        return np.column_stack([cls._to_numeric_array(df[c]) for c in cols])
+
     def _auto_detect_confounders(self, df: pd.DataFrame) -> List[str]:
         """Auto-detect potential confounders."""
         exclude = {self.treatment_col, self.outcome_col}
@@ -335,7 +349,11 @@ class CausalAnalyzer:
         for col in df.columns:
             if col in exclude:
                 continue
-            if df[col].dtype in [np.float64, np.int64, float, int, bool]:
+            if (
+                pd.api.types.is_numeric_dtype(df[col])
+                and not pd.api.types.is_datetime64_any_dtype(df[col])
+                and not pd.api.types.is_timedelta64_dtype(df[col])
+            ):
                 confounders.append(col)
         
         return confounders
@@ -346,8 +364,9 @@ class CausalAnalyzer:
         report.confounders_identified = self.confounders or []
         
         # Treatment rate
-        treatment = df[self.treatment_col].values
-        report.treatment_rate = float(np.mean(treatment))
+        treatment = self._to_numeric_array(df[self.treatment_col])
+        finite_t = treatment[np.isfinite(treatment)]
+        report.treatment_rate = float(np.mean(finite_t)) if len(finite_t) > 0 else 0.0
         
         # Treatment imbalance
         if report.treatment_rate < 0.05 or report.treatment_rate > 0.95:
@@ -432,30 +451,34 @@ class CausalAnalyzer:
         """Compute propensity scores using logistic regression."""
         from sklearn.linear_model import LogisticRegression
         from sklearn.preprocessing import StandardScaler
-        
-        X = df[self.confounders].values
-        T = df[self.treatment_col].values
-        
-        # Handle NaN
-        mask = ~np.isnan(X).any(axis=1) & ~np.isnan(T)
+
+        if not self.confounders:
+            return np.full(len(df), 0.5)
+
+        X = self._to_numeric_matrix(df, self.confounders)
+        T = self._to_numeric_array(df[self.treatment_col])
+
+        # Handle NaN, pd.NA, and +-inf
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(T)
         X_clean = X[mask]
         T_clean = T[mask]
-        
-        if len(X_clean) < 10:
+
+        if len(X_clean) < 10 or len(np.unique(T_clean)) < 2:
             return np.full(len(df), 0.5)
-        
+
         # Scale features
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X_clean)
-        
+
         # Fit logistic regression
         model = LogisticRegression(max_iter=1000, random_state=42)
         model.fit(X_scaled, T_clean)
-        
-        # Predict propensity
-        X_all = scaler.transform(np.nan_to_num(X, nan=0))
+
+        # Predict propensity (impute non-finite entries with training column means)
+        X_safe = np.where(np.isfinite(X), X, scaler.mean_)
+        X_all = scaler.transform(X_safe)
         propensity = model.predict_proba(X_all)[:, 1]
-        
+
         return propensity
     
     def _detect_post_treatment_features(self, df: pd.DataFrame) -> List[str]:
@@ -463,19 +486,20 @@ class CausalAnalyzer:
         post_treatment = []
         
         # Heuristic: features highly correlated with treatment might be post-treatment
-        treatment = df[self.treatment_col].values
+        treatment = self._to_numeric_array(df[self.treatment_col])
         
         for col in self.confounders or []:
             if col == self.treatment_col:
                 continue
             
             try:
-                values = df[col].values
-                corr = np.corrcoef(treatment, values)[0, 1]
-                
-                # Very high correlation might indicate post-treatment
-                if abs(corr) > 0.9:
-                    post_treatment.append(col)
+                values = self._to_numeric_array(df[col])
+                valid = np.isfinite(treatment) & np.isfinite(values)
+                if int(valid.sum()) >= 2:
+                    corr = np.corrcoef(treatment[valid], values[valid])[0, 1]
+                    # Very high correlation might indicate post-treatment
+                    if np.isfinite(corr) and abs(corr) > 0.9:
+                        post_treatment.append(col)
             except Exception:
                 pass
         
@@ -501,10 +525,12 @@ class CausalAnalyzer:
         if not self.confounders:
             return None
         
-        X = df[self.confounders].values
-        T = df[self.treatment_col].values
+        X = self._to_numeric_matrix(df, self.confounders)
+        T = self._to_numeric_array(df[self.treatment_col])
         
-        mask = ~np.isnan(X).any(axis=1) & ~np.isnan(T)
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(T)
+        if int(mask.sum()) < 2 or len(np.unique(T[mask])) < 2:
+            return None
         
         pipeline = Pipeline([
             ('scaler', StandardScaler()),
@@ -626,13 +652,25 @@ class CausalAnalyzer:
         
         # Simple regression adjustment
         if self.confounders:
-            X = df[self.confounders + [self.treatment_col]].values
+            X = self._to_numeric_matrix(df, self.confounders + [self.treatment_col])
         else:
-            X = df[[self.treatment_col]].values
+            X = self._to_numeric_matrix(df, [self.treatment_col])
         
-        y = df[self.outcome_col].values
+        y = self._to_numeric_array(df[self.outcome_col])
         
-        mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        if int(mask.sum()) < 2:
+            ate = CausalEstimate(
+                effect=0.0,
+                effect_type='ate',
+                method='linear_regression_adjustment',
+            )
+            att = CausalEstimate(
+                effect=0.0,
+                effect_type='att',
+                method='inverse_propensity_weighting',
+            )
+            return ate, att
         
         model = LinearRegression()
         model.fit(X[mask], y[mask])
@@ -651,15 +689,25 @@ class CausalAnalyzer:
         
         # IPW estimate for ATT
         propensity = self._compute_propensity_scores(df)
-        treatment = df[self.treatment_col].values
-        outcome = df[self.outcome_col].values
+        treatment = self._to_numeric_array(df[self.treatment_col])
+        outcome = y
         
-        # IPW weights
-        weights = np.where(treatment == 1, 1, propensity / (1 - propensity + 1e-10))
+        # IPW weights (mask out non-finite outcome/treatment/propensity)
+        att_mask = np.isfinite(outcome) & np.isfinite(treatment) & np.isfinite(propensity)
+        treated_mask = att_mask & (treatment == 1)
+        control_mask = att_mask & (treatment == 0)
+        weights = np.where(treatment == 1, 1.0, propensity / (1.0 - propensity + 1e-10))
         
         # Weighted mean difference
-        treated_mean = np.average(outcome[treatment == 1], weights=weights[treatment == 1])
-        control_mean = np.average(outcome[treatment == 0], weights=weights[treatment == 0])
+        if treated_mask.any() and np.sum(weights[treated_mask]) > 0:
+            treated_mean = float(np.average(outcome[treated_mask], weights=weights[treated_mask]))
+        else:
+            treated_mean = 0.0
+        
+        if control_mask.any() and np.sum(weights[control_mask]) > 0:
+            control_mean = float(np.average(outcome[control_mask], weights=weights[control_mask]))
+        else:
+            control_mean = 0.0
         
         att = CausalEstimate(
             effect=float(treated_mean - control_mean),

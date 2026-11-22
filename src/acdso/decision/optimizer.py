@@ -36,6 +36,17 @@ import numpy as np
 import pandas as pd
 
 
+def _to_float_array(series: pd.Series) -> np.ndarray:
+    """Coerce a pandas Series (including nullable/extension dtypes) to float64 ndarray."""
+    return pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+
+
+def _iter_group_masks(series: pd.Series) -> List[np.ndarray]:
+    """Return boolean NumPy masks for each distinct non-null group in ``series``."""
+    codes, _ = pd.factorize(series, sort=False, use_na_sentinel=True)
+    return [codes == c for c in np.unique(codes) if c >= 0]
+
+
 @dataclass
 class Constraint(ABC):
     """Base class for optimization constraints."""
@@ -76,20 +87,34 @@ class BudgetConstraint(Constraint):
     name: str = 'budget'
     
     def is_feasible(self, selected: np.ndarray, df: pd.DataFrame) -> bool:
-        costs = df[self.cost_col].values
-        return float(np.sum(costs * selected)) <= self.max_budget
+        selected_mask = np.asarray(selected) == 1
+        if not np.any(selected_mask):
+            return 0.0 <= self.max_budget
+        costs = _to_float_array(df[self.cost_col])[selected_mask]
+        if not np.all(np.isfinite(costs)) or np.any(costs < 0):
+            return False
+        return float(np.sum(costs)) <= self.max_budget
     
     def get_violation(self, selected: np.ndarray, df: pd.DataFrame) -> float:
-        costs = df[self.cost_col].values
-        total = float(np.sum(costs * selected))
-        return max(0, total - self.max_budget)
+        selected_mask = np.asarray(selected) == 1
+        if not np.any(selected_mask):
+            return float(max(0.0, 0.0 - self.max_budget))
+        costs = _to_float_array(df[self.cost_col])[selected_mask]
+        if not np.all(np.isfinite(costs)) or np.any(costs < 0):
+            return float('inf')
+        total = float(np.sum(costs))
+        return float(max(0.0, total - self.max_budget))
     
     def add_to_solver(self, solver, variables, df: pd.DataFrame):
-        costs = df[self.cost_col].values
-        solver.Add(
-            solver.Sum(float(costs[i]) * variables[i] for i in range(len(variables)))
-            <= self.max_budget
-        )
+        costs = _to_float_array(df[self.cost_col])
+        terms = []
+        for i in range(len(variables)):
+            if np.isfinite(costs[i]) and costs[i] >= 0:
+                terms.append(float(costs[i]) * variables[i])
+            else:
+                solver.Add(variables[i] == 0)
+        if terms:
+            solver.Add(solver.Sum(terms) <= self.max_budget)
 
 
 @dataclass
@@ -148,54 +173,46 @@ class FairnessConstraint(Constraint):
     name: str = 'fairness'
     
     def is_feasible(self, selected: np.ndarray, df: pd.DataFrame) -> bool:
-        groups = df[self.group_col].values
-        unique_groups = np.unique(groups)
-        
+        selected_arr = np.asarray(selected)
         rates = []
-        for g in unique_groups:
-            mask = groups == g
-            if mask.sum() > 0:
-                rate = selected[mask].sum() / mask.sum()
-                rates.append(rate)
-                
-                if self.min_per_group > 0 and selected[mask].sum() < self.min_per_group:
+        for mask in _iter_group_masks(df[self.group_col]):
+            count = int(mask.sum())
+            if count > 0:
+                sel_sum = float(selected_arr[mask].sum())
+                rates.append(sel_sum / count)
+
+                if self.min_per_group > 0 and sel_sum < self.min_per_group:
                     return False
-        
+
         if len(rates) < 2:
             return True
-        
-        return max(rates) - min(rates) <= self.max_disparity
-    
+
+        return float(max(rates) - min(rates)) <= self.max_disparity
+
     def get_violation(self, selected: np.ndarray, df: pd.DataFrame) -> float:
-        groups = df[self.group_col].values
-        unique_groups = np.unique(groups)
-        
+        selected_arr = np.asarray(selected)
         rates = []
-        min_violations = 0
-        
-        for g in unique_groups:
-            mask = groups == g
-            if mask.sum() > 0:
-                rate = selected[mask].sum() / mask.sum()
-                rates.append(rate)
-                
+        min_violations = 0.0
+
+        for mask in _iter_group_masks(df[self.group_col]):
+            count = int(mask.sum())
+            if count > 0:
+                sel_sum = float(selected_arr[mask].sum())
+                rates.append(sel_sum / count)
+
                 if self.min_per_group > 0:
-                    min_violations += max(0, self.min_per_group - selected[mask].sum())
-        
-        disparity = max(rates) - min(rates) if len(rates) >= 2 else 0.0
-        disparity_violation = max(0, disparity - self.max_disparity)
-        
-        return disparity_violation + min_violations
-    
+                    min_violations += max(0.0, float(self.min_per_group) - sel_sum)
+
+        disparity = float(max(rates) - min(rates)) if len(rates) >= 2 else 0.0
+        disparity_violation = max(0.0, disparity - self.max_disparity)
+
+        return float(disparity_violation + min_violations)
+
     def add_to_solver(self, solver, variables, df: pd.DataFrame):
-        groups = df[self.group_col].values
-        unique_groups = np.unique(groups)
-        
         # This is an approximation - exact fairness is more complex
-        for g in unique_groups:
-            mask = groups == g
+        for mask in _iter_group_masks(df[self.group_col]):
             group_vars = [variables[i] for i in range(len(variables)) if mask[i]]
-            
+
             if self.min_per_group > 0 and len(group_vars) > 0:
                 solver.Add(solver.Sum(group_vars) >= self.min_per_group)
 
@@ -221,11 +238,16 @@ class ROIConstraint(Constraint):
     name: str = 'roi'
     
     def is_feasible(self, selected: np.ndarray, df: pd.DataFrame) -> bool:
-        values = df[self.value_col].values
-        costs = df[self.cost_col].values
+        selected_mask = np.asarray(selected) == 1
+        if not np.any(selected_mask):
+            return True
+        values = _to_float_array(df[self.value_col])[selected_mask]
+        costs = _to_float_array(df[self.cost_col])[selected_mask]
+        if not np.all(np.isfinite(values)) or not np.all(np.isfinite(costs)) or np.any(costs < 0):
+            return False
         
-        total_value = float(np.sum(values * selected))
-        total_cost = float(np.sum(costs * selected))
+        total_value = float(np.sum(values))
+        total_cost = float(np.sum(costs))
         
         if total_cost == 0:
             return True
@@ -233,27 +255,37 @@ class ROIConstraint(Constraint):
         return total_value / total_cost >= self.min_roi
     
     def get_violation(self, selected: np.ndarray, df: pd.DataFrame) -> float:
-        values = df[self.value_col].values
-        costs = df[self.cost_col].values
+        selected_mask = np.asarray(selected) == 1
+        if not np.any(selected_mask):
+            return 0.0
+        values = _to_float_array(df[self.value_col])[selected_mask]
+        costs = _to_float_array(df[self.cost_col])[selected_mask]
+        if not np.all(np.isfinite(values)) or not np.all(np.isfinite(costs)) or np.any(costs < 0):
+            return float('inf')
         
-        total_value = float(np.sum(values * selected))
-        total_cost = float(np.sum(costs * selected))
+        total_value = float(np.sum(values))
+        total_cost = float(np.sum(costs))
         
         if total_cost == 0:
             return 0.0
         
         roi = total_value / total_cost
-        return max(0, self.min_roi - roi)
+        return float(max(0.0, self.min_roi - roi))
     
     def add_to_solver(self, solver, variables, df: pd.DataFrame):
         # ROI constraint is non-linear, approximate with value >= min_roi * cost
-        values = df[self.value_col].values
-        costs = df[self.cost_col].values
-        
-        solver.Add(
-            solver.Sum(float(values[i]) * variables[i] for i in range(len(variables)))
-            >= self.min_roi * solver.Sum(float(costs[i]) * variables[i] for i in range(len(variables)))
-        )
+        values = _to_float_array(df[self.value_col])
+        costs = _to_float_array(df[self.cost_col])
+        val_terms = []
+        cost_terms = []
+        for i in range(len(variables)):
+            if np.isfinite(values[i]) and np.isfinite(costs[i]) and costs[i] >= 0:
+                val_terms.append(float(values[i]) * variables[i])
+                cost_terms.append(float(costs[i]) * variables[i])
+            else:
+                solver.Add(variables[i] == 0)
+        if val_terms:
+            solver.Add(solver.Sum(val_terms) >= self.min_roi * solver.Sum(cost_terms))
 
 
 @dataclass
@@ -425,15 +457,26 @@ class ActionOptimizer:
             return self._optimize_greedy(df, verbose)
         
         n = len(df)
-        values = df[self.value_col].values
+        values = _to_float_array(df[self.value_col])
+        eligible = np.isfinite(values)
+        if self.cost_col:
+            costs = _to_float_array(df[self.cost_col])
+            eligible = eligible & np.isfinite(costs) & (costs >= 0)
+        else:
+            costs = None
         
         # Create binary decision variables
         x = [solver.IntVar(0, 1, f'x_{i}') for i in range(n)]
         
-        # Objective: maximize total value
-        solver.Maximize(
-            solver.Sum(float(values[i]) * x[i] for i in range(n))
-        )
+        # Objective: maximize total value (mark non-finite/negative-cost rows ineligible)
+        obj_terms = []
+        for i in range(n):
+            if eligible[i]:
+                obj_terms.append(float(values[i]) * x[i])
+            else:
+                solver.Add(x[i] == 0)
+        if obj_terms:
+            solver.Maximize(solver.Sum(obj_terms))
         
         # Add constraints
         for constraint in self._constraints:
@@ -452,12 +495,12 @@ class ActionOptimizer:
             selected = np.zeros(n, dtype=int)
             solver_status = 'infeasible'
         
-        # Compute metrics
-        total_value = float(np.sum(values * selected))
+        # Compute metrics strictly over selected rows
+        selected_mask = selected == 1
+        total_value = float(np.sum(values[selected_mask])) if np.any(selected_mask) else 0.0
         
         if self.cost_col:
-            costs = df[self.cost_col].values
-            total_cost = float(np.sum(costs * selected))
+            total_cost = float(np.sum(costs[selected_mask])) if np.any(selected_mask) else 0.0
             roi = total_value / total_cost if total_cost > 0 else 0.0
         else:
             total_cost = 0.0
@@ -498,21 +541,26 @@ class ActionOptimizer:
         start_time = time.time()
         
         n = len(df)
-        values = df[self.value_col].values
+        values = _to_float_array(df[self.value_col])
+        eligible = np.isfinite(values)
         
         if self.cost_col:
-            costs = df[self.cost_col].values
-            # Sort by value/cost ratio (ROI)
+            costs = _to_float_array(df[self.cost_col])
+            eligible = eligible & np.isfinite(costs) & (costs >= 0)
+            eligible_indices = np.where(eligible)[0]
+            # Sort eligible rows by value/cost ratio (ROI)
             with np.errstate(divide='ignore', invalid='ignore'):
-                ratios = values / (costs + 1e-10)
-            order = np.argsort(-ratios)
+                ratios = values[eligible_indices] / (costs[eligible_indices] + 1e-10)
+            order = eligible_indices[np.argsort(-ratios)]
         else:
-            # Sort by value
-            order = np.argsort(-values)
+            costs = None
+            eligible_indices = np.where(eligible)[0]
+            # Sort eligible rows by value
+            order = eligible_indices[np.argsort(-values[eligible_indices])]
         
         selected = np.zeros(n, dtype=int)
         
-        # Greedily add units while constraints satisfied
+        # Greedily add eligible units while constraints satisfied
         for idx in order:
             selected[idx] = 1
             
@@ -528,12 +576,12 @@ class ActionOptimizer:
         
         solve_time = time.time() - start_time
         
-        # Compute metrics
-        total_value = float(np.sum(values * selected))
+        # Compute metrics strictly over selected rows
+        selected_mask = selected == 1
+        total_value = float(np.sum(values[selected_mask])) if np.any(selected_mask) else 0.0
         
         if self.cost_col:
-            costs = df[self.cost_col].values
-            total_cost = float(np.sum(costs * selected))
+            total_cost = float(np.sum(costs[selected_mask])) if np.any(selected_mask) else 0.0
             roi = total_value / total_cost if total_cost > 0 else 0.0
         else:
             total_cost = 0.0
@@ -627,40 +675,59 @@ def knapsack_optimize(
     total_value : float
         Total value of selected items.
     """
+    vals_arr = _to_float_array(values) if isinstance(values, (pd.Series, pd.Index, pd.api.extensions.ExtensionArray)) else np.asarray(values, dtype=np.float64)
+    wts_arr = _to_float_array(weights) if isinstance(weights, (pd.Series, pd.Index, pd.api.extensions.ExtensionArray)) else np.asarray(weights, dtype=np.float64)
+    eligible = np.isfinite(vals_arr) & np.isfinite(wts_arr) & (wts_arr >= 0)
     try:
         from ortools.linear_solver import pywraplp
-        
+
         solver = pywraplp.Solver.CreateSolver('CBC')
-        n = len(values)
-        
+        n = len(vals_arr)
+
         x = [solver.IntVar(0, 1, f'x_{i}') for i in range(n)]
-        
-        solver.Maximize(solver.Sum(float(values[i]) * x[i] for i in range(n)))
-        solver.Add(solver.Sum(float(weights[i]) * x[i] for i in range(n)) <= capacity)
-        
+
+        obj_terms = []
+        wt_terms = []
+        for i in range(n):
+            if eligible[i]:
+                obj_terms.append(float(vals_arr[i]) * x[i])
+                wt_terms.append(float(wts_arr[i]) * x[i])
+            else:
+                solver.Add(x[i] == 0)
+
+        if obj_terms:
+            solver.Maximize(solver.Sum(obj_terms))
+        if wt_terms:
+            solver.Add(solver.Sum(wt_terms) <= capacity)
+
         status = solver.Solve()
-        
+
         if status == pywraplp.Solver.OPTIMAL:
             selected = np.array([int(x[i].solution_value()) for i in range(n)])
         else:
             selected = np.zeros(n, dtype=int)
-        
-        return selected, float(np.sum(values * selected))
-        
+
+        selected_mask = selected == 1
+        total_val = float(np.sum(vals_arr[selected_mask])) if np.any(selected_mask) else 0.0
+        return selected, total_val
+
     except ImportError:
         # Greedy fallback
-        ratios = values / (weights + 1e-10)
-        order = np.argsort(-ratios)
-        
-        selected = np.zeros(len(values), dtype=int)
+        eligible_indices = np.where(eligible)[0]
+        ratios = vals_arr[eligible_indices] / (wts_arr[eligible_indices] + 1e-10)
+        order = eligible_indices[np.argsort(-ratios)]
+
+        selected = np.zeros(len(vals_arr), dtype=int)
         current_weight = 0.0
-        
+
         for idx in order:
-            if current_weight + weights[idx] <= capacity:
+            if current_weight + wts_arr[idx] <= capacity:
                 selected[idx] = 1
-                current_weight += weights[idx]
-        
-        return selected, float(np.sum(values * selected))
+                current_weight += wts_arr[idx]
+
+        selected_mask = selected == 1
+        total_val = float(np.sum(vals_arr[selected_mask])) if np.any(selected_mask) else 0.0
+        return selected, total_val
 
 
 def ilp_optimize(

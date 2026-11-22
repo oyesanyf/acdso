@@ -148,8 +148,10 @@ class TLearner(BaseEstimator):
     """
     
     def __init__(self, base_model=None):
-        self.base_model = base_model or GradientBoostingRegressor(
-            n_estimators=100, max_depth=5, random_state=42
+        self.base_model = (
+            base_model
+            if base_model is not None
+            else GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42)
         )
         self._model_t1 = None
         self._model_t0 = None
@@ -191,8 +193,10 @@ class SLearner(BaseEstimator):
     """
     
     def __init__(self, base_model=None):
-        self.base_model = base_model or GradientBoostingRegressor(
-            n_estimators=100, max_depth=5, random_state=42
+        self.base_model = (
+            base_model
+            if base_model is not None
+            else GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42)
         )
         self._model = None
     
@@ -233,10 +237,16 @@ class XLearner(BaseEstimator):
     """
     
     def __init__(self, base_model=None, propensity_model=None):
-        self.base_model = base_model or GradientBoostingRegressor(
-            n_estimators=100, max_depth=5, random_state=42
+        self.base_model = (
+            base_model
+            if base_model is not None
+            else GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42)
         )
-        self.propensity_model = propensity_model or LogisticRegression(max_iter=1000)
+        self.propensity_model = (
+            propensity_model
+            if propensity_model is not None
+            else LogisticRegression(max_iter=1000)
+        )
         
         self._model_t1 = None
         self._model_t0 = None
@@ -328,11 +338,19 @@ class DRLearner(BaseEstimator):
                 from econml.dr import DRLearner as EconMLDRLearner
                 
                 self._econml_model = EconMLDRLearner(
-                    model_regression=self.model_y or RandomForestRegressor(
-                        n_estimators=100, random_state=42
+                    model_regression=(
+                        self.model_y
+                        if self.model_y is not None
+                        else RandomForestRegressor(n_estimators=100, random_state=42)
                     ),
-                    model_propensity=self.model_t or LogisticRegression(max_iter=1000),
-                    model_final=self.model_final or Ridge(),
+                    model_propensity=(
+                        self.model_t
+                        if self.model_t is not None
+                        else LogisticRegression(max_iter=1000)
+                    ),
+                    model_final=(
+                        self.model_final if self.model_final is not None else Ridge()
+                    ),
                     random_state=42,
                 )
                 
@@ -344,10 +362,16 @@ class DRLearner(BaseEstimator):
         
         # Fallback to X-Learner if EconML unavailable
         self._fallback_model = XLearner(
-            base_model=self.model_y or GradientBoostingRegressor(
-                n_estimators=100, max_depth=5, random_state=42
+            base_model=(
+                self.model_y
+                if self.model_y is not None
+                else GradientBoostingRegressor(n_estimators=100, max_depth=5, random_state=42)
             ),
-            propensity_model=self.model_t or LogisticRegression(max_iter=1000),
+            propensity_model=(
+                self.model_t
+                if self.model_t is not None
+                else LogisticRegression(max_iter=1000)
+            ),
         )
         self._fallback_model.fit(X, y, treatment)
         
@@ -636,6 +660,18 @@ class UpliftModeler:
         
         self._result: Optional[UpliftResult] = None
         self._best_model: Optional[BaseEstimator] = None
+        self._feature_medians: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _coerce_features(df: pd.DataFrame, feature_cols: List[str]) -> np.ndarray:
+        """Coerce feature columns (including nullable extension dtypes) to float64 with non-finite as NaN."""
+        if not feature_cols:
+            return np.empty((len(df), 0), dtype=np.float64)
+        X = df[feature_cols].apply(pd.to_numeric, errors="coerce").to_numpy(
+            dtype=np.float64, na_value=np.nan
+        )
+        X[~np.isfinite(X)] = np.nan
+        return X
     
     def fit(
         self,
@@ -664,16 +700,24 @@ class UpliftModeler:
             self.feature_cols = [
                 c for c in df.columns
                 if c not in [self.treatment_col, self.outcome_col]
-                and df[c].dtype in [np.float64, np.int64, float, int, bool]
+                and pd.api.types.is_numeric_dtype(df[c])
             ]
         
-        X = df[self.feature_cols].values
-        y = df[self.outcome_col].values
-        treatment = df[self.treatment_col].values
+        X = self._coerce_features(df, self.feature_cols)
+        y = pd.to_numeric(df[self.outcome_col], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        treatment = pd.to_numeric(df[self.treatment_col], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
         
-        # Handle NaN
-        mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y) & ~np.isnan(treatment)
+        # Handle NaN / Inf
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(y) & np.isfinite(treatment)
         X, y, treatment = X[mask], y[mask], treatment[mask]
+
+        if len(X) > 0 and X.shape[1] > 0:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                medians = np.nanmedian(X, axis=0)
+            self._feature_medians = np.where(np.isfinite(medians), medians, 0.0)
+        else:
+            self._feature_medians = np.zeros(len(self.feature_cols), dtype=np.float64)
         
         if verbose:
             print("=" * 50)
@@ -685,8 +729,9 @@ class UpliftModeler:
             print(f"Models to evaluate: {self.models}")
         
         # Evaluate each model
-        model_scores = {}
-        model_ites = {}
+        valid_scores: Dict[str, float] = {}
+        model_ites: Dict[str, np.ndarray] = {}
+        model_errors: Dict[str, str] = {}
         
         for model_name in self.models:
             try:
@@ -702,7 +747,10 @@ class UpliftModeler:
                 qini = qini_score(y, ite, treatment)
                 auuc = auuc_score(y, ite, treatment)
                 
-                model_scores[model_name] = (qini + auuc) / 2
+                score = float((qini + auuc) / 2)
+                if not np.isfinite(score):
+                    raise ValueError(f"Non-finite uplift score: {score}")
+                valid_scores[model_name] = score
                 model_ites[model_name] = ite
                 
                 if verbose:
@@ -711,11 +759,15 @@ class UpliftModeler:
             except Exception as e:
                 if verbose:
                     print(f"  Failed: {str(e)[:50]}")
-                model_scores[model_name] = 0.0
+                model_errors[model_name] = str(e)
         
-        # Select best model
-        best_model_name = max(model_scores.keys(), key=lambda k: model_scores[k])
-        best_ite = model_ites.get(best_model_name, np.zeros(len(X)))
+        if not valid_scores:
+            raise RuntimeError(f"All uplift models failed to fit: {model_errors}")
+
+        # Select best model from models that actually succeeded
+        best_model_name = max(valid_scores.keys(), key=lambda k: valid_scores[k])
+        best_ite = model_ites[best_model_name]
+        model_scores = valid_scores
         
         # Refit best model on full data
         self._best_model = self._create_model(best_model_name)
@@ -814,7 +866,18 @@ class UpliftModeler:
         if self._best_model is None:
             raise RuntimeError("Must call fit() before predict()")
         
-        X = df[self.feature_cols].values
+        X = self._coerce_features(df, self.feature_cols)
+        if X.shape[1] > 0:
+            if self._feature_medians is not None and len(self._feature_medians) == X.shape[1]:
+                fill_vals = self._feature_medians
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    med = np.nanmedian(X, axis=0) if len(X) > 0 else np.zeros(X.shape[1])
+                fill_vals = np.where(np.isfinite(med), med, 0.0)
+            nan_r, nan_c = np.where(np.isnan(X))
+            if nan_r.size > 0:
+                X[nan_r, nan_c] = fill_vals[nan_c]
         return self._best_model.effect(X)
     
     @property

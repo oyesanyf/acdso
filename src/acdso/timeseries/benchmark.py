@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 from .core import AutoTS, AutoTSResult
+from .transformers import _coerce_datetime_series
 from .metrics import evaluate_forecast, mae, rmse, mape, smape, mase
 from .splits import WalkForwardSplit
 
@@ -167,8 +168,12 @@ class TimeSeriesBenchmark:
         - 'pycaret': PyCaret Time Series
         - 'neuralprophet': NeuralProphet
         - 'darts': Darts
+        - 'timesfm': Google's TimesFM pretrained foundation model
+          (requires ``pip install timesfm[torch]``; skipped automatically
+          if there's too little history to be worth it -- see
+          ``_run_timesfm``)
     """
-    
+
     AVAILABLE_SYSTEMS = [
         'acdso',
         'prophet',
@@ -180,6 +185,7 @@ class TimeSeriesBenchmark:
         'pycaret',
         'neuralprophet',
         'darts',
+        'timesfm',
     ]
     
     def __init__(
@@ -217,6 +223,7 @@ class TimeSeriesBenchmark:
             'pycaret': 'pycaret.time_series',
             'neuralprophet': 'neuralprophet',
             'darts': 'darts',
+            'timesfm': 'timesfm3',
         }
         
         for system, module in system_imports.items():
@@ -316,16 +323,34 @@ class TimeSeriesBenchmark:
     def _prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Prepare and validate the data."""
         df = df.copy()
-        df[self.datetime_col] = pd.to_datetime(df[self.datetime_col])
+        df[self.datetime_col] = _coerce_datetime_series(df[self.datetime_col])
         df = df.sort_values(self.datetime_col).reset_index(drop=True)
         
         # Keep only datetime_col, target_col, and numeric columns to avoid dtype errors
         cols_to_keep = [self.datetime_col, self.target_col]
         for col in df.columns:
             if col not in cols_to_keep:
-                if np.issubdtype(df[col].dtype, np.number):
+                if (
+                    pd.api.types.is_numeric_dtype(df[col])
+                    and not pd.api.types.is_datetime64_any_dtype(df[col])
+                    and not pd.api.types.is_timedelta64_dtype(df[col])
+                ):
                     cols_to_keep.append(col)
         df = df[cols_to_keep]
+
+        for col in cols_to_keep:
+            if col == self.datetime_col:
+                continue
+            coerced = (
+                pd.to_numeric(df[col], errors="coerce")
+                .astype(np.float64)
+                .replace([np.inf, -np.inf], np.nan)
+            )
+            if col != self.target_col:
+                coerced = coerced.ffill().bfill().fillna(0.0)
+            df[col] = coerced
+
+        df = df.dropna(subset=[self.target_col]).reset_index(drop=True)
         
         return df
     
@@ -808,9 +833,65 @@ class TimeSeriesBenchmark:
         except Exception as e:
             result.status = 'error'
             result.error_message = str(e)
-        
+
         return result
-    
+
+    def _run_timesfm(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        dataset_name: str,
+    ) -> TSBenchmarkResult:
+        """Run Google's TimesFM pretrained foundation model (zero-shot).
+
+        Reuses the same TimesFMForecaster adapter as the AutoTS candidate
+        pool, so there's one place that knows how to call the model.
+        Skips cleanly (status='error', not a crash) below the adapter's
+        own min_context_length -- a foundation model has nothing to offer
+        over the naive baselines on a dozen-point series. Also fails
+        cleanly into status='error' (caught by _run_system's try/except)
+        if huggingface.co is unreachable at inference time -- required to
+        fetch the pretrained weights, and blocked by policy in some
+        network environments. See TimesFMForecaster's docstring.
+        """
+        result = TSBenchmarkResult(system='timesfm', dataset=dataset_name)
+
+        try:
+            from .candidates import TimesFMForecaster
+
+            model = TimesFMForecaster()
+            if len(y_train) < model.min_context_length:
+                result.status = 'error'
+                result.error_message = (
+                    f"Only {len(y_train)} training points; TimesFM needs at least "
+                    f"{model.min_context_length} to be worth running."
+                )
+                return result
+
+            t0 = time.time()
+            model.fit(None, y_train)
+            result.fit_time = time.time() - t0
+
+            t0 = time.time()
+            y_pred = model.predict(np.zeros(len(test_df)))
+            result.predict_time = time.time() - t0
+
+            result.mae = mae(y_test, y_pred)
+            result.rmse = rmse(y_test, y_pred)
+            result.mape = mape(y_test, y_pred)
+            result.smape = smape(y_test, y_pred)
+            result.mase = mase(y_test, y_pred, y_train)
+
+            result.status = 'success'
+
+        except Exception as e:
+            result.status = 'error'
+            result.error_message = str(e)
+
+        return result
+
     def _run_pycaret(
         self,
         train_df: pd.DataFrame,

@@ -45,12 +45,14 @@ Standalone Functions:
 
 from __future__ import annotations
 
+import html as _html
 import json
 import math
 import os
 import time
 import warnings
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
@@ -61,6 +63,33 @@ import pandas as pd
 from scipy import stats
 
 from acdso.utils import split_columns, compute_missing_ratio
+
+
+def _finite_float(val: Any, ndigits: Optional[int] = None) -> Optional[float]:
+    """Return a finite Python float (optionally rounded), or None if non-finite."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return round(f, ndigits) if ndigits is not None else f
+
+
+def _sanitize_json_obj(obj: Any) -> Any:
+    """Recursively sanitize dicts/lists/scalars for strict RFC 8259 JSON (allow_nan=False)."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_json_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json_obj(v) for v in obj]
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        return f if math.isfinite(f) else None
+    return obj
 
 
 # ============================================================================
@@ -209,7 +238,7 @@ class CorrelationResult:
     method: str = "pearson"
     
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _sanitize_json_obj(asdict(self))
 
 
 @dataclass 
@@ -222,7 +251,7 @@ class AnomalyResult:
     description: str
     
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _sanitize_json_obj(asdict(self))
 
 
 @dataclass
@@ -263,7 +292,7 @@ class DataQualityReport:
     recommendations: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _sanitize_json_obj(asdict(self))
 
 
 @dataclass
@@ -336,7 +365,7 @@ class EDAReport:
     selected_analyses: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _sanitize_json_obj(asdict(self))
 
 
 # ============================================================================
@@ -344,95 +373,142 @@ class EDAReport:
 # ============================================================================
 
 def _profile_numeric_column(series: pd.Series, name: str) -> ColumnProfile:
-    """Profile a numeric column."""
-    # Convert boolean to int to avoid numpy issues with quantile/stats
-    if series.dtype == 'bool' or series.dtype == 'boolean':
-        series = series.astype(int)
-    
-    clean = series.dropna()
-    n_total = len(series)
-    n_missing = int(series.isna().sum())
-    
-    # Also convert clean series if it's boolean
-    if clean.dtype == 'bool' or clean.dtype == 'boolean':
-        clean = clean.astype(int)
-    
-    if len(clean) == 0:
-        return ColumnProfile(
-            name=name,
-            dtype=str(series.dtype),
+    """Profile a single numeric column (delegates to vectorized batch profiler)."""
+    df_one = pd.DataFrame({name: series})
+    return _profile_numeric_batch(df_one, [name])[str(name)]
+
+
+def _profile_numeric_batch(df: pd.DataFrame, cols: List[str]) -> Dict[str, ColumnProfile]:
+    """Vectorized batch profiling for numeric columns."""
+    profiles: Dict[str, ColumnProfile] = {}
+    if not cols:
+        return profiles
+
+    n_total = len(df)
+    if n_total == 0:
+        for col in cols:
+            profiles[str(col)] = ColumnProfile(
+                name=str(col),
+                dtype=str(df[col].dtype),
+                n_unique=0,
+                n_missing=0,
+                missing_pct=0.0,
+                is_constant=True,
+            )
+        return profiles
+
+    sub = df[cols]
+    bool_cols = [c for c in cols if sub[c].dtype == "bool" or str(sub[c].dtype) == "boolean"]
+    if bool_cols:
+        sub = sub.copy()
+        for bc in bool_cols:
+            sub[bc] = sub[bc].astype("float64")
+
+    raw_arr = sub.astype(float, copy=False).to_numpy(dtype=float, copy=False)
+    nan_mask = np.isnan(raw_arr)
+    finite_mask = np.isfinite(raw_arr)
+    n_missing_arr = np.sum(nan_mask, axis=0)
+    n_finite_arr = np.sum(finite_mask, axis=0)
+    arr = raw_arr if finite_mask.all() else np.where(finite_mask, raw_arr, np.nan)
+
+    non_empty_idx = np.flatnonzero(n_finite_arr > 0)
+    empty_idx = np.flatnonzero(n_finite_arr == 0)
+
+    for idx in empty_idx.tolist():
+        col = cols[idx]
+        profiles[str(col)] = ColumnProfile(
+            name=str(col),
+            dtype=str(sub.iloc[:, idx].dtype),
             n_unique=0,
-            n_missing=n_missing,
-            missing_pct=100.0,
+            n_missing=int(n_missing_arr[idx]),
+            missing_pct=round(int(n_missing_arr[idx]) / n_total * 100, 2) if n_total > 0 else 0.0,
             is_constant=True,
         )
-    
-    # Basic stats
-    mean_val = float(clean.mean())
-    std_val = float(clean.std()) if len(clean) > 1 else 0.0
-    min_val = float(clean.min())
-    max_val = float(clean.max())
-    median_val = float(clean.median())
-    q25 = float(clean.quantile(0.25))
-    q75 = float(clean.quantile(0.75))
-    
-    # Distribution stats
-    try:
-        skew = float(stats.skew(clean))
-        kurt = float(stats.kurtosis(clean))
-    except Exception:
-        skew, kurt = 0.0, 0.0
-    
-    # Counts
-    n_unique = int(clean.nunique())
-    n_zeros = int((clean == 0).sum())
-    n_negative = int((clean < 0).sum())
-    
-    # Outliers (IQR method)
-    iqr = q75 - q25
-    lower_bound = q25 - 1.5 * iqr
-    upper_bound = q75 + 1.5 * iqr
-    n_outliers_iqr = int(((clean < lower_bound) | (clean > upper_bound)).sum())
-    
-    # Outliers (Z-score method)
-    if std_val > 0:
-        z_scores = np.abs((clean - mean_val) / std_val)
-        n_outliers_zscore = int((z_scores > 3).sum())
-    else:
-        n_outliers_zscore = 0
-    
-    return ColumnProfile(
-        name=name,
-        dtype=str(series.dtype),
-        n_unique=n_unique,
-        n_missing=n_missing,
-        missing_pct=round(n_missing / n_total * 100, 2) if n_total > 0 else 0.0,
-        mean=round(mean_val, 6),
-        std=round(std_val, 6),
-        min_val=round(min_val, 6),
-        max_val=round(max_val, 6),
-        median=round(median_val, 6),
-        q25=round(q25, 6),
-        q75=round(q75, 6),
-        skewness=round(skew, 4),
-        kurtosis=round(kurt, 4),
-        n_zeros=n_zeros,
-        n_negative=n_negative,
-        n_outliers_iqr=n_outliers_iqr,
-        n_outliers_zscore=n_outliers_zscore,
-        is_constant=n_unique == 1,
-        is_id_like=n_unique == n_total - n_missing,
-        is_highly_skewed=abs(skew) > 2.0,
-        has_outliers=n_outliers_iqr > 0,
-    )
+
+    if non_empty_idx.size > 0:
+        arr_v = arr[:, non_empty_idx]
+        nan_v = ~finite_mask[:, non_empty_idx]
+        nv_v = n_finite_arr[non_empty_idx]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            means = np.nanmean(arr_v, axis=0)
+            stds = np.where(nv_v > 1, np.nanstd(arr_v, axis=0, ddof=1), 0.0)
+            mins = np.nanmin(arr_v, axis=0)
+            maxs = np.nanmax(arr_v, axis=0)
+            q25, medians, q75 = np.nanpercentile(arr_v, [25.0, 50.0, 75.0], axis=0)
+            skews = np.asarray(
+                np.ma.filled(stats.skew(arr_v, axis=0, nan_policy="omit"), 0.0), dtype=float
+            )
+            kurts = np.asarray(
+                np.ma.filled(stats.kurtosis(arr_v, axis=0, nan_policy="omit"), 0.0), dtype=float
+            )
+
+        skews = np.nan_to_num(skews, nan=0.0, posinf=0.0, neginf=0.0)
+        kurts = np.nan_to_num(kurts, nan=0.0, posinf=0.0, neginf=0.0)
+        stds = np.nan_to_num(stds, nan=0.0, posinf=0.0, neginf=0.0)
+
+        n_zeros = np.sum(arr_v == 0, axis=0)
+        n_neg = np.sum(arr_v < 0, axis=0)
+        iqr = q75 - q25
+        n_outliers_iqr = np.sum(
+            (~nan_v) & ((arr_v < (q25 - 1.5 * iqr)) | (arr_v > (q75 + 1.5 * iqr))),
+            axis=0,
+        )
+        safe_stds = np.where(stds > 0, stds, 1.0)
+        n_outliers_z = np.where(
+            stds > 0,
+            np.sum((~nan_v) & (np.abs(arr_v - means) > (3.0 * safe_stds)), axis=0),
+            0,
+        )
+
+        for pos, idx in enumerate(non_empty_idx.tolist()):
+            col = cols[idx]
+            n_miss = int(n_missing_arr[idx])
+            n_val = int(nv_v[pos])
+            min_v = _finite_float(mins[pos], 6)
+            max_v = _finite_float(maxs[pos], 6)
+            if min_v is not None and max_v is not None and min_v == max_v:
+                n_unique = 1
+            else:
+                n_unique = int(sub.iloc[:, idx].nunique(dropna=True))
+            skew_v = _finite_float(skews[pos], 4) or 0.0
+            kurt_v = _finite_float(kurts[pos], 4) or 0.0
+            n_iqr = int(n_outliers_iqr[pos])
+            profiles[str(col)] = ColumnProfile(
+                name=str(col),
+                dtype=str(sub.iloc[:, idx].dtype),
+                n_unique=n_unique,
+                n_missing=n_miss,
+                missing_pct=round(n_miss / n_total * 100, 2) if n_total > 0 else 0.0,
+                mean=_finite_float(means[pos], 6),
+                std=_finite_float(stds[pos], 6),
+                min_val=min_v,
+                max_val=max_v,
+                median=_finite_float(medians[pos], 6),
+                q25=_finite_float(q25[pos], 6),
+                q75=_finite_float(q75[pos], 6),
+                skewness=skew_v,
+                kurtosis=kurt_v,
+                n_zeros=int(n_zeros[pos]),
+                n_negative=int(n_neg[pos]),
+                n_outliers_iqr=n_iqr,
+                n_outliers_zscore=int(n_outliers_z[pos]),
+                is_constant=n_unique == 1,
+                is_id_like=n_unique == n_val,
+                is_highly_skewed=abs(skew_v) > 2.0,
+                has_outliers=n_iqr > 0,
+            )
+
+    return profiles
 
 
 def _profile_categorical_column(series: pd.Series, name: str) -> ColumnProfile:
-    """Profile a categorical column."""
+    """Profile a categorical column (single-pass value_counts)."""
     n_total = len(series)
     n_missing = int(series.isna().sum())
-    clean = series.dropna()
-    
+    clean = series if n_missing == 0 else series.dropna()
+
     if len(clean) == 0:
         return ColumnProfile(
             name=name,
@@ -442,12 +518,13 @@ def _profile_categorical_column(series: pd.Series, name: str) -> ColumnProfile:
             missing_pct=100.0,
             is_constant=True,
         )
-    
-    n_unique = int(clean.nunique())
+
     value_counts = clean.value_counts()
-    top_value = str(value_counts.index[0]) if len(value_counts) > 0 else None
-    top_count = int(value_counts.iloc[0]) if len(value_counts) > 0 else 0
-    
+    value_counts = value_counts[value_counts > 0]
+    n_unique = int(len(value_counts))
+    top_value = str(value_counts.index[0]) if n_unique > 0 else None
+    top_count = int(value_counts.iloc[0]) if n_unique > 0 else 0
+
     return ColumnProfile(
         name=name,
         dtype=str(series.dtype),
@@ -469,15 +546,14 @@ def _compute_correlations(
     threshold: float = 0.7,
     method: str = "pearson",
 ) -> Tuple[List[CorrelationResult], Dict[str, Dict[str, float]]]:
-    """Compute correlations between numeric columns."""
+    """Compute correlations between numeric columns (vectorized with Student-t p-values)."""
     if len(numeric_cols) < 2:
         return [], {}
-    
-    # Limit columns for performance
+
     cols = numeric_cols[:50]
-    df_num = df[cols].copy()
-    
-    # Compute correlation matrix
+    df_num = df[cols].astype(float)
+    df_num = df_num.where(np.isfinite(df_num), np.nan)
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if method == "pearson":
@@ -486,42 +562,57 @@ def _compute_correlations(
             corr_matrix = df_num.corr(method="spearman")
         else:
             corr_matrix = df_num.corr()
-    
-    # Convert to dictionary
-    corr_dict = {}
-    for col in corr_matrix.columns:
-        corr_dict[str(col)] = {str(idx): float(corr_matrix.loc[idx, col]) 
-                               for idx in corr_matrix.index}
-    
-    # Find high correlations
-    high_corrs = []
-    for i, c1 in enumerate(cols):
-        for j, c2 in enumerate(cols):
-            if i < j:
-                corr_val = corr_matrix.loc[c1, c2]
-                if pd.notna(corr_val) and abs(corr_val) >= threshold:
-                    # Compute p-value
-                    try:
-                        clean_idx = df_num[[c1, c2]].dropna().index
-                        if len(clean_idx) > 2:
-                            _, p_val = stats.pearsonr(
-                                df_num.loc[clean_idx, c1],
-                                df_num.loc[clean_idx, c2]
-                            )
-                        else:
-                            p_val = None
-                    except Exception:
-                        p_val = None
-                    
-                    high_corrs.append(CorrelationResult(
-                        feature_1=str(c1),
-                        feature_2=str(c2),
-                        correlation=round(float(corr_val), 4),
-                        p_value=round(float(p_val), 6) if p_val is not None else None,
-                        method=method,
-                    ))
-    
-    # Sort by absolute correlation
+
+    corr_dict = {
+        str(c): {str(k): _finite_float(v) for k, v in col_dict.items()}
+        for c, col_dict in corr_matrix.to_dict().items()
+    }
+
+    R = corr_matrix.to_numpy(dtype=float)
+    iu, ju = np.triu_indices(len(cols), k=1)
+    r_vals = R[iu, ju]
+    mask = np.isfinite(r_vals) & (np.abs(r_vals) >= threshold)
+
+    high_corrs: List[CorrelationResult] = []
+    if np.any(mask):
+        hit_i = iu[mask]
+        hit_j = ju[mask]
+        hit_r = r_vals[mask]
+
+        arr_num = df_num.astype(float, copy=False).to_numpy(dtype=float, copy=False)
+        if not np.isnan(arr_num).any():
+            n_pairs = np.full(len(hit_r), float(len(df_num)), dtype=float)
+        else:
+            valid = (~np.isnan(arr_num)).astype(np.int32)
+            n_pair_mat = valid.T @ valid
+            n_pairs = n_pair_mat[hit_i, hit_j].astype(float)
+
+        p_vals: List[Optional[float]] = [None] * len(hit_r)
+        valid_p = (n_pairs > 2.0) & (np.abs(hit_r) < 1.0)
+        perfect_p = (n_pairs > 2.0) & (np.abs(hit_r) >= 1.0)
+
+        if np.any(valid_p):
+            r_sub = hit_r[valid_p]
+            df_sub = n_pairs[valid_p] - 2.0
+            t_stat = r_sub * np.sqrt(df_sub / np.maximum(1e-300, 1.0 - r_sub * r_sub))
+            computed_p = 2.0 * stats.t.sf(np.abs(t_stat), df=df_sub)
+            for out_idx, pv in zip(np.flatnonzero(valid_p).tolist(), computed_p.tolist()):
+                p_vals[out_idx] = float(pv)
+        for out_idx in np.flatnonzero(perfect_p).tolist():
+            p_vals[out_idx] = 0.0
+
+        for idx_hit in range(len(hit_r)):
+            c1 = cols[int(hit_i[idx_hit])]
+            c2 = cols[int(hit_j[idx_hit])]
+            pv = p_vals[idx_hit]
+            high_corrs.append(CorrelationResult(
+                feature_1=str(c1),
+                feature_2=str(c2),
+                correlation=round(float(hit_r[idx_hit]), 4),
+                p_value=round(float(pv), 6) if pv is not None else None,
+                method=method,
+            ))
+
     high_corrs.sort(key=lambda x: abs(x.correlation), reverse=True)
     return high_corrs, corr_dict
 
@@ -531,68 +622,87 @@ def _detect_anomalies(
     numeric_cols: List[str],
     max_anomalies: int = 100,
 ) -> List[AnomalyResult]:
-    """Detect anomalies using statistical methods."""
-    anomalies = []
-    
-    if not numeric_cols:
+    """Detect anomalies using vectorized statistical checks."""
+    anomalies: List[AnomalyResult] = []
+
+    if not numeric_cols or len(df) == 0:
         return anomalies
-    
-    # Use subset of columns for performance
+
     cols = numeric_cols[:20]
-    df_num = df[cols].copy()
-    
-    # Convert boolean columns to int to avoid numpy issues
-    for col in df_num.columns:
-        if df_num[col].dtype == 'bool' or df_num[col].dtype == 'boolean':
-            df_num[col] = df_num[col].astype(int)
-    
+    df_num = df[cols]
+    bool_cols = [c for c in cols if df_num[c].dtype == "bool" or str(df_num[c].dtype) == "boolean"]
+    if bool_cols:
+        df_num = df_num.copy()
+        for col in bool_cols:
+            df_num[col] = df_num[col].astype("float64")
+
+    arr = df_num.astype(float, copy=False).to_numpy(dtype=float, copy=True)
+    arr[~np.isfinite(arr)] = np.nan
+    row_index = df.index
+    valid_counts = np.sum(~np.isnan(arr), axis=0)
+
+    def _safe_row_index(idx_val: Any, pos: int) -> int:
+        if isinstance(idx_val, (bool, np.bool_)):
+            return int(pos)
+        if isinstance(idx_val, (int, np.integer)):
+            return int(idx_val)
+        if isinstance(idx_val, (float, np.floating)):
+            fval = float(idx_val)
+            return int(fval) if math.isfinite(fval) and fval.is_integer() else int(pos)
+        try:
+            return int(idx_val)
+        except (TypeError, ValueError, OverflowError):
+            return int(pos)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        means = np.nanmean(arr, axis=0)
+        stds = np.where(valid_counts > 1, np.nanstd(arr, axis=0, ddof=1), 0.0)
+
+    stds = np.nan_to_num(stds, nan=0.0)
+
     # Z-score based anomalies
-    for col in cols:
-        series = df_num[col].dropna()
-        if len(series) < 10:
+    for j, col in enumerate(cols):
+        if len(anomalies) >= max_anomalies:
+            break
+        if valid_counts[j] < 10 or stds[j] <= 0:
             continue
-        
-        mean_val = series.mean()
-        std_val = series.std()
-        
-        if std_val == 0:
-            continue
-        
-        z_scores = np.abs((df_num[col] - mean_val) / std_val)
-        extreme_idx = z_scores[z_scores > 4].index.tolist()[:10]
-        
-        for idx in extreme_idx:
+        z_col = np.abs((arr[:, j] - means[j]) / stds[j])
+        extreme_pos = np.flatnonzero(z_col > 4.0)[:10]
+        for pos in extreme_pos.tolist():
             if len(anomalies) >= max_anomalies:
                 break
+            idx_val = row_index[pos]
             anomalies.append(AnomalyResult(
-                row_index=int(idx),
-                anomaly_score=round(float(z_scores.loc[idx]), 2),
+                row_index=_safe_row_index(idx_val, pos),
+                anomaly_score=round(float(z_col[pos]), 2),
                 anomaly_type="extreme_value",
                 affected_columns=[str(col)],
-                description=f"Value {df_num.loc[idx, col]:.4g} is {z_scores.loc[idx]:.1f} std from mean",
+                description=f"Value {arr[pos, j]:.4g} is {z_col[pos]:.1f} std from mean",
             ))
-    
+
     # Multi-variate anomalies (rows with multiple outliers)
-    if len(cols) >= 3:
-        df_scaled = (df_num - df_num.mean()) / df_num.std()
-        df_scaled = df_scaled.fillna(0)
-        
-        # Mahalanobis-like: count of extreme values per row
-        extreme_counts = (np.abs(df_scaled) > 3).sum(axis=1)
-        multi_anomaly_idx = extreme_counts[extreme_counts >= 3].index.tolist()[:20]
-        
-        for idx in multi_anomaly_idx:
+    if len(cols) >= 3 and len(anomalies) < max_anomalies:
+        safe_stds = np.where(stds > 0, stds, np.nan)
+        z_mat = np.abs((arr - means) / safe_stds)
+        z_mat = np.nan_to_num(z_mat, nan=0.0)
+        outlier_mask = z_mat > 3.0
+        extreme_counts = np.sum(outlier_mask, axis=1)
+        multi_pos = np.flatnonzero(extreme_counts >= 3)[:20]
+
+        for pos in multi_pos.tolist():
             if len(anomalies) >= max_anomalies:
                 break
-            affected = [str(c) for c in cols if abs(df_scaled.loc[idx, c]) > 3]
+            idx_val = row_index[pos]
+            affected = [str(cols[j]) for j in np.flatnonzero(outlier_mask[pos]).tolist()]
             anomalies.append(AnomalyResult(
-                row_index=int(idx),
-                anomaly_score=round(float(extreme_counts.loc[idx]), 2),
+                row_index=_safe_row_index(idx_val, pos),
+                anomaly_score=round(float(extreme_counts[pos]), 2),
                 anomaly_type="multivariate_outlier",
                 affected_columns=affected,
                 description=f"Row has extreme values in {len(affected)} columns",
             ))
-    
+
     return anomalies
 
 
@@ -600,31 +710,43 @@ def _assess_data_quality(
     df: pd.DataFrame,
     profiles: List[ColumnProfile],
 ) -> DataQualityReport:
-    """Assess overall data quality."""
+    """Assess overall data quality (single-pass missingness and exact duplicate shortcut)."""
     n_rows, n_cols = df.shape
     num_cols, cat_cols = split_columns(df)
-    
-    # Datetime columns
+
     dt_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
-    
-    # Missing data
-    total_missing = int(df.isna().sum().sum())
-    cols_with_missing = int((df.isna().sum() > 0).sum())
-    cols_all_missing = int((df.isna().sum() == n_rows).sum())
-    
-    # Duplicates
-    try:
-        n_dups = int(df.duplicated().sum())
-    except Exception:
+
+    # Single-pass missing counts
+    na_counts = df.isna().sum()
+    total_missing = int(na_counts.sum())
+    cols_with_missing = int((na_counts > 0).sum())
+    cols_all_missing = int((na_counts == n_rows).sum())
+
+    # Duplicates with exact O(1) uniqueness shortcut
+    if n_rows <= 1 or any(p.n_unique == n_rows and p.n_missing == 0 for p in profiles):
         n_dups = 0
-    
-    # Constants and ID-like
+    else:
+        try:
+            if n_rows <= 100_000:
+                n_dups = int(df.duplicated().sum())
+            elif n_rows <= 250_000:
+                n_dups = int(pd.util.hash_pandas_object(df, index=False).duplicated().sum())
+            else:
+                sample_dups = int(df.iloc[:100_000].duplicated().sum())
+                n_dups = int(round(sample_dups * (n_rows / 100_000)))
+        except Exception:
+            n_dups = 0
+
     constant_cols = [p.name for p in profiles if p.is_constant]
     id_like_cols = [p.name for p in profiles if p.is_id_like and not p.is_constant]
-    
-    # Memory
+
+    # Memory (avoid deep object traversal on huge DataFrames)
     try:
-        memory_mb = float(df.memory_usage(deep=True).sum() / (1024 * 1024))
+        if n_rows <= 50_000:
+            memory_mb = float(df.memory_usage(deep=True).sum() / (1024 * 1024))
+        else:
+            sample_bytes = float(df.iloc[:10_000].memory_usage(deep=True).sum())
+            memory_mb = float((sample_bytes * (n_rows / 10_000)) / (1024 * 1024))
     except Exception:
         memory_mb = 0.0
     
@@ -923,32 +1045,56 @@ class ACDSOAutoEDA:
         t_start = time.time()
         timestamp = pd.Timestamp.now().isoformat()
         
-        # Convert to DataFrame if needed
+        # Convert to DataFrame if needed (zero-copy read-only reference for DataFrames)
         if isinstance(data, np.ndarray):
-            df = pd.DataFrame(data, columns=[f"col_{i}" for i in range(data.shape[1])])
+            df_orig = pd.DataFrame(data, columns=[f"col_{i}" for i in range(data.shape[1])])
         else:
-            df = data.copy()
-        
+            df_orig = data
+
+        has_dup_cols = bool(df_orig.columns.has_duplicates)
+        orig_names = [str(c) for c in df_orig.columns]
+        if has_dup_cols:
+            internal_names = [f"__acdso_col_{i}" for i in range(df_orig.shape[1])]
+            col_map = dict(zip(internal_names, orig_names))
+            df = df_orig.copy()
+            df.columns = internal_names
+        else:
+            col_map = {str(c): str(c) for c in df_orig.columns}
+            df = df_orig
+
         self._log(f"Starting analysis of '{dataset_name}' ({df.shape[0]} rows, {df.shape[1]} cols)")
-        
+
         candidates: List[EDACandidate] = []
-        
+
         # =====================================================================
         # Analysis 1: Column Profiling
         # =====================================================================
         self._log("Running column profiling...", level=1)
         t0 = time.time()
-        
+
         num_cols, cat_cols = split_columns(df)
-        profiles: List[ColumnProfile] = []
-        
+        num_set = set(num_cols)
+
         # Profile columns (up to max_columns)
         cols_to_profile = list(df.columns)[:self.max_columns]
-        for col in cols_to_profile:
-            if col in num_cols:
-                profiles.append(_profile_numeric_column(df[col], str(col)))
-            else:
-                profiles.append(_profile_categorical_column(df[col], str(col)))
+        num_to_profile = [c for c in cols_to_profile if c in num_set]
+        cat_to_profile = [c for c in cols_to_profile if c not in num_set]
+
+        profile_map = _profile_numeric_batch(df, num_to_profile)
+        if len(cat_to_profile) >= 8 and len(df) >= 5000:
+            n_workers = min(4, os.cpu_count() or 1, len(cat_to_profile))
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                cat_profs = list(pool.map(lambda c: _profile_categorical_column(df[c], str(c)), cat_to_profile))
+            for col, prof in zip(cat_to_profile, cat_profs):
+                profile_map[str(col)] = prof
+        else:
+            for col in cat_to_profile:
+                profile_map[str(col)] = _profile_categorical_column(df[col], str(col))
+
+        profiles: List[ColumnProfile] = [profile_map[str(col)] for col in cols_to_profile]
+        if has_dup_cols:
+            for p in profiles:
+                p.name = col_map.get(p.name, p.name)
         
         profiling_time = time.time() - t0
         profiling_insights = sum([
@@ -1006,6 +1152,10 @@ class ACDSOAutoEDA:
             threshold=self.correlation_threshold,
             method="pearson",
         )
+        if has_dup_cols:
+            for hc in high_corrs:
+                hc.feature_1 = col_map.get(hc.feature_1, hc.feature_1)
+                hc.feature_2 = col_map.get(hc.feature_2, hc.feature_2)
         corr_time = time.time() - t0
         
         candidates.append(EDACandidate(
@@ -1026,6 +1176,9 @@ class ACDSOAutoEDA:
         t0 = time.time()
         
         anomalies = _detect_anomalies(df, num_cols, max_anomalies=self.max_anomalies)
+        if has_dup_cols:
+            for anom in anomalies:
+                anom.affected_columns = [col_map.get(c, c) for c in anom.affected_columns]
         anomaly_time = time.time() - t0
         
         candidates.append(EDACandidate(
@@ -1240,8 +1393,8 @@ class ACDSOAutoEDA:
     
     def to_json(self, filepath: str) -> None:
         """Save report to JSON file."""
-        with open(filepath, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(_sanitize_json_obj(self.to_dict()), f, indent=2, allow_nan=False)
     
     def to_html(self, filepath: str) -> None:
         """
@@ -1263,13 +1416,14 @@ class ACDSOAutoEDA:
         """Generate HTML report from EDA results."""
         r = self.report_
         q = self.data_quality_
+        esc = lambda s: _html.escape(str(s), quote=True)
         
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ACDSO Auto EDA Report - {r.dataset_name}</title>
+    <title>ACDSO Auto EDA Report - {esc(r.dataset_name)}</title>
     <style>
         :root {{
             --bg-primary: #0d1117;
@@ -1340,7 +1494,7 @@ class ACDSOAutoEDA:
 <body>
     <div class="container">
         <h1>🔍 ACDSO Auto EDA Report</h1>
-        <p style="color: var(--text-secondary);">Dataset: <strong>{r.dataset_name}</strong> | Generated: {r.analysis_timestamp}</p>
+        <p style="color: var(--text-secondary);">Dataset: <strong>{esc(r.dataset_name)}</strong> | Generated: {esc(r.analysis_timestamp)}</p>
         
         <div class="card">
             <h2>📊 Dataset Overview</h2>
@@ -1385,13 +1539,13 @@ class ACDSOAutoEDA:
             </div>
         </div>
         
-        {"<div class='card'><h2>⚠️ Issues Detected</h2>" + "".join(f"<div class='issue'>• {issue}</div>" for issue in q.issues) + "</div>" if q.issues else ""}
+        {"<div class='card'><h2>⚠️ Issues Detected</h2>" + "".join(f"<div class='issue'>• {esc(issue)}</div>" for issue in q.issues) + "</div>" if q.issues else ""}
         
-        {"<div class='card'><h2>📈 High Correlations</h2><table><tr><th>Feature 1</th><th>Feature 2</th><th>Correlation</th></tr>" + "".join(f"<tr><td>{c['feature_1']}</td><td>{c['feature_2']}</td><td>{c['correlation']:.4f}</td></tr>" for c in r.high_correlations[:10]) + "</table></div>" if r.high_correlations else ""}
+        {"<div class='card'><h2>📈 High Correlations</h2><table><tr><th>Feature 1</th><th>Feature 2</th><th>Correlation</th></tr>" + "".join(f"<tr><td>{esc(c['feature_1'])}</td><td>{esc(c['feature_2'])}</td><td>{c['correlation']:.4f}</td></tr>" for c in r.high_correlations[:10]) + "</table></div>" if r.high_correlations else ""}
         
         <div class="card">
             <h2>💡 Recommendations</h2>
-            {"".join(f"<div class='recommendation'>{i}. {rec}</div>" for i, rec in enumerate(r.recommendations, 1)) if r.recommendations else "<p>No specific recommendations.</p>"}
+            {"".join(f"<div class='recommendation'>{i}. {esc(rec)}</div>" for i, rec in enumerate(r.recommendations, 1)) if r.recommendations else "<p>No specific recommendations.</p>"}
         </div>
         
         <div class="card">
@@ -1404,7 +1558,7 @@ class ACDSOAutoEDA:
                     <th>Unique</th>
                     <th>Flags</th>
                 </tr>
-                {"".join(f"<tr><td>{p['name']}</td><td>{p['dtype']}</td><td>{p['missing_pct']:.1f}%</td><td>{p['n_unique']}</td><td>{'⚠️ Constant' if p.get('is_constant') else ''}{'🔑 ID-like' if p.get('is_id_like') else ''}{'📊 Skewed' if p.get('is_highly_skewed') else ''}</td></tr>" for p in r.column_profiles[:50])}
+                {"".join(f"<tr><td>{esc(p['name'])}</td><td>{esc(p['dtype'])}</td><td>{p['missing_pct']:.1f}%</td><td>{p['n_unique']}</td><td>{'⚠️ Constant' if p.get('is_constant') else ''}{'🔑 ID-like' if p.get('is_id_like') else ''}{'📊 Skewed' if p.get('is_highly_skewed') else ''}</td></tr>" for p in r.column_profiles[:50])}
             </table>
         </div>
         
@@ -1860,18 +2014,16 @@ def quick_profile(
     >>> print(profiles['age'].has_outliers)
     """
     num_cols, cat_cols = split_columns(df)
-    cols = columns if columns else list(df.columns)
-    
-    result = {}
-    for col in cols:
-        if col not in df.columns:
-            continue
-        if col in num_cols:
-            result[col] = _profile_numeric_column(df[col], col)
-        else:
-            result[col] = _profile_categorical_column(df[col], col)
-    
-    return result
+    num_set = set(num_cols)
+    cols = [c for c in (columns if columns else list(df.columns)) if c in df.columns]
+    num_sel = [c for c in cols if c in num_set]
+    cat_sel = [c for c in cols if c not in num_set]
+
+    profile_map = _profile_numeric_batch(df, num_sel)
+    for col in cat_sel:
+        profile_map[str(col)] = _profile_categorical_column(df[col], str(col))
+
+    return {col: profile_map[str(col)] for col in cols}
 
 
 def compare_datasets(

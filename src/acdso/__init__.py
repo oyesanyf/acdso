@@ -42,142 +42,117 @@ License: MIT
 
 from __future__ import annotations
 
+import importlib
+from typing import Dict, Tuple
+
 __version__ = "2.0.0"
 __author__ = "DS-TUI Development Team"
 __license__ = "MIT"
 
-# Core estimators
-from acdso.core import (
-    ACDSOClassifier,
-    ACDSORegressor,
-)
+_LAZY_SUBMODULES = frozenset({
+    "core",
+    "eda",
+    "risk",
+    "utils",
+    "pareto",
+    "feature_importance",
+    "auto_preprocessing",
+    "advisors",
+    "integrations",
+    "timeseries",
+    "decision",
+})
 
-# Auto EDA
-from acdso.eda import (
-    # Main class
-    ACDSOAutoEDA,
-    # Data classes
-    ColumnProfile,
-    DataQualityReport,
-    EDAReport,
-    EDACandidate,
-    CorrelationResult,
-    AnomalyResult,
-    # Backend adapters
-    EDABackend,
-    get_available_backends,
-    get_backend_adapter,
-    YDataProfilingAdapter,
-    SweetvizAdapter,
-    DataprepAdapter,
-    DTaleAdapter,
-    # Standalone functions
-    quick_profile,
-    compare_datasets,
-    validate_data,
-    infer_data_types,
-    get_preprocessing_recommendations,
-)
+_LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
+    # Core estimators
+    "ACDSOClassifier": ("acdso.core", "ACDSOClassifier"),
+    "ACDSORegressor": ("acdso.core", "ACDSORegressor"),
+    # Auto EDA
+    "ACDSOAutoEDA": ("acdso.eda", "ACDSOAutoEDA"),
+    "ColumnProfile": ("acdso.eda", "ColumnProfile"),
+    "DataQualityReport": ("acdso.eda", "DataQualityReport"),
+    "EDAReport": ("acdso.eda", "EDAReport"),
+    "EDACandidate": ("acdso.eda", "EDACandidate"),
+    "CorrelationResult": ("acdso.eda", "CorrelationResult"),
+    "AnomalyResult": ("acdso.eda", "AnomalyResult"),
+    "EDABackend": ("acdso.eda", "EDABackend"),
+    "get_available_backends": ("acdso.eda", "get_available_backends"),
+    "get_backend_adapter": ("acdso.eda", "get_backend_adapter"),
+    "YDataProfilingAdapter": ("acdso.eda", "YDataProfilingAdapter"),
+    "SweetvizAdapter": ("acdso.eda", "SweetvizAdapter"),
+    "DataprepAdapter": ("acdso.eda", "DataprepAdapter"),
+    "DTaleAdapter": ("acdso.eda", "DTaleAdapter"),
+    "quick_profile": ("acdso.eda", "quick_profile"),
+    "compare_datasets": ("acdso.eda", "compare_datasets"),
+    "validate_data": ("acdso.eda", "validate_data"),
+    "infer_data_types": ("acdso.eda", "infer_data_types"),
+    "get_preprocessing_recommendations": ("acdso.eda", "get_preprocessing_recommendations"),
+    # Risk analysis components
+    "RiskReport": ("acdso.risk", "RiskReport"),
+    "analyze_risk": ("acdso.risk", "analyze_risk"),
+    "compute_risk_penalty": ("acdso.risk", "compute_risk_penalty"),
+    # Utility functions
+    "build_preprocessor": ("acdso.utils", "build_preprocessor"),
+    "detect_datetime_column": ("acdso.utils", "detect_datetime_column"),
+    "infer_target_type": ("acdso.utils", "infer_target_type"),
+    "split_columns": ("acdso.utils", "split_columns"),
+    # Pareto optimization
+    "CandidateResult": ("acdso.pareto", "CandidateResult"),
+    "pareto_front": ("acdso.pareto", "pareto_front"),
+    "knee_point_selection": ("acdso.pareto", "knee_point_selection"),
+    # Safe Feature Importance
+    "SafeFeatureImportance": ("acdso.feature_importance", "SafeFeatureImportance"),
+    "FeatureImportanceResult": ("acdso.feature_importance", "FeatureImportanceResult"),
+    "SafeImportanceReport": ("acdso.feature_importance", "SafeImportanceReport"),
+    "compute_safe_importance": ("acdso.feature_importance", "compute_safe_importance"),
+    # AutoEDA-Informed Preprocessing
+    "AutoPreprocessor": ("acdso.auto_preprocessing", "AutoPreprocessor"),
+    "PreprocessingPlan": ("acdso.auto_preprocessing", "PreprocessingPlan"),
+    "PreprocessingAction": ("acdso.auto_preprocessing", "PreprocessingAction"),
+    "TargetEncoder": ("acdso.auto_preprocessing", "TargetEncoder"),
+    "SkewnessTransformer": ("acdso.auto_preprocessing", "SkewnessTransformer"),
+    "OutlierClipper": ("acdso.auto_preprocessing", "OutlierClipper"),
+    "create_eda_preprocessor": ("acdso.auto_preprocessing", "create_eda_preprocessor"),
+    # LLM advisors
+    "LLMAdvisor": ("acdso.advisors", "LLMAdvisor"),
+    "LLMConfig": ("acdso.advisors", "LLMConfig"),
+    "PromptTemplate": ("acdso.advisors", "PromptTemplate"),
+    "BaseLLMProvider": ("acdso.advisors", "BaseLLMProvider"),
+    "OpenAIProvider": ("acdso.advisors", "OpenAIProvider"),
+    "AnthropicProvider": ("acdso.advisors", "AnthropicProvider"),
+    "AzureOpenAIProvider": ("acdso.advisors", "AzureOpenAIProvider"),
+    "OllamaProvider": ("acdso.advisors", "OllamaProvider"),
+    "LiteLLMProvider": ("acdso.advisors", "LiteLLMProvider"),
+    "create_advisor": ("acdso.advisors", "create_advisor"),
+    "llm_advisor_stub": ("acdso.advisors", "llm_advisor_stub"),
+    "BaseLLMAdvisor": ("acdso.advisors", "BaseLLMAdvisor"),
+    "StubLLMAdvisor": ("acdso.advisors", "StubLLMAdvisor"),
+    "LLMLabelAnalyzer": ("acdso.advisors", "LLMLabelAnalyzer"),
+    "LabelAnalysisResult": ("acdso.advisors", "LabelAnalysisResult"),
+    "analyze_labels_with_llm": ("acdso.advisors", "analyze_labels_with_llm"),
+    "LLMColumnAnalyzer": ("acdso.advisors", "LLMColumnAnalyzer"),
+    "ColumnAnalysisResult": ("acdso.advisors", "ColumnAnalysisResult"),
+    "auto_exclude_columns": ("acdso.advisors", "auto_exclude_columns"),
+}
 
-# Risk analysis components
-from acdso.risk import (
-    RiskReport,
-    analyze_risk,
-    compute_risk_penalty,
-)
 
-# Utility functions
-from acdso.utils import (
-    build_preprocessor,
-    detect_datetime_column,
-    infer_target_type,
-    split_columns,
-)
-
-# Pareto optimization
-from acdso.pareto import (
-    CandidateResult,
-    pareto_front,
-    knee_point_selection,
-)
-
-# Safe Feature Importance
-from acdso.feature_importance import (
-    SafeFeatureImportance,
-    FeatureImportanceResult,
-    SafeImportanceReport,
-    compute_safe_importance,
-)
-
-# AutoEDA-Informed Preprocessing
-from acdso.auto_preprocessing import (
-    AutoPreprocessor,
-    PreprocessingPlan,
-    PreprocessingAction,
-    TargetEncoder,
-    SkewnessTransformer,
-    OutlierClipper,
-    create_eda_preprocessor,
-)
-
-# LLM advisors
-from acdso.advisors import (
-    # Main advisor class
-    LLMAdvisor,
-    LLMConfig,
-    PromptTemplate,
-    # Providers
-    BaseLLMProvider,
-    OpenAIProvider,
-    AnthropicProvider,
-    AzureOpenAIProvider,
-    OllamaProvider,
-    LiteLLMProvider,
-    # Factory and utilities
-    create_advisor,
-    llm_advisor_stub,
-    BaseLLMAdvisor,
-    StubLLMAdvisor,
-    # LLM-powered label analysis
-    LLMLabelAnalyzer,
-    LabelAnalysisResult,
-    analyze_labels_with_llm,
-    # LLM-powered column analysis & auto-exclusion
-    LLMColumnAnalyzer,
-    ColumnAnalysisResult,
-    auto_exclude_columns,
-)
-
-# Integrations and submodules (lazy import to avoid requiring all dependencies)
-def __getattr__(name):
-    """Lazy import for integration modules and submodules."""
-    if name == "integrations":
-        from acdso import integrations as _integrations
-        return _integrations
-    if name == "timeseries":
-        from acdso.timeseries import (
-            AutoTS, AutoTSResult, ForecastingPipeline, auto_forecast,
-            TimeSeriesSplitter, ExpandingWindowSplit, RollingWindowSplit, WalkForwardSplit,
-            LagFeatureTransformer, RollingWindowTransformer, DateTimeFeatureTransformer,
-            mae, rmse, mape, smape, mase, wape,
-            TimeSeriesRiskAnalyzer, TimeSeriesRiskReport,
-            NaiveForecaster, SeasonalNaiveForecaster, MovingAverageForecaster,
-            TimeSeriesBenchmark, run_ts_benchmark,
-        )
-        import acdso.timeseries as _timeseries
-        return _timeseries
-    if name == "decision":
-        from acdso.decision import (
-            DecisionIntelligence, DecisionResult, DecisionAuditTrail,
-            CausalAnalyzer, CausalModel, CausalEstimate, CausalReadinessReport,
-            UpliftModeler, UpliftResult, TLearner, SLearner, XLearner, DRLearner,
-            ActionOptimizer, OptimizationResult, BudgetConstraint, CapacityConstraint,
-            PolicyLearner, PolicyResult, ContextualBanditEnv,
-            qini_score, estimate_ate, optimize_actions,
-        )
-        import acdso.decision as _decision
-        return _decision
+def __getattr__(name: str):
+    """Lazy import for ACDSO public symbols and submodules."""
+    if name in _LAZY_ATTRS:
+        mod_name, attr_name = _LAZY_ATTRS[name]
+        mod = importlib.import_module(mod_name)
+        val = getattr(mod, attr_name)
+        globals()[name] = val
+        return val
+    if name in _LAZY_SUBMODULES:
+        mod = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = mod
+        return mod
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 __all__ = [
     # Version info

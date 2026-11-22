@@ -278,3 +278,124 @@ class TestComputeRiskPenalty:
         # Safe preference should penalize leakage more
         assert penalty_safe >= penalty_balanced
 
+
+class TestVectorizedRiskDiagnostics:
+    """Tests for vectorized VIF, proxy leakage detection, and time budget."""
+
+    def test_vif_exact_duplicates_and_constants(self):
+        """Test VIF flags exact duplicates while ignoring constants and NaNs/Infs."""
+        rng = np.random.RandomState(42)
+        x1 = rng.randn(150)
+        df = pd.DataFrame({
+            "x1": x1,
+            "x2": x1.copy(),
+            "x_indep": rng.randn(150),
+            "const_col": np.ones(150),
+            "all_nan": np.full(150, np.nan),
+        })
+        df.loc[0, "x_indep"] = np.inf
+
+        vif_max, high_vif = _vif_numeric(df)
+        assert vif_max >= 10.0
+        assert "x1" in high_vif and "x2" in high_vif
+        assert "const_col" not in high_vif
+        assert "all_nan" not in high_vif
+
+    def test_proxy_leakage_continuous_numeric(self):
+        """Continuous numeric proxy leakage is detected without flagging innocent columns."""
+        rng = np.random.RandomState(42)
+        n = 400
+        X = pd.DataFrame({f"f{i}": rng.randn(n) for i in range(6)})
+        y = rng.randint(0, 2, n)
+        X["leaky_feature"] = y + rng.randn(n) * 0.01
+
+        report = analyze_risk(X, y, task="classification", random_state=42)
+        assert report.leakage_proxy_score_max >= 0.95
+        assert report.leakage_proxy_features == ["leaky_feature"]
+
+    def test_proxy_leakage_regression(self):
+        """Continuous regression proxy leakage is detected."""
+        rng = np.random.RandomState(42)
+        n = 300
+        X = pd.DataFrame({f"f{i}": rng.randn(n) for i in range(5)})
+        y = 2.0 * X["f0"].to_numpy() + 2.0 * X["f1"].to_numpy() + 2.0 * X["f2"].to_numpy() + rng.randn(n) * 0.5
+        X["leaky_reg"] = y + rng.randn(n) * 0.01
+
+        report = analyze_risk(X, y, task="regression", scorer="r2", random_state=42)
+        assert report.leakage_proxy_score_max >= 0.95
+        assert report.leakage_proxy_features == ["leaky_reg"]
+
+    def test_proxy_leakage_categorical_and_id_skip(self):
+        """Categorical proxy leak is detected while high-cardinality string IDs are skipped."""
+        rng = np.random.RandomState(42)
+        n = 200
+        y = rng.randint(0, 2, n)
+        X = pd.DataFrame({
+            "user_id": [f"uid_{i}" for i in range(n)],
+            "cat_leak": np.where(y == 1, "yes", "no"),
+            "noise": rng.randn(n),
+        })
+
+        report = analyze_risk(X, y, task="classification", random_state=42)
+        assert report.leakage_proxy_score_max >= 0.95
+        assert "cat_leak" in report.leakage_proxy_features
+        assert "user_id" not in report.leakage_proxy_features
+
+    def test_analyze_risk_time_budget(self):
+        """analyze_risk honors small time_budget_s without raising."""
+        rng = np.random.RandomState(42)
+        X = pd.DataFrame(rng.randn(200, 15), columns=[f"c{i}" for i in range(15)])
+        y = rng.randint(0, 2, 200)
+
+        report = analyze_risk(X, y, task="classification", time_budget_s=0.05, random_state=42)
+        assert isinstance(report, RiskReport)
+        assert report.n_rows == 200
+        assert report.n_cols == 15
+
+    def test_proxy_leakage_categorical_non_range_and_sliced_index(self):
+        """Categorical proxy leak is detected on sliced iloc and custom string-indexed >10-col DataFrames."""
+        rng = np.random.RandomState(42)
+        n = 300
+        y = rng.randint(0, 2, n)
+        data = {f"c{i}": rng.choice(["A", "B", "C", "D"], n) for i in range(15)}
+        data["leak_cat"] = np.where(y == 1, "yes", "no")
+
+        # Case 1: sliced DataFrame (index 150..299)
+        df_full = pd.DataFrame(data)
+        df_sliced = df_full.iloc[150:]
+        y_sliced = y[150:]
+        rep_sliced = analyze_risk(df_sliced, y_sliced, task="classification", random_state=42)
+        assert "leak_cat" in rep_sliced.leakage_proxy_features
+        assert rep_sliced.leakage_proxy_score_max >= 0.95
+
+        # Case 2: custom string index
+        df_str = pd.DataFrame(data, index=[f"id_{i}" for i in range(n)])
+        rep_str = analyze_risk(df_str, y, task="classification", random_state=42)
+        assert "leak_cat" in rep_str.leakage_proxy_features
+        assert rep_str.leakage_proxy_score_max >= 0.95
+
+    def test_analyze_risk_all_nan_column_no_imputer_warning(self):
+        """All-NaN numeric columns do not emit SimpleImputer UserWarning in _detect_linearity."""
+        import warnings
+
+        rng = np.random.RandomState(42)
+        n = 100
+        X = pd.DataFrame({
+            "x1": rng.randn(n),
+            "x2": rng.randn(n),
+            "all_nan": np.full(n, np.nan),
+        })
+        y = (X["x1"] > 0).astype(int).to_numpy()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            report = analyze_risk(X, y, task="classification", random_state=42)
+
+        assert isinstance(report, RiskReport)
+        imputer_warnings = [
+            w for w in caught
+            if issubclass(w.category, UserWarning) and "Skipping features without any observed values" in str(w.message)
+        ]
+        assert imputer_warnings == []
+
+

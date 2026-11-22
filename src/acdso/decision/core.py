@@ -375,10 +375,23 @@ class DecisionIntelligence:
         
         # Auto-detect features if not provided
         if self.feature_cols is None:
+            excluded = {
+                c for c in [
+                    self.treatment_col,
+                    self.outcome_col,
+                    self.cost_col,
+                    self.value_col,
+                    fairness_col,
+                    *(self.confounders or []),
+                ]
+                if c is not None
+            }
             self.feature_cols = [
                 c for c in df.columns
-                if c not in [self.treatment_col, self.outcome_col, self.cost_col, self.value_col]
-                and df[c].dtype in [np.float64, np.int64, float, int, bool]
+                if c not in excluded
+                and pd.api.types.is_numeric_dtype(df[c])
+                and not pd.api.types.is_datetime64_any_dtype(df[c])
+                and not pd.api.types.is_timedelta64_dtype(df[c])
             ]
         
         causal_model = None
@@ -417,14 +430,29 @@ class DecisionIntelligence:
                 'policy_value': uplift_result.policy_value,
             }
             
-            # Add ITE to dataframe for optimization
-            df['_ite'] = uplift_result.ite
+            # Add ITE to dataframe for optimization (align if UpliftModeler filtered non-finite rows)
+            if len(uplift_result.ite) == len(df):
+                ite_aligned = np.asarray(uplift_result.ite, dtype=np.float64)
+            else:
+                if self.feature_cols:
+                    X_u = df[self.feature_cols].apply(pd.to_numeric, errors="coerce").to_numpy(
+                        dtype=np.float64, na_value=np.nan
+                    )
+                else:
+                    X_u = np.empty((len(df), 0), dtype=np.float64)
+                y_u = pd.to_numeric(df[self.outcome_col], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+                t_u = pd.to_numeric(df[self.treatment_col], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+                finite_mask = np.isfinite(X_u).all(axis=1) & np.isfinite(y_u) & np.isfinite(t_u)
+                ite_aligned = np.zeros(len(df), dtype=np.float64)
+                if int(finite_mask.sum()) == len(uplift_result.ite):
+                    ite_aligned[finite_mask] = uplift_result.ite
+            df['_ite'] = ite_aligned
             
             # Compute expected benefit
             if self.outcome_type == 'minimize':
-                df['_expected_benefit'] = -uplift_result.ite  # Negative ITE = reduction in bad outcome
+                df['_expected_benefit'] = -ite_aligned  # Negative ITE = reduction in bad outcome
             else:
-                df['_expected_benefit'] = uplift_result.ite
+                df['_expected_benefit'] = ite_aligned
         
         # Step 3: Action Optimization
         if run_optimization and (uplift_result is not None or self.value_col is not None):
@@ -557,13 +585,30 @@ class DecisionIntelligence:
                 return None
             
             # Build reward matrix
-            X = df[self.feature_cols].values.astype(np.float32)
-            ite = df['_ite'].values
-            
-            if self.cost_col:
-                costs = df[self.cost_col].values
+            if self.feature_cols:
+                X_raw = df[self.feature_cols].apply(pd.to_numeric, errors="coerce").to_numpy(
+                    dtype=np.float64, na_value=np.nan
+                )
+                X_raw[~np.isfinite(X_raw)] = np.nan
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    medians = np.nanmedian(X_raw, axis=0) if len(X_raw) > 0 else np.zeros(len(self.feature_cols))
+                medians = np.where(np.isfinite(medians), medians, 0.0)
+                nan_r, nan_c = np.where(np.isnan(X_raw))
+                if nan_r.size > 0:
+                    X_raw[nan_r, nan_c] = medians[nan_c]
+                X = X_raw.astype(np.float32)
             else:
-                costs = np.zeros(len(df))
+                X = np.empty((len(df), 0), dtype=np.float32)
+
+            ite = pd.to_numeric(df['_ite'], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+            ite = np.nan_to_num(ite, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if self.cost_col:
+                costs = pd.to_numeric(df[self.cost_col], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+                costs = np.nan_to_num(costs, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                costs = np.zeros(len(df), dtype=np.float64)
             
             # Reward for not treating: 0
             # Reward for treating: benefit - cost

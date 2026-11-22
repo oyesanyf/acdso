@@ -30,6 +30,7 @@ Primary Dataset: Seaborn Tips Dataset
 - Restaurant tipping data with 244 observations
 - Features: total_bill, tip, sex, smoker, day, time, size
 """
+from __future__ import annotations
 
 # Suppress warnings BEFORE any imports to catch pkg_resources deprecation
 import warnings
@@ -38,25 +39,210 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='stopit')
 
+import html as _html
 import json
-import numpy as np
-import pandas as pd
+import math
+import os
+import re
 from typing import List, Optional, Dict, Any, Callable
-from sklearn.datasets import make_classification, make_regression, load_iris, load_wine
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score,
-    confusion_matrix, classification_report, r2_score, 
-    mean_squared_error, mean_absolute_error
-)
 import time
 import gc
 import tracemalloc
-from scipy import stats
 import sys
 import io
 from contextlib import contextmanager
 from datetime import datetime
+
+_ML_DEPS_LOADED = False
+_LAZY_ML_SYMBOLS = {
+    "np",
+    "pd",
+    "stats",
+    "make_classification",
+    "make_regression",
+    "load_iris",
+    "load_wine",
+    "train_test_split",
+    "accuracy_score",
+    "f1_score",
+    "precision_score",
+    "recall_score",
+    "confusion_matrix",
+    "classification_report",
+    "r2_score",
+    "mean_squared_error",
+    "mean_absolute_error",
+}
+
+
+def _ensure_ml_deps() -> None:
+    """Lazily import heavy scientific/ML dependencies once on first use."""
+    global _ML_DEPS_LOADED
+    if _ML_DEPS_LOADED:
+        return
+    import numpy as _np
+    import pandas as _pd
+    from scipy import stats as _stats
+    from sklearn.datasets import (
+        make_classification as _make_classification,
+        make_regression as _make_regression,
+        load_iris as _load_iris,
+        load_wine as _load_wine,
+    )
+    from sklearn.model_selection import train_test_split as _train_test_split
+    from sklearn.metrics import (
+        accuracy_score as _accuracy_score,
+        f1_score as _f1_score,
+        precision_score as _precision_score,
+        recall_score as _recall_score,
+        confusion_matrix as _confusion_matrix,
+        classification_report as _classification_report,
+        r2_score as _r2_score,
+        mean_squared_error as _mean_squared_error,
+        mean_absolute_error as _mean_absolute_error,
+    )
+
+    g = globals()
+    g["np"] = _np
+    g["pd"] = _pd
+    g["stats"] = _stats
+    g["make_classification"] = _make_classification
+    g["make_regression"] = _make_regression
+    g["load_iris"] = _load_iris
+    g["load_wine"] = _load_wine
+    g["train_test_split"] = _train_test_split
+    g["accuracy_score"] = _accuracy_score
+    g["f1_score"] = _f1_score
+    g["precision_score"] = _precision_score
+    g["recall_score"] = _recall_score
+    g["confusion_matrix"] = _confusion_matrix
+    g["classification_report"] = _classification_report
+    g["r2_score"] = _r2_score
+    g["mean_squared_error"] = _mean_squared_error
+    g["mean_absolute_error"] = _mean_absolute_error
+    _ML_DEPS_LOADED = True
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_ML_SYMBOLS:
+        _ensure_ml_deps()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _is_tty() -> bool:
+    """Return True if stdout is connected to an interactive terminal."""
+    try:
+        return bool(getattr(sys.stdout, "isatty", lambda: False)())
+    except Exception:
+        return False
+
+
+def _use_ansi() -> bool:
+    """Return True when ANSI terminal styling is safe to emit."""
+    return _is_tty() and not os.environ.get("NO_COLOR")
+
+
+def _configure_console() -> None:
+    """Ensure UTF-8 safe console streams and enable Windows VT mode on TTY."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.platform == "win32" and _is_tty():
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except Exception:
+            pass
+
+
+def _emit_progress(
+    phase: int,
+    total: int,
+    name: str,
+    status: str,
+    detail: str = "",
+) -> None:
+    """Flush a structured single-line progress marker for WebUI/TUI consumers."""
+    norm_status = status if status in ("running", "done", "error") else "running"
+    payload = {
+        "phase": int(phase),
+        "total": int(total),
+        "name": str(name),
+        "status": norm_status,
+        "detail": "" if detail is None else str(detail),
+    }
+    print(f"[ACDSO_PROGRESS] {json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _render_phase_banner(phase: int, total: int, name: str) -> None:
+    """Render a clean terminal phase banner (ANSI on TTY, ASCII when piped)."""
+    if _use_ansi():
+        print(f"\n\033[1;36m[{phase}/{total}]\033[0m \033[1m{name}\033[0m", flush=True)
+    else:
+        print(f"\n[{phase}/{total}] {name}", flush=True)
+
+
+def _esc(val: Any) -> str:
+    """HTML-escape arbitrary values safely including quotes."""
+    return _html.escape("" if val is None else str(val), quote=True)
+
+
+def _json_safe_scalar(val: Any) -> Any:
+    """Convert scalar values to RFC 8259-compliant JSON primitives (NaN/inf -> None)."""
+    _ensure_ml_deps()
+    if val is None:
+        return None
+    if isinstance(val, (bool, np.bool_)):
+        return bool(val)
+    if isinstance(val, (int, np.integer)):
+        return int(val)
+    if isinstance(val, (float, np.floating)):
+        fval = float(val)
+        return fval if math.isfinite(fval) else None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(val)
+
+
+def _sanitize_json_payload(obj: Any) -> Any:
+    """Recursively sanitize nested payloads for strict RFC 8259 JSON (allow_nan=False)."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_json_payload(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json_payload(v) for v in obj]
+    if isinstance(obj, str) or obj is None:
+        return obj
+    return _json_safe_scalar(obj)
+
+
+def _sanitize_embedded_html(raw_html: str) -> str:
+    """Sanitize and sandbox embedded EDA/TS HTML fragments to prevent stored XSS."""
+    import re
+
+    content = str(raw_html or "")
+    if "<body" in content.lower():
+        m_body = re.search(r"<body[^>]*>(.*)</body\s*>", content, flags=re.DOTALL | re.IGNORECASE)
+        if m_body:
+            content = m_body.group(1)
+    # Strip <script> tags including malformed closing tags (e.g. </script >) and event handlers
+    content = re.sub(r"<script\b[^>]*>.*?</script\s*>", "", content, flags=re.DOTALL | re.IGNORECASE)
+    content = re.sub(r"\son[a-z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", "", content, flags=re.IGNORECASE)
+    content = re.sub(r"javascript\s*:", "blocked:", content, flags=re.IGNORECASE)
+    return (
+        f'<iframe sandbox="" srcdoc="{_esc(content)}" '
+        'style="width:100%; height:600px; border:none; background:#fff;"></iframe>'
+    )
 
 
 # ============================================================================
@@ -101,6 +287,9 @@ class DualOutput:
     def flush(self):
         self.console.flush()
         self.buffer.flush()
+
+    def isatty(self):
+        return getattr(self.console, "isatty", lambda: False)()
 
 
 @contextmanager
@@ -155,6 +344,7 @@ def generate_combined_report(
     dict
         Combined report with all information.
     """
+    _ensure_ml_deps()
     report = {
         "timestamp": datetime.now().isoformat(),
         "acdso_version": "3.0",
@@ -256,8 +446,9 @@ def save_combined_report(report: Dict[str, Any], output_path: str = "acdso_combi
     str
         Path to saved file.
     """
+    sanitized = _sanitize_json_payload(report)
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+        json.dump(sanitized, f, indent=2, ensure_ascii=False, allow_nan=False)
     return output_path
 
 
@@ -276,14 +467,16 @@ def _file_uri(path: str) -> str:
 
 def _file_link_cell(path: str) -> str:
     """Table cell for a generated-file path: click to open/download, or copy."""
-    uri = _file_uri(path)
+    raw_path = "" if path is None else str(path)
+    uri = _esc(_file_uri(raw_path))
+    esc_path = _esc(raw_path)
     return (
         f'<a href="{uri}" target="_blank" rel="noopener" '
         f'style="color:#93c5fd; text-decoration:none; background:#2d3748; '
         f'padding:4px 8px; border-radius:4px; font-family:Consolas,monospace; '
-        f'font-size:0.85em; word-break:break-all;">{path}</a> '
-        f'<button type="button" onclick="navigator.clipboard.writeText(\'{path}\')'
-        f'.then(()=>alert(\'Path copied!\'))" '
+        f'font-size:0.85em; word-break:break-all;">{esc_path}</a> '
+        f'<button type="button" data-path="{esc_path}" '
+        f'onclick="navigator.clipboard.writeText(this.dataset.path).then(()=>alert(\'Path copied!\'))" '
         f'style="background:#334155; color:#94a3b8; border:none; border-radius:4px; '
         f'padding:3px 8px; cursor:pointer; font-size:0.75em; vertical-align:middle;">copy</button>'
     )
@@ -334,7 +527,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-size='32' font-weight='700' fill='%23ffffff' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
-    <title>ACDSO {acdso_version} Report - {mode.title()}</title>
+    <title>ACDSO {_esc(acdso_version)} Report - {_esc(str(mode).title())}</title>
     <style>
         :root {{
             --primary: #2563eb;
@@ -477,9 +670,9 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
 <body>
     <div class="container">
         <div class="header">
-            <h1>ACDSO {acdso_version} Report</h1>
-            <div class="subtitle">Mode: {mode.title()}</div>
-            <div class="subtitle">Generated: {timestamp}</div>
+            <h1>ACDSO {_esc(acdso_version)} Report</h1>
+            <div class="subtitle">Mode: {_esc(str(mode).title())}</div>
+            <div class="subtitle">Generated: {_esc(timestamp)}</div>
         </div>
 """
     
@@ -493,7 +686,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
 """
         for key, value in config.items():
             if value is not None:
-                html += f"                <tr><th>{key}</th><td>{value}</td></tr>\n"
+                html += f"                <tr><th>{_esc(key)}</th><td>{_esc(value)}</td></tr>\n"
         html += "            </table>\n        </div>\n"
     
     # Add selected model information
@@ -503,20 +696,22 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         <div class="card">
             <h2>Selected Model</h2>
             <table>
-                <tr><th>Model Name</th><td class="model-name">{model.get('name', 'N/A')}</td></tr>
-                <tr><th>Type</th><td>{model.get('type', 'N/A')}</td></tr>
+                <tr><th>Model Name</th><td class="model-name">{_esc(model.get('name', 'N/A'))}</td></tr>
+                <tr><th>Type</th><td>{_esc(model.get('type', 'N/A'))}</td></tr>
 """
         if 'pipeline_steps' in model and model['pipeline_steps']:
-            html += f"                <tr><th>Pipeline Steps</th><td>{' → '.join(model['pipeline_steps'])}</td></tr>\n"
+            steps_html = ' → '.join(_esc(s) for s in model['pipeline_steps'])
+            html += f"                <tr><th>Pipeline Steps</th><td>{steps_html}</td></tr>\n"
         if 'metrics' in model:
             metrics = model['metrics']
             html += "                <tr><th colspan='2'><h3>Metrics</h3></th></tr>\n"
             for key, value in metrics.items():
                 if value is not None:
                     if isinstance(value, float):
-                        html += f"                <tr><th>{key}</th><td>{value:.4f}</td></tr>\n"
+                        html += f"                <tr><th>{_esc(key)}</th><td>{value:.4f}</td></tr>\n"
                     else:
-                        html += f"                <tr><th>{key}</th><td>{value}</td></tr>\n"
+                        html += f"                <tr><th>{_esc(key)}</th><td>{_esc(value)}</td></tr>\n"
+        html += "            </table>\n"
         # Display actual execution code
         code_info = model.get('code_info', {})
         if code_info and isinstance(code_info, dict):
@@ -525,10 +720,10 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             if code:
                 html += f"""
             <h3>Actual Execution Code</h3>
-            <p class="info-text"><strong>Execution Summary:</strong> {execution_summary}</p>
-            <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"><code>{code}</code></pre>
+            <p class="info-text"><strong>Execution Summary:</strong> {_esc(execution_summary)}</p>
+            <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"><code>{_esc(code)}</code></pre>
 """
-        html += "            </table>\n        </div>\n"
+        html += "        </div>\n"
     
     # Add phase results with model names (for autonomous mode)
     if 'phase_results' in report:
@@ -538,16 +733,17 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
 """
         for phase_name, phase_data in report['phase_results'].items():
             if isinstance(phase_data, list) and phase_data:
-                html += f"            <h3>{phase_name}</h3>\n            <table>\n"
+                html += f"            <h3>{_esc(phase_name)}</h3>\n            <table>\n"
                 html += "                <tr><th>Demo Name</th><th>Status</th><th>Selected Model</th><th>Time (s)</th></tr>\n"
                 for item in phase_data:
                     if isinstance(item, dict):
                         name = item.get('name', 'Unknown')
                         status = item.get('status', 'Unknown')
                         model_name = item.get('model_name', 'N/A')
-                        time_val = item.get('time', 0)
-                        status_class = 'success' if 'SUCCESS' in status else 'error'
-                        html += f"                <tr><td>{name}</td><td class='{status_class}'>{status}</td><td class='model-name'>{model_name}</td><td>{time_val:.2f}</td></tr>\n"
+                        time_val = item.get('time', 0) or 0
+                        status_class = 'success' if 'SUCCESS' in str(status) else 'error'
+                        time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
+                        html += f"                <tr><td>{_esc(name)}</td><td class='{status_class}'>{_esc(status)}</td><td class='model-name'>{_esc(model_name)}</td><td>{time_str}</td></tr>\n"
                 html += "            </table>\n"
         html += "        </div>\n"
     
@@ -593,20 +789,20 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 row_class = 'selected-model' if is_selected else ''
                 status = '✓ Selected' if is_selected else 'Evaluated'
                 
-                stress_str = f"{stress_drop:.4f}" if stress_drop is not None else "N/A"
+                stress_str = f"{stress_drop:.4f}" if isinstance(stress_drop, (int, float)) else (_esc(stress_drop) if stress_drop is not None else "N/A")
                 
                 # Format values safely
-                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else str(metric)
-                cv_std_str = f"{cv_std:.4f}" if isinstance(cv_std, (int, float)) else str(cv_std)
-                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else str(train_time)
+                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
+                cv_std_str = f"{cv_std:.4f}" if isinstance(cv_std, (int, float)) else _esc(cv_std)
+                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
                 
-                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else str(memory)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else str(latency)
-                risk_str = f"{risk_penalty:.4f}" if isinstance(risk_penalty, (int, float)) else str(risk_penalty)
+                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
+                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
+                risk_str = f"{risk_penalty:.4f}" if isinstance(risk_penalty, (int, float)) else _esc(risk_penalty)
                 
                 html += f"""                    <tr class="{row_class}">
                         <td>{i}</td>
-                        <td class="model-name">{name}</td>
+                        <td class="model-name">{_esc(name)}</td>
                         <td>{metric_str}</td>
                         <td>{cv_std_str}</td>
                         <td>{train_time_str}</td>
@@ -646,19 +842,24 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
 """
             for model in pareto_front:
                 name = model.get('name', 'Unknown')
-                metric = model.get('metric', 0)
-                train_time = model.get('train_time_s', 0)
-                memory = model.get('peak_mem_mb', 0)
-                latency = model.get('latency_ms_per_row', 0)
-                risk_penalty = model.get('risk_penalty', 0)
+                metric = model.get('metric', 0) or 0
+                train_time = model.get('train_time_s', 0) or 0
+                memory = model.get('peak_mem_mb', 0) or 0
+                latency = model.get('latency_ms_per_row', 0) or 0
+                risk_penalty = model.get('risk_penalty', 0) or 0
                 
+                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
+                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
+                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
+                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
+                risk_str = f"{risk_penalty:.4f}" if isinstance(risk_penalty, (int, float)) else _esc(risk_penalty)
                 html += f"""                    <tr>
-                        <td class="model-name">{name}</td>
-                        <td>{metric:.4f}</td>
-                        <td>{train_time:.2f}</td>
-                        <td>{memory:.1f}</td>
-                        <td>{latency:.3f}</td>
-                        <td>{risk_penalty:.4f}</td>
+                        <td class="model-name">{_esc(name)}</td>
+                        <td>{metric_str}</td>
+                        <td>{train_time_str}</td>
+                        <td>{memory_str}</td>
+                        <td>{latency_str}</td>
+                        <td>{risk_str}</td>
                     </tr>
 """
             html += """                </tbody>
@@ -678,13 +879,16 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         for result in report['benchmark_results']:
             system = result.get('system', 'N/A')
             dataset = result.get('dataset', 'N/A')
-            score = result.get('test_score', 0)
+            score = result.get('test_score', 0) or 0
             f1 = result.get('test_f1', None)
-            time_val = result.get('fit_time_s', 0)
-            latency = result.get('latency_ms_per_row', 0)
+            time_val = result.get('fit_time_s', 0) or 0
+            latency = result.get('latency_ms_per_row', 0) or 0
             model_name = result.get('model_name', 'N/A')
-            f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
-            html += f"                <tr><td>{system}</td><td>{dataset}</td><td>{score:.4f}</td><td>{f1_str}</td><td>{time_val:.2f}</td><td>{latency:.3f}</td><td class='model-name'>{model_name}</td></tr>\n"
+            score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _esc(score)
+            f1_str = f"{f1:.4f}" if isinstance(f1, (int, float)) else (_esc(f1) if f1 is not None else "N/A")
+            time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
+            latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
+            html += f"                <tr><td>{_esc(system)}</td><td>{_esc(dataset)}</td><td>{score_str}</td><td>{f1_str}</td><td>{time_str}</td><td>{latency_str}</td><td class='model-name'>{_esc(model_name)}</td></tr>\n"
         html += "            </table>\n"
         
         # Add actual execution code for each framework
@@ -702,9 +906,9 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 if code:
                     html += f"""
             <div style="margin-bottom: 20px; border: 1px solid var(--border); border-radius: 8px; padding: 15px; background: var(--card-bg);">
-                <h4 style="margin-top: 0; color: var(--primary);">{system} - {model_name}</h4>
-                <p style="color: var(--success); font-weight: bold; margin-bottom: 10px;">✓ {execution_summary}</p>
-                <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; margin: 0;"><code>{code}</code></pre>
+                <h4 style="margin-top: 0; color: var(--primary);">{_esc(system)} - {_esc(model_name)}</h4>
+                <p style="color: var(--success); font-weight: bold; margin-bottom: 10px;">✓ {_esc(execution_summary)}</p>
+                <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; margin: 0;"><code>{_esc(code)}</code></pre>
             </div>
 """
         html += "        </div>\n"
@@ -720,7 +924,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         for i, est in enumerate(report['estimators'], 1):
             est_type = est.get('type', 'Unknown')
             model_name = est.get('selected_model_name', 'N/A')
-            html += f"                <tr><td>{i}</td><td>{est_type}</td><td class='model-name'>{model_name}</td></tr>\n"
+            html += f"                <tr><td>{i}</td><td>{_esc(est_type)}</td><td class='model-name'>{_esc(model_name)}</td></tr>\n"
         html += "            </table>\n        </div>\n"
     
     # Add EDA HTML section if available
@@ -731,19 +935,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             <p class="info-text">Complete EDA report with data quality analysis, statistics, and visualizations.</p>
             <div style="border: 1px solid #ddd; border-radius: 4px; padding: 10px; max-height: 800px; overflow-y: auto;">
 """
-        # Extract body content from EDA HTML (skip DOCTYPE, html, head tags)
-        eda_html = report['eda_html']
-        # Try to extract just the body content
-        if '<body' in eda_html:
-            body_start = eda_html.find('<body')
-            body_start = eda_html.find('>', body_start) + 1
-            body_end = eda_html.find('</body>')
-            if body_end > body_start:
-                eda_html = eda_html[body_start:body_end]
-        # Remove script tags that might conflict
-        import re
-        eda_html = re.sub(r'<script[^>]*>.*?</script>', '', eda_html, flags=re.DOTALL | re.IGNORECASE)
-        html += eda_html
+        html += _sanitize_embedded_html(report['eda_html'])
         html += """
             </div>
         </div>
@@ -757,18 +949,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             <p class="info-text">Time series analysis, forecasting models, and benchmark comparisons.</p>
             <div style="border: 1px solid #ddd; border-radius: 4px; padding: 10px; max-height: 800px; overflow-y: auto;">
 """
-        ts_html = report['timeseries_html']
-        # Extract body content
-        if '<body' in ts_html:
-            body_start = ts_html.find('<body')
-            body_start = ts_html.find('>', body_start) + 1
-            body_end = ts_html.find('</body>')
-            if body_end > body_start:
-                ts_html = ts_html[body_start:body_end]
-        # Remove conflicting scripts
-        import re
-        ts_html = re.sub(r'<script[^>]*>.*?</script>', '', ts_html, flags=re.DOTALL | re.IGNORECASE)
-        html += ts_html
+        html += _sanitize_embedded_html(report['timeseries_html'])
         html += """
             </div>
         </div>
@@ -784,14 +965,13 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 <tr><th>Forecast Horizon</th><td>{}</td></tr>
                 <tr><th>Datetime Column</th><td>{}</td></tr>
                 <tr><th>Target Column</th><td>{}</td></tr>
-            </table>
 """.format(
-            ts.get('horizon', 'N/A'),
-            ts.get('datetime_col', 'N/A'),
-            ts.get('target', 'N/A')
+            _esc(ts.get('horizon', 'N/A')),
+            _esc(ts.get('datetime_col', 'N/A')),
+            _esc(ts.get('target', 'N/A'))
         )
         if 'best_model' in ts:
-            html += f"                <tr><th>Best Model</th><td class='model-name'>{ts.get('best_model', 'N/A')}</td></tr>\n"
+            html += f"                <tr><th>Best Model</th><td class='model-name'>{_esc(ts.get('best_model', 'N/A'))}</td></tr>\n"
         html += "            </table>\n"
         
         # Display actual execution code for time series
@@ -802,8 +982,8 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             if code:
                 html += f"""
             <h3>Actual Execution Code</h3>
-            <p class="info-text" style="color: var(--success); font-weight: bold;">✓ {execution_summary}</p>
-            <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"><code>{code}</code></pre>
+            <p class="info-text" style="color: var(--success); font-weight: bold;">✓ {_esc(execution_summary)}</p>
+            <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"><code>{_esc(code)}</code></pre>
 """
         if 'leaderboard' in ts and ts['leaderboard']:
             html += "            <h3>Model Leaderboard</h3>\n            <table>\n"
@@ -815,9 +995,9 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 fit_time = row.get('Fit Time (s)', row.get('fit_time', 'N/A'))
                 family = row.get('Family', row.get('family', 'N/A'))
                 # Format numeric values, keep strings as-is
-                score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else str(score_val)
-                time_str = f"{fit_time:.2f}s" if isinstance(fit_time, (int, float)) else str(fit_time)
-                html += f"                <tr><td>{i}</td><td class='model-name'>{model_name}</td><td>{score_str}</td><td>{time_str}</td><td>{family}</td></tr>\n"
+                score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else _esc(score_val)
+                time_str = f"{fit_time:.2f}s" if isinstance(fit_time, (int, float)) else _esc(fit_time)
+                html += f"                <tr><td>{i}</td><td class='model-name'>{_esc(model_name)}</td><td>{score_str}</td><td>{time_str}</td><td>{_esc(family)}</td></tr>\n"
             html += "            </table>\n"
         html += "        </div>\n"
     
@@ -836,9 +1016,9 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 if code:
                     html += f"""
             <div style="margin-bottom: 20px; border: 1px solid var(--border); border-radius: 8px; padding: 15px; background: var(--card-bg);">
-                <h4 style="margin-top: 0; color: var(--primary);">{system}</h4>
-                <p style="color: var(--success); font-weight: bold; margin-bottom: 10px;">✓ {execution_summary}</p>
-                <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; margin: 0;"><code>{code}</code></pre>
+                <h4 style="margin-top: 0; color: var(--primary);">{_esc(system)}</h4>
+                <p style="color: var(--success); font-weight: bold; margin-bottom: 10px;">✓ {_esc(execution_summary)}</p>
+                <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; margin: 0;"><code>{_esc(code)}</code></pre>
             </div>
 """
         html += "        </div>\n"
@@ -857,10 +1037,10 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 <tr><th>Output File</th><td><code>{}</code></td></tr>
             </table>
 """.format(
-            pred.get('target_column', 'N/A'),
-            pred.get('total_predictions', 0),
-            pred.get('task', 'N/A'),
-            pred.get('output_file', 'N/A')
+            _esc(pred.get('target_column', 'N/A')),
+            _esc(pred.get('total_predictions', 0)),
+            _esc(pred.get('task', 'N/A')),
+            _esc(pred.get('output_file', 'N/A'))
         )
         
         # Add statistics
@@ -878,7 +1058,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             if 'distribution' in stats and stats['distribution']:
                 html += "                <tr><th>Distribution</th><td>\n"
                 for class_val, count in stats['distribution'].items():
-                    html += f"                    Class {class_val}: {count}<br>\n"
+                    html += f"                    Class {_esc(class_val)}: {_esc(count)}<br>\n"
                 html += "                </td></tr>\n"
             html += "            </table>\n"
         
@@ -890,15 +1070,15 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             <p class="info-text">First 20 rows and last 5 rows of predictions (total: {} predictions)</p>
             <table>
                 <tr><th>Row</th><th>Predicted Value</th><th>Actual Value</th></tr>
-""".format(pred.get('total_predictions', len(samples)))
+""".format(_esc(pred.get('total_predictions', len(samples))))
             for sample in samples:
                 row_idx = sample.get('row', 'N/A')
                 pred_val = sample.get('predicted', 'N/A')
                 actual_val = sample.get('actual', 'N/A')
                 # Format values
-                pred_str = f"{pred_val:.4f}" if isinstance(pred_val, (int, float)) else str(pred_val)
-                actual_str = f"{actual_val:.4f}" if isinstance(actual_val, (int, float)) and actual_val is not None else str(actual_val) if actual_val is not None else "N/A"
-                html += f"                <tr><td>{row_idx}</td><td>{pred_str}</td><td>{actual_str}</td></tr>\n"
+                pred_str = f"{pred_val:.4f}" if isinstance(pred_val, (int, float)) else _esc(pred_val)
+                actual_str = f"{actual_val:.4f}" if isinstance(actual_val, (int, float)) and actual_val is not None else (_esc(actual_val) if actual_val is not None else "N/A")
+                html += f"                <tr><td>{_esc(row_idx)}</td><td>{pred_str}</td><td>{actual_str}</td></tr>\n"
             html += "            </table>\n"
         
         html += "        </div>\n"
@@ -909,7 +1089,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         html += f"""
         <div class="card">
             <h2>Console Output ({len(console_lines)} lines)</h2>
-            <div class="console-output">{report['console_output'][:50000]}</div>
+            <div class="console-output">{_esc(report['console_output'][:50000])}</div>
         </div>
 """
     
@@ -933,9 +1113,9 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             elif isinstance(value, int):
                 formatted_value = str(value)
             else:
-                formatted_value = str(value)
+                formatted_value = _esc(value)
             
-            html += f"                <div class='summary-item'><div class='summary-value'>{formatted_value}</div><div class='summary-label'>{key.replace('_', ' ').title()}</div></div>\n"
+            html += f"                <div class='summary-item'><div class='summary-value'>{formatted_value}</div><div class='summary-label'>{_esc(key.replace('_', ' ').title())}</div></div>\n"
         html += "            </div>\n        </div>\n"
     
     # Add Files Generated section - comprehensive list of all output files
@@ -978,9 +1158,9 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
 """
         for file_type, file_path in output_files:
             if file_path and file_path != 'None':
-                # Create copyable path with onclick
+                # Create copyable path with data-path
                 html += f"""                <tr>
-                    <td>{file_type}</td>
+                    <td>{_esc(file_type)}</td>
                     <td>{_file_link_cell(file_path)}</td>
                 </tr>
 """
@@ -1009,6 +1189,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     """
     import os
     from datetime import datetime
+    from urllib.parse import quote
     
     targets = results.get("targets", [])
     target_reports = results.get("target_reports", {})
@@ -1020,7 +1201,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-size='32' font-weight='700' fill='%23ffffff' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
-    <title>ACDSO Multi-Target Report - {base_name}</title>
+    <title>ACDSO Multi-Target Report - {_esc(base_name)}</title>
     <style>
         :root {{
             --primary: #2563eb;
@@ -1287,7 +1468,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     <div class="container">
         <div class="header">
             <h1>🎯 ACDSO Multi-Target Report</h1>
-            <p class="subtitle">{base_name} | {len(targets)} Targets | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p class="subtitle">{_esc(base_name)} | {len(targets)} Targets | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
         
         <div class="summary-stats">
@@ -1319,7 +1500,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
         
         html += f"""
             <div class="target-card">
-                <h3>🎯 {target}</h3>
+                <h3>🎯 {_esc(target)}</h3>
 """
         if "mean" in stats:
             html += f"""
@@ -1332,11 +1513,13 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
             dist = stats.get("distribution", {})
             for k, v in list(dist.items())[:5]:
                 html += f"""
-                <div class="stat"><span>Class {k}:</span><span>{v}</span></div>
+                <div class="stat"><span>Class {_esc(k)}:</span><span>{_esc(v)}</span></div>
 """
+        pred_count = pred.get('count', 0)
+        pred_count_str = f"{pred_count:,}" if isinstance(pred_count, (int, float)) else _esc(pred_count)
         html += f"""
-                <div class="stat"><span>Predictions:</span><span>{pred.get('count', 0):,}</span></div>
-                <div class="stat"><span>Output:</span><span style="font-size:0.8em;">{os.path.basename(pred.get('output_file', 'N/A'))}</span></div>
+                <div class="stat"><span>Predictions:</span><span>{pred_count_str}</span></div>
+                <div class="stat"><span>Output:</span><span style="font-size:0.8em;">{_esc(os.path.basename(pred.get('output_file', 'N/A')))}</span></div>
             </div>
 """
     
@@ -1351,7 +1534,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     # Add tabs for each target
     for i, target in enumerate(targets):
         active = "active" if i == 0 else ""
-        html += f"""                <button class="tab {active}" onclick="showTab('{target}')">{target}</button>
+        html += f"""                <button type="button" class="tab {active}" data-tab="tab-panel-{i}" onclick="showTab(this.dataset.tab, this)">{_esc(target)}</button>
 """
     
     html += """            </div>
@@ -1363,8 +1546,8 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
         report = target_reports.get(target, {})
         
         html += f"""
-            <div id="tab-{target}" class="tab-content {active}">
-                <h3>🎯 Target: {target}</h3>
+            <div id="tab-panel-{i}" class="tab-content {active}">
+                <h3>🎯 Target: {_esc(target)}</h3>
 """
         
         # Selected Model (from the actual combined report structure)
@@ -1376,14 +1559,14 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 <h4>🤖 Selected Model</h4>
                 <table>
                     <tr><th>Metric</th><th>Value</th></tr>
-                    <tr><td>Model Name</td><td><span class="badge badge-primary">{model_name}</span></td></tr>
+                    <tr><td>Model Name</td><td><span class="badge badge-primary">{_esc(model_name)}</span></td></tr>
 """
             for key, value in metrics.items():
                 if value is not None:
                     if isinstance(value, float):
-                        html += f"                    <tr><td>{key}</td><td>{value:.4f}</td></tr>\n"
+                        html += f"                    <tr><td>{_esc(key)}</td><td>{value:.4f}</td></tr>\n"
                     else:
-                        html += f"                    <tr><td>{key}</td><td>{value}</td></tr>\n"
+                        html += f"                    <tr><td>{_esc(key)}</td><td>{_esc(value)}</td></tr>\n"
             html += """                </table>
 """
         
@@ -1406,17 +1589,17 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 risk = c.get('risk_penalty', 0) or 0
                 
                 # Format values safely
-                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else str(metric)
-                cv_std_str = f"{cv_std:.4f}" if isinstance(cv_std, (int, float)) else str(cv_std)
-                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else str(train_time)
-                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else str(memory)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else str(latency)
-                risk_str = f"{risk:.4f}" if isinstance(risk, (int, float)) else str(risk)
+                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
+                cv_std_str = f"{cv_std:.4f}" if isinstance(cv_std, (int, float)) else _esc(cv_std)
+                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
+                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
+                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
+                risk_str = f"{risk:.4f}" if isinstance(risk, (int, float)) else _esc(risk)
                 
                 html += f"""
                     <tr>
                         <td>{idx}</td>
-                        <td>{name}</td>
+                        <td>{_esc(name)}</td>
                         <td>{metric_str}</td>
                         <td>{cv_std_str}</td>
                         <td>{train_time_str}</td>
@@ -1443,14 +1626,14 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 memory = p.get('peak_mem_mb', 0) or 0
                 latency = p.get('latency_ms_per_row', 0) or 0
                 
-                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else str(metric)
-                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else str(train_time)
-                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else str(memory)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else str(latency)
+                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
+                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
+                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
+                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
                 
                 html += f"""
                     <tr>
-                        <td>{name}</td>
+                        <td>{_esc(name)}</td>
                         <td>{metric_str}</td>
                         <td>{train_time_str}</td>
                         <td>{memory_str}</td>
@@ -1470,8 +1653,8 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 <h4>📈 Time Series Results</h4>
                 <table>
                     <tr><th>Metric</th><th>Value</th></tr>
-                    <tr><td>Best Model</td><td><span class="badge badge-success">{best_model}</span></td></tr>
-                    <tr><td>RMSE</td><td>{rmse}</td></tr>
+                    <tr><td>Best Model</td><td><span class="badge badge-success">{_esc(best_model)}</span></td></tr>
+                    <tr><td>RMSE</td><td>{_esc(rmse)}</td></tr>
                 </table>
 """
         
@@ -1487,10 +1670,10 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 if isinstance(row, dict):
                     html += f"""
                     <tr>
-                        <td>{row.get('System', row.get('system', 'N/A'))}</td>
-                        <td>{row.get('RMSE', row.get('rmse', 'N/A'))}</td>
-                        <td>{row.get('MAE', row.get('mae', 'N/A'))}</td>
-                        <td>{row.get('Time(s)', row.get('time', 'N/A'))}</td>
+                        <td>{_esc(row.get('System', row.get('system', 'N/A')))}</td>
+                        <td>{_esc(row.get('RMSE', row.get('rmse', 'N/A')))}</td>
+                        <td>{_esc(row.get('MAE', row.get('mae', 'N/A')))}</td>
+                        <td>{_esc(row.get('Time(s)', row.get('time', 'N/A')))}</td>
                     </tr>
 """
             html += """                </table>
@@ -1511,17 +1694,17 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 latency = res.get('latency_ms_per_row', 0) or 0
                 model_name = res.get('model_name', 'N/A')
                 
-                score_str = f"{score:.4f}" if isinstance(score, (int, float)) else str(score)
-                time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else str(time_val)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else str(latency)
+                score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _esc(score)
+                time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
+                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
                 
                 html += f"""
                     <tr>
-                        <td>{system}</td>
+                        <td>{_esc(system)}</td>
                         <td>{score_str}</td>
                         <td>{time_str}</td>
                         <td>{latency_str}</td>
-                        <td>{model_name}</td>
+                        <td>{_esc(model_name)}</td>
                     </tr>
 """
             html += """                </table>
@@ -1533,32 +1716,24 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
             quality_score = eda_report.get('quality_score', 'N/A')
             n_rows = eda_report.get('n_rows', 'N/A')
             n_cols = eda_report.get('n_cols', 'N/A')
+            n_rows_str = f"{n_rows:,}" if isinstance(n_rows, (int, float)) else _esc(n_rows)
             html += f"""
                 <h4>🔍 EDA Summary</h4>
                 <table>
                     <tr><th>Metric</th><th>Value</th></tr>
-                    <tr><td>Quality Score</td><td><span class="badge badge-success">{quality_score}/100</span></td></tr>
-                    <tr><td>Rows</td><td>{n_rows:,}</td></tr>
-                    <tr><td>Columns</td><td>{n_cols}</td></tr>
+                    <tr><td>Quality Score</td><td><span class="badge badge-success">{_esc(quality_score)}/100</span></td></tr>
+                    <tr><td>Rows</td><td>{n_rows_str}</td></tr>
+                    <tr><td>Columns</td><td>{_esc(n_cols)}</td></tr>
                 </table>
 """
         
         # Embedded EDA HTML (if available)
         eda_html = report.get("eda_html", "")
         if eda_html:
-            # Extract body content from EDA HTML
-            import re
-            if '<body' in eda_html:
-                body_start = eda_html.find('<body')
-                body_start = eda_html.find('>', body_start) + 1
-                body_end = eda_html.find('</body>')
-                if body_end > body_start:
-                    eda_html = eda_html[body_start:body_end]
-            eda_html = re.sub(r'<script[^>]*>.*?</script>', '', eda_html, flags=re.DOTALL | re.IGNORECASE)
             html += f"""
                 <h4>📊 Full EDA Report</h4>
                 <div style="border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 600px; overflow-y: auto; background: white;">
-                    {eda_html}
+                    {_sanitize_embedded_html(eda_html)}
                 </div>
 """
         
@@ -1579,12 +1754,14 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                             model = item.get('model_name', 'N/A') or 'N/A'
                             time_val = item.get('time', 0) or 0
                             status_class = 'badge-success' if 'SUCCESS' in str(status) else 'badge-warning'
-                            time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else str(time_val)
+                            time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
+                            status_str = str(status)
+                            status_disp = status_str[:50] if len(status_str) > 50 else status_str
                             html += f"""
                     <tr>
-                        <td>{name}</td>
-                        <td><span class="badge {status_class}">{status[:50] if len(str(status)) > 50 else status}</span></td>
-                        <td>{model}</td>
+                        <td>{_esc(name)}</td>
+                        <td><span class="badge {status_class}">{_esc(status_disp)}</span></td>
+                        <td>{_esc(model)}</td>
                         <td>{time_str}</td>
                     </tr>
 """
@@ -1605,11 +1782,15 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     
     for target in targets:
         pred = predictions.get(target, {})
+        pred_file = pred.get('output_file')
+        pred_href = _esc(_file_uri(pred_file)) if pred_file else '#'
+        pred_count = pred.get('count', 0)
+        pred_count_str = f"{pred_count:,}" if isinstance(pred_count, (int, float)) else _esc(pred_count)
         html += f"""
                 <div class="prediction-box">
-                    <h4>🎯 {target}</h4>
-                    <p>Predictions: <strong>{pred.get('count', 0):,}</strong></p>
-                    <a href="{pred.get('output_file', '#')}" class="file-link">📥 Download CSV</a>
+                    <h4>🎯 {_esc(target)}</h4>
+                    <p>Predictions: <strong>{pred_count_str}</strong></p>
+                    <a href="{pred_href}" class="file-link">📥 Download CSV</a>
                 </div>
 """
     
@@ -1624,8 +1805,9 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
 """
     
     for target in targets:
+        ind_href = _esc(quote(f"autonomous_{base_name}_{target}_report.html", safe="/:._-"))
         html += f"""
-                <a href="autonomous_{base_name}_{target}_report.html" class="file-link">📊 {target} Report</a>
+                <a href="{ind_href}" class="file-link">📊 {_esc(target)} Report</a>
 """
     
     html += """
@@ -1646,7 +1828,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
         abs_path = os.path.abspath(model_path) if model_path else "N/A"
         html += f"""                <tr>
                     <td>🤖 Model</td>
-                    <td>{target}</td>
+                    <td>{_esc(target)}</td>
                     <td>{_file_link_cell(abs_path)}</td>
                 </tr>
 """
@@ -1658,7 +1840,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
         abs_path = os.path.abspath(output_file) if output_file else "N/A"
         html += f"""                <tr>
                     <td>📊 Predictions CSV</td>
-                    <td>{target}</td>
+                    <td>{_esc(target)}</td>
                     <td>{_file_link_cell(abs_path)}</td>
                 </tr>
 """
@@ -1669,7 +1851,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
         abs_path = os.path.abspath(report_path)
         html += f"""                <tr>
                     <td>📄 Individual Report</td>
-                    <td>{target}</td>
+                    <td>{_esc(target)}</td>
                     <td>{_file_link_cell(abs_path)}</td>
                 </tr>
 """
@@ -1695,14 +1877,15 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     </div>
     
     <script>
-        function showTab(target) {{
+        function showTab(panelId, btn) {{
             // Hide all tabs
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
             
             // Show selected tab
-            document.getElementById('tab-' + target).classList.add('active');
-            event.target.classList.add('active');
+            const panel = document.getElementById(panelId);
+            if (panel) panel.classList.add('active');
+            if (btn) btn.classList.add('active');
         }}
     </script>
 </body>
@@ -1908,6 +2091,7 @@ def load_tips_dataset() -> pd.DataFrame:
     pd.DataFrame
         Tips dataset with columns: total_bill, tip, sex, smoker, day, time, size
     """
+    _ensure_ml_deps()
     try:
         import seaborn as sns
         tips = sns.load_dataset("tips")
@@ -1940,6 +2124,7 @@ TIPS_DATA = None
 def get_tips_data() -> pd.DataFrame:
     """Get the tips dataset (cached)."""
     global TIPS_DATA
+    _ensure_ml_deps()
     if TIPS_DATA is None:
         TIPS_DATA = load_tips_dataset()
     return TIPS_DATA.copy()
@@ -2008,6 +2193,7 @@ def demo_basic_classification():
     =============================================
     Predict if a customer is a smoker using the Seaborn tips dataset.
     """
+    _ensure_ml_deps()
     # Capture all console output for the combined report
     console_output_lines = []
     
@@ -2239,6 +2425,7 @@ def demo_with_constraints():
     ===================================================================
     Enforce latency, memory, and training time limits.
     """
+    _ensure_ml_deps()
     print_header("DEMO 2: Production Constraints (Tips Dataset)")
 
     from acdso import ACDSOClassifier
@@ -2337,6 +2524,7 @@ def demo_risk_report():
     =====================================
     See what ACDSO detects about your data.
     """
+    _ensure_ml_deps()
     print_header("DEMO 3: Understanding Risk Analysis")
 
     from acdso import ACDSOClassifier
@@ -2451,6 +2639,7 @@ def demo_pareto_front():
     ===================================================
     See all optimal models, not just the "best" one.
     """
+    _ensure_ml_deps()
     print_header("DEMO 4: Exploring the Pareto Front (Tips)")
 
     from acdso import ACDSOClassifier
@@ -2550,6 +2739,7 @@ def demo_regression():
     ==========================================
     Predict tip amount using the Seaborn tips dataset.
     """
+    _ensure_ml_deps()
     print_header("DEMO 5: Regression Example (Tips Dataset)")
 
     from acdso import ACDSORegressor
@@ -2647,6 +2837,7 @@ def demo_audit_trail():
     ====================================================
     Export evaluation details for compliance/tracking.
     """
+    _ensure_ml_deps()
     print_header("DEMO 6: Saving Audit Trail for MLOps (Tips)")
 
     from acdso import ACDSOClassifier
@@ -2752,6 +2943,7 @@ def demo_with_llm():
     =====================================
     Add semantic analysis with LLM.
     """
+    _ensure_ml_deps()
     print_header("DEMO 7: Using LLM Advisor for Semantic Analysis")
 
     from acdso import ACDSOClassifier, llm_advisor_stub
@@ -2855,6 +3047,7 @@ def demo_real_dataset():
     ==================================================
     Using ACDSO on the tips dataset for multi-class prediction.
     """
+    _ensure_ml_deps()
     print_header("DEMO 8: Real Dataset Example (Tips - Day Prediction)")
 
     from acdso import ACDSOClassifier
@@ -2941,6 +3134,7 @@ def demo_auto_eda_basic():
     ======================================
     Automatic Exploratory Data Analysis on the tips dataset.
     """
+    _ensure_ml_deps()
     print_header("DEMO 9: Basic Auto EDA (Tips Dataset)")
 
     from acdso import ACDSOAutoEDA
@@ -3012,6 +3206,7 @@ def demo_auto_eda_quality():
     =====================================================
     Deep dive into data quality assessment using tips data with issues.
     """
+    _ensure_ml_deps()
     print_header("DEMO 10: Auto EDA - Data Quality Analysis (Extended Tips)")
 
     from acdso import ACDSOAutoEDA
@@ -3135,6 +3330,7 @@ def demo_auto_eda_pareto():
     =====================================================
     Understanding the multi-objective optimization in Auto EDA.
     """
+    _ensure_ml_deps()
     print_header("DEMO 11: Auto EDA - Pareto Optimization (Tips)")
 
     from acdso import ACDSOAutoEDA
@@ -3227,6 +3423,7 @@ def demo_auto_eda_with_llm():
     ====================================
     Using LLM advisor for enhanced insights.
     """
+    _ensure_ml_deps()
     print_header("DEMO 12: Auto EDA with LLM Insights")
 
     from acdso import ACDSOAutoEDA, llm_advisor_stub
@@ -3304,6 +3501,7 @@ def demo_auto_eda_export():
     ======================================================
     Saving EDA results for documentation and sharing.
     """
+    _ensure_ml_deps()
     print_header("DEMO 13: Auto EDA - Export and Reporting (Tips)")
 
     from acdso import ACDSOAutoEDA
@@ -3379,6 +3577,7 @@ def demo_automl_integration():
     Using ACDSO as a unified decision layer across AutoML tools.
     Predicting smoker status from tips data.
     """
+    _ensure_ml_deps()
     print_header("DEMO 14: AutoML Integration - Meta Optimizer (Tips)")
 
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -3534,6 +3733,7 @@ def demo_automl_flaml():
     ==========================================
     Using ACDSO with Microsoft FLAML on tips data.
     """
+    _ensure_ml_deps()
     print_header("DEMO 15: FLAML Integration (Tips)")
 
     # Check if FLAML is available
@@ -3644,6 +3844,7 @@ def demo_eda_integrations():
     ===================================================
     Using ACDSO Auto EDA with external EDA tools on tips data.
     """
+    _ensure_ml_deps()
     print_header("DEMO 16: Auto EDA Tool Integrations (Tips)")
 
     from acdso.eda import get_available_backends
@@ -3763,6 +3964,7 @@ def demo_eda_utilities():
     ===================================================
     Standalone EDA utilities for common tasks using tips data.
     """
+    _ensure_ml_deps()
     print_header("DEMO 17: Auto EDA Utility Functions (Tips)")
 
     from acdso.eda import (
@@ -3878,6 +4080,7 @@ def demo_complete_workflow():
     End-to-end workflow: EDA → Risk Analysis → AutoML → Deployment.
     Predicting if a customer will leave a high tip (>$3).
     """
+    _ensure_ml_deps()
     print_header("DEMO 18: Complete ML Workflow with ACDSO (Tips)")
 
     from acdso import ACDSOClassifier, ACDSOAutoEDA
@@ -4234,6 +4437,7 @@ def demo_safe_feature_importance():
     - Stability across resamples
     - Cross-validated importance
     """
+    _ensure_ml_deps()
     print_header("DEMO 19: Safe Feature Importance", 80)
     
     # Load tips data
@@ -4334,6 +4538,7 @@ def demo_auto_preprocessing():
     - Categorical encoding
     - Multicollinearity reduction
     """
+    _ensure_ml_deps()
     print_header("DEMO 20: AutoEDA-Informed Preprocessing", 80)
     
     # Create a challenging dataset
@@ -4504,6 +4709,7 @@ def demo_benchmark_comparison():
     - Production metrics (risk detection, audit trails)
     - Leakage detection capability
     """
+    _ensure_ml_deps()
     print_header("DEMO 21: Benchmark Comparison with Other AutoML Systems", 80)
     
     # Check available systems
@@ -4948,6 +5154,7 @@ def demo_benchmark_comparison():
 
 def demo_v3_innovations():
     """Demo: ACDSO v3 Innovations - Stress Testing, Successive Halving, Learned Risk Calibration."""
+    _ensure_ml_deps()
     print_header("ACDSO v3 INNOVATIONS")
     
     print("\n  ACDSO v3 introduces three major innovations:")
@@ -5111,6 +5318,7 @@ def demo_v3_innovations():
 
 def demo_auto_timeseries():
     """Demo: ACDSO Auto Time Series Forecasting."""
+    _ensure_ml_deps()
     print_header("AUTO TIME SERIES FORECASTING")
     
     try:
@@ -5264,6 +5472,7 @@ def demo_auto_timeseries():
 
 def demo_decision_intelligence():
     """Demo: ACDSO Decision Intelligence (Causal + Uplift + Optimization)."""
+    _ensure_ml_deps()
     print_header("DECISION INTELLIGENCE")
     
     try:
@@ -5530,6 +5739,7 @@ def demo_decision_intelligence():
 
 def demo_policy_learning():
     """Demo: ACDSO Policy Learning with RLlib."""
+    _ensure_ml_deps()
     print_header("POLICY LEARNING (RLlib)")
     
     try:
@@ -5652,6 +5862,7 @@ def demo_policy_learning():
 
 def run_all_demos():
     """Run all demos with summary."""
+    _ensure_ml_deps()
     demos = [
         ("Basic Classification", demo_basic_classification),
         ("Production Constraints", demo_with_constraints),
@@ -5720,6 +5931,90 @@ def run_all_demos():
     print("=" * 80 + "\n")
 
 
+def _validate_dataframe_nonempty(df: Any, filepath: str = "") -> None:
+    """Raise ValueError if df is None or has 0 rows / 0 columns."""
+    _ensure_ml_deps()
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty or len(df) == 0 or len(df.columns) == 0:
+        label = f" ({filepath})" if filepath else ""
+        raise ValueError(f"Dataset{label} is empty (0 rows or 0 columns).")
+
+
+def _sanitize_target_rows(
+    df: "pd.DataFrame",
+    target_cols: List[str],
+    min_rows: int = 2,
+) -> "pd.DataFrame":
+    """Drop rows containing NaN/inf in target_cols and enforce min_rows."""
+    _ensure_ml_deps()
+    _validate_dataframe_nonempty(df)
+    valid_mask = pd.Series(True, index=df.index)
+    for col in target_cols:
+        if col not in df.columns:
+            raise ValueError(f"Target column '{col}' not found in dataset.")
+        s = df[col]
+        col_mask = s.notna()
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            vals = s.to_numpy(dtype=float, na_value=np.nan)
+            col_mask = col_mask & np.isfinite(vals)
+        valid_mask = valid_mask & col_mask
+
+    n_dropped = int(len(df) - int(valid_mask.sum()))
+    if n_dropped > 0:
+        print(
+            f"  [WARN] Dropped {n_dropped} row(s) containing NaN/inf in target {target_cols}; "
+            f"{int(valid_mask.sum())} row(s) remaining."
+        )
+    df_clean = df.loc[valid_mask].copy()
+    if len(df_clean) < min_rows:
+        raise ValueError(
+            f"Insufficient valid rows ({len(df_clean)}) after dropping NaN/inf target values "
+            f"(minimum required: {min_rows})."
+        )
+    return df_clean
+
+
+def _is_datetime_series(s: "pd.Series") -> bool:
+    """Return True only if Series is genuine datetime or non-numeric datetime strings."""
+    _ensure_ml_deps()
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return True
+    if pd.api.types.is_bool_dtype(s) or pd.api.types.is_numeric_dtype(s):
+        return False
+    sample = s.dropna().head(50)
+    if sample.empty:
+        return False
+    sample_str = sample.astype(str).str.strip()
+    sample_str = sample_str[sample_str != ""]
+    if sample_str.empty:
+        return False
+    if pd.to_numeric(sample_str, errors="coerce").notna().mean() > 0.8:
+        return False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        parsed = pd.to_datetime(sample_str, errors="coerce")
+    return bool(parsed.notna().mean() > 0.8)
+
+
+def _detect_datetime_column(df: "pd.DataFrame") -> Optional[str]:
+    """Detect a genuine datetime column without misclassifying numeric/bool columns."""
+    _ensure_ml_deps()
+    if df is None or df.empty:
+        return None
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            return col
+    dt_kw_re = re.compile(
+        r"(?<![a-z])(?:date|time|timestamp|ts|datetime|created|updated|week|period|dt)(?![a-z])"
+    )
+    for col in df.columns:
+        if dt_kw_re.search(str(col).lower()) and _is_datetime_series(df[col]):
+            return col
+    for col in df.columns:
+        if _is_datetime_series(df[col]):
+            return col
+    return None
+
+
 def _llm_detect_target(df: pd.DataFrame) -> dict:
     """
     Use LLM to intelligently detect target column and task type.
@@ -5731,6 +6026,7 @@ def _llm_detect_target(df: pd.DataFrame) -> dict:
     dict
         {'target': str, 'task': str, 'confidence': float, 'reasoning': str}
     """
+    _ensure_ml_deps()
     import os
     
     result = {
@@ -5837,23 +6133,10 @@ REASONING: <brief explanation>"""
 
 def _llm_detect_datetime_col(df: pd.DataFrame) -> str:
     """Detect datetime column for time series analysis."""
-    import os
-    
-    # Check for obvious datetime columns
-    for col in df.columns:
-        col_lower = col.lower()
-        if any(kw in col_lower for kw in ['date', 'time', 'timestamp', 'datetime', 'dt']):
-            # Verify it can be converted to datetime
-            try:
-                pd.to_datetime(df[col])
-                return col
-            except:
-                pass
-    
-    # Check dtype
-    for col in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            return col
+    _ensure_ml_deps()
+    detected = _detect_datetime_column(df)
+    if detected:
+        return detected
     
     # Try LLM
     if os.environ.get('OPENAI_API_KEY'):
@@ -5871,7 +6154,7 @@ Respond with just the column name or 'NONE' if no datetime column."""
             
             config = LLMConfig(max_tokens=50, temperature=0.0)
             response = provider.complete(system_prompt, user_prompt, config).strip()
-            if response in df.columns:
+            if response in df.columns and _is_datetime_series(df[response]):
                 return response
         except:
             pass
@@ -6575,6 +6858,9 @@ def _run_autonomous_custom_file(
     has_llm: bool = False,
     start_time: float = None,
     selection_mode: str = "knee_point",
+    auto_exclude: bool = True,
+    phase_offset: int = 0,
+    total_phases: int = 9,
 ):
     """
     Run comprehensive autonomous analysis on a USER'S CUSTOM FILE.
@@ -6587,26 +6873,30 @@ def _run_autonomous_custom_file(
     - Benchmarking (if requested)
     - Full report generation
     """
-    import os
-    
+    _ensure_ml_deps()
     if start_time is None:
         start_time = time.time()
     
     all_results = []
     analysis_outputs = {}
+    effective_exclude = list(exclude) if exclude else []
     
     print("\n" + "=" * 80)
     print("  ANALYZING YOUR CUSTOM FILE: " + os.path.basename(custom_file))
     print("=" * 80)
     
     # Load the data
+    p1 = phase_offset + 1
+    _render_phase_banner(p1, total_phases, "Data Loading")
+    _emit_progress(p1, total_phases, "Data Loading", "running", detail=os.path.basename(custom_file))
     print("\n" + "-" * 80)
     print("  PHASE 1: Loading & Understanding Your Data")
     print("-" * 80)
     
     phase1_start = time.time()
     try:
-        df = pd.read_csv(custom_file)
+        df = load_user_file(custom_file)
+        _validate_dataframe_nonempty(df, custom_file)
         print(f"\n  [OK] Loaded: {custom_file}")
         print(f"      Shape: {df.shape[0]} rows x {df.shape[1]} columns")
         print(f"      Columns: {list(df.columns)}")
@@ -6628,21 +6918,17 @@ def _run_autonomous_custom_file(
     except Exception as e:
         print(f"\n  [X] Failed to load file: {e}")
         all_results.append(("Data Loading", f"FAILED: {e}", time.time() - phase1_start))
-        return
+        _emit_progress(p1, total_phases, "Data Loading", "error", detail=str(e))
+        return None
     
     # Auto-detect datetime column
     detected_datetime_col = datetime_col
     if not detected_datetime_col:
         print("\n  Detecting datetime column...")
-        for col in df.columns:
-            try:
-                pd.to_datetime(df[col])
-                detected_datetime_col = col
-                print(f"      [OK] Auto-detected: '{detected_datetime_col}'")
-                break
-            except Exception:
-                pass
-        if not detected_datetime_col:
+        detected_datetime_col = _detect_datetime_column(df)
+        if detected_datetime_col:
+            print(f"      [OK] Auto-detected: '{detected_datetime_col}'")
+        else:
             print(f"      [--] No datetime column detected")
     
     # Auto-detect target column
@@ -6655,7 +6941,8 @@ def _run_autonomous_custom_file(
             print(f"      Available columns: {list(df.columns)}")
             print(f"\n      Please use one of the available columns with --predict or --target")
             all_results.append(("Target Detection", f"FAILED: Column '{detected_target}' not found", 0))
-            return
+            _emit_progress(p1, total_phases, "Data Loading", "error", detail=f"Target '{detected_target}' not found")
+            return None
         print(f"\n  Using provided target column: '{detected_target}'")
     else:
         print("\n  Detecting target column...")
@@ -6685,25 +6972,73 @@ def _run_autonomous_custom_file(
     if not detected_target:
         print(f"\n  [X] Could not detect target column. Use --target flag.")
         all_results.append(("Target Detection", "FAILED: No target detected", 0))
-        return
+        _emit_progress(p1, total_phases, "Data Loading", "error", detail="No target column detected")
+        return None
     
     analysis_outputs['target'] = detected_target
     analysis_outputs['datetime_col'] = detected_datetime_col
+    
+    # Smart automatic column exclusion (unless --no-auto-exclude)
+    if auto_exclude:
+        try:
+            from acdso.advisors import auto_exclude_columns
+            llm_provider = None
+            if has_llm and os.environ.get('OPENAI_API_KEY'):
+                try:
+                    from acdso.advisors import OpenAIProvider
+                    llm_provider = OpenAIProvider()
+                except Exception:
+                    llm_provider = None
+            excl_result = auto_exclude_columns(
+                df,
+                target_column=detected_target,
+                provider=llm_provider,
+                verbose=True,
+            )
+            for col in excl_result.columns_to_exclude:
+                if col != detected_target and col != detected_datetime_col and col not in effective_exclude:
+                    effective_exclude.append(col)
+        except Exception as e:
+            print(f"  [--] Auto-exclusion skipped: {e}")
+    else:
+        print("\n  [--] Auto-exclusion disabled (--no-auto-exclude)")
+    
+    # Sanitize NaN/inf target rows before downstream phases
+    try:
+        df = _sanitize_target_rows(df, [detected_target], min_rows=2)
+        analysis_outputs['df'] = df
+        analysis_outputs['shape'] = df.shape
+    except Exception as e:
+        print(f"\n  [X] ERROR: {e}")
+        all_results.append(("Target Validation", f"FAILED: {e}", time.time() - phase1_start))
+        _emit_progress(p1, total_phases, "Data Loading", "error", detail=str(e))
+        return None
     
     # Auto-detect task type
     detected_task = task
     if not detected_task or detected_task == 'auto':
         n_unique = df[detected_target].nunique()
-        if n_unique <= 10 and df[detected_target].dtype in ['int64', 'int32', 'object', 'bool']:
+        if n_unique <= 10 and (df[detected_target].dtype in ['int64', 'int32', 'object', 'bool'] or str(df[detected_target].dtype) in ['category', 'string']):
             detected_task = 'classification'
         else:
             detected_task = 'regression'
         print(f"\n  Task type: {detected_task} (target has {n_unique} unique values)")
     
+    if detected_task == 'classification' and df[detected_target].nunique(dropna=True) < 2:
+        msg = f"Classification target '{detected_target}' has fewer than 2 distinct classes after cleaning."
+        print(f"\n  [X] ERROR: {msg}")
+        all_results.append(("Target Validation", f"FAILED: {msg}", time.time() - phase1_start))
+        _emit_progress(p1, total_phases, "Data Loading", "error", detail=msg)
+        return None
+    
     analysis_outputs['task'] = detected_task
     all_results.append(("Target Detection", "SUCCESS", time.time() - phase1_start))
+    _emit_progress(p1, total_phases, "Data Loading", "done", detail=f"{df.shape[0]}x{df.shape[1]}, target={detected_target}")
     
     # Phase 2: Auto EDA
+    p2 = phase_offset + 2
+    _render_phase_banner(p2, total_phases, "Auto EDA")
+    _emit_progress(p2, total_phases, "Auto EDA", "running")
     print("\n" + "-" * 80)
     print("  PHASE 2: Auto EDA - Exploratory Data Analysis")
     print("-" * 80)
@@ -6720,11 +7055,16 @@ def _run_autonomous_custom_file(
         # EDA will be embedded in the combined report (no separate file)
         analysis_outputs['eda'] = eda
         all_results.append(("Auto EDA", "SUCCESS", time.time() - phase2_start))
+        _emit_progress(p2, total_phases, "Auto EDA", "done")
     except Exception as e:
         print(f"\n  [X] Auto EDA failed: {e}")
         all_results.append(("Auto EDA", f"FAILED: {e}", time.time() - phase2_start))
+        _emit_progress(p2, total_phases, "Auto EDA", "error", detail=str(e))
     
     # Phase 3: Risk Analysis
+    p3 = phase_offset + 3
+    _render_phase_banner(p3, total_phases, "Risk Analysis")
+    _emit_progress(p3, total_phases, "Risk Analysis", "running")
     print("\n" + "-" * 80)
     print("  PHASE 3: Risk Analysis")
     print("-" * 80)
@@ -6737,18 +7077,19 @@ def _run_autonomous_custom_file(
         X = df.drop(columns=[detected_target])
         if detected_datetime_col and detected_datetime_col in X.columns:
             X = X.drop(columns=[detected_datetime_col])
-        if exclude:
-            X = X.drop(columns=[c for c in exclude if c in X.columns], errors='ignore')
+        if effective_exclude:
+            X = X.drop(columns=[c for c in effective_exclude if c in X.columns], errors='ignore')
         
         # Handle empty features
         if X.empty or X.shape[1] == 0:
             print(f"\n  [--] No features for risk analysis after dropping target/datetime")
             all_results.append(("Risk Analysis", "SKIPPED: No features", time.time() - phase3_start))
+            _emit_progress(p3, total_phases, "Risk Analysis", "done", detail="skipped: no features")
         else:
-            # Encode categorical columns only
-            cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+            # Encode categorical columns safely
+            cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
             if cat_cols:
-                X_encoded = pd.get_dummies(X, columns=cat_cols, drop_first=True)
+                X_encoded = _encode_categoricals_safe(X, cat_cols)
             else:
                 X_encoded = X.copy()
             y = df[detected_target]
@@ -6766,16 +7107,22 @@ def _run_autonomous_custom_file(
             
             analysis_outputs['risk'] = risk
             all_results.append(("Risk Analysis", "SUCCESS", time.time() - phase3_start))
+            _emit_progress(p3, total_phases, "Risk Analysis", "done")
     except Exception as e:
         print(f"\n  [X] Risk analysis failed: {e}")
         all_results.append(("Risk Analysis", f"FAILED: {e}", time.time() - phase3_start))
+        _emit_progress(p3, total_phases, "Risk Analysis", "error", detail=str(e))
     
     # Phase 4: AutoML
+    p4 = phase_offset + 4
+    _render_phase_banner(p4, total_phases, "AutoML Training")
+    _emit_progress(p4, total_phases, "AutoML Training", "running")
     print("\n" + "-" * 80)
     print(f"  PHASE 4: AutoML - {detected_task.title()}")
     print("-" * 80)
     
     phase4_start = time.time()
+    automl_failed = False
     try:
         from acdso import ACDSOClassifier, ACDSORegressor
         
@@ -6783,8 +7130,8 @@ def _run_autonomous_custom_file(
         X = df.drop(columns=[detected_target])
         if detected_datetime_col and detected_datetime_col in X.columns:
             X = X.drop(columns=[detected_datetime_col])
-        if exclude:
-            X = X.drop(columns=[c for c in exclude if c in X.columns], errors='ignore')
+        if effective_exclude:
+            X = X.drop(columns=[c for c in effective_exclude if c in X.columns], errors='ignore')
         
         # Handle empty features (common for time-series-only datasets)
         if X.empty or X.shape[1] == 0:
@@ -6792,18 +7139,21 @@ def _run_autonomous_custom_file(
             print(f"      This is typical for time-series datasets with only date + value.")
             print(f"      Skipping standard AutoML - Time Series analysis will be used instead.")
             all_results.append(("AutoML", "SKIPPED: Time-series-only dataset", time.time() - phase4_start))
+            _emit_progress(p4, total_phases, "AutoML Training", "done", detail="skipped: no tabular features")
         else:
-            # Encode categorical columns only
-            cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+            # Encode categorical columns safely and capture encoding metadata for --predict
+            cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
             if cat_cols:
-                X_encoded = pd.get_dummies(X, columns=cat_cols, drop_first=True)
+                X_encoded, enc_meta = _encode_categoricals_safe(X, cat_cols, return_meta=True)
             else:
                 X_encoded = X.copy()
+                enc_meta = {"low_card_cols": [], "high_card_freqs": {}}
             
             y = df[detected_target]
+            ts_split = 0.2 if len(X_encoded) >= 5 else 1
             
             X_train, X_test, y_train, y_test = train_test_split(
-                X_encoded, y, test_size=0.2, random_state=42
+                X_encoded, y, test_size=ts_split, random_state=42
             )
             
             if detected_task == 'classification':
@@ -6851,28 +7201,33 @@ def _run_autonomous_custom_file(
                 analysis_outputs['r2'] = r2
                 analysis_outputs['rmse'] = rmse
             
+            # Ensure reports directory exists before writing audit/model artifacts
+            os.makedirs("reports", exist_ok=True)
+            base_file_name = os.path.splitext(os.path.basename(custom_file))[0]
+            
             # Save audit trail
-            audit_path = f"reports/audit_{os.path.basename(custom_file).replace('.csv', '')}.json"
-            with open(audit_path, 'w') as f:
+            audit_path = f"reports/audit_{base_file_name}.json"
+            with open(audit_path, 'w', encoding='utf-8') as f:
                 json.dump(model._engine.audit_trail_, f, indent=2, default=str)
             print(f"\n  [OK] Audit trail saved: {audit_path}")
             analysis_outputs['audit_path'] = audit_path
             
             # Save the best model for later prediction use
             # Include target name in the model filename to support multi-target
-            base_file_name = os.path.basename(custom_file).replace('.csv', '')
             target_suffix = f"_{detected_target}" if detected_target else ""
+            model_payload = {
+                'model': model,
+                'target': detected_target,
+                'task': detected_task,
+                'feature_columns': list(X_encoded.columns),
+                'datetime_col': detected_datetime_col,
+                'exclude': effective_exclude,
+                'categorical_encoding': enc_meta,
+            }
             try:
                 import joblib
                 model_path = f"reports/model_{base_file_name}{target_suffix}.pkl"
-                joblib.dump({
-                    'model': model,
-                    'target': detected_target,
-                    'task': detected_task,
-                    'feature_columns': list(X_encoded.columns),
-                    'datetime_col': detected_datetime_col,
-                    'exclude': exclude,
-                }, model_path)
+                joblib.dump(model_payload, model_path)
                 print(f"  [OK] Best model saved: {model_path}")
                 analysis_outputs['model_path'] = model_path
             except ImportError:
@@ -6880,32 +7235,35 @@ def _run_autonomous_custom_file(
                 import pickle
                 model_path = f"reports/model_{base_file_name}{target_suffix}.pkl"
                 with open(model_path, 'wb') as f:
-                    pickle.dump({
-                        'model': model,
-                        'target': detected_target,
-                        'task': detected_task,
-                        'feature_columns': list(X_encoded.columns),
-                        'datetime_col': detected_datetime_col,
-                        'exclude': exclude,
-                    }, f)
+                    pickle.dump(model_payload, f)
                 print(f"  [OK] Best model saved: {model_path}")
                 analysis_outputs['model_path'] = model_path
             
             analysis_outputs['model'] = model
             all_results.append(("AutoML", "SUCCESS", time.time() - phase4_start))
+            _emit_progress(p4, total_phases, "AutoML Training", "done", detail=model._engine.best_result_.name)
     except Exception as e:
+        automl_failed = True
         print(f"\n  [X] AutoML failed: {e}")
         import traceback
         traceback.print_exc()
         all_results.append(("AutoML", f"FAILED: {e}", time.time() - phase4_start))
+        _emit_progress(p4, total_phases, "AutoML Training", "error", detail=str(e))
+    
+    if automl_failed:
+        return None
     
     # Phase 5: Time Series (if datetime column detected and not skipped)
+    p5 = phase_offset + 5
+    _render_phase_banner(p5, total_phases, "Time Series")
     if skip_timeseries:
+        _emit_progress(p5, total_phases, "Time Series", "done", detail="skipped: quick mode")
         print("\n" + "-" * 80)
         print("  PHASE 5: Time Series - SKIPPED (quick mode)")
         print("-" * 80)
         all_results.append(("Time Series", "SKIPPED: Quick mode", 0))
     elif detected_datetime_col:
+        _emit_progress(p5, total_phases, "Time Series", "running", detail=detected_datetime_col)
         print("\n" + "-" * 80)
         print("  PHASE 5: Auto Time Series Forecasting")
         print("-" * 80)
@@ -6914,7 +7272,6 @@ def _run_autonomous_custom_file(
         try:
             # Capture time series results
             from acdso.timeseries import AutoTS, TimeSeriesBenchmark
-            import os
             
             ts = AutoTS(
                 datetime_col=detected_datetime_col,
@@ -6948,7 +7305,7 @@ def _run_autonomous_custom_file(
                 # Get benchmark HTML content (embedded in combined report, no separate file)
                 import tempfile
                 try:
-                    with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as tmp:
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as tmp:
                         benchmark.generate_report(tmp.name)
                         with open(tmp.name, 'r', encoding='utf-8') as f:
                             analysis_outputs['timeseries_html'] = f.read()
@@ -6965,18 +7322,24 @@ def _run_autonomous_custom_file(
                 target=detected_target,
                 datetime_col=detected_datetime_col,
                 horizon=horizon,
+                emit_progress=False,
             )
             all_results.append(("Time Series", "SUCCESS", time.time() - phase5_start))
+            _emit_progress(p5, total_phases, "Time Series", "done")
         except Exception as e:
             print(f"\n  [X] Time Series failed: {e}")
             all_results.append(("Time Series", f"FAILED: {e}", time.time() - phase5_start))
+            _emit_progress(p5, total_phases, "Time Series", "error", detail=str(e))
     else:
+        _emit_progress(p5, total_phases, "Time Series", "done", detail="skipped: no datetime column")
         print("\n" + "-" * 80)
         print("  PHASE 5: Time Series - SKIPPED (no datetime column)")
         print("-" * 80)
         all_results.append(("Time Series", "SKIPPED: No datetime column", 0))
     
     # Phase 6: Additional EDA Features (if applicable)
+    p6 = phase_offset + 6
+    _render_phase_banner(p6, total_phases, "Advanced EDA")
     print("\n" + "-" * 80)
     print("  PHASE 6: Advanced EDA Features")
     print("-" * 80)
@@ -6989,8 +7352,12 @@ def _run_autonomous_custom_file(
     phase6_results.append(("Advanced EDA Features", "SKIPPED: Advanced EDA features are included in basic EDA", time.time() - phase6_start))
     
     all_results.extend(phase6_results)
+    _emit_progress(p6, total_phases, "Advanced EDA", "done", detail="included in Auto EDA")
     
     # Phase 7: Decision Intelligence (if applicable - needs treatment column)
+    p7 = phase_offset + 7
+    _render_phase_banner(p7, total_phases, "Decision Intelligence")
+    _emit_progress(p7, total_phases, "Decision Intelligence", "running")
     print("\n" + "-" * 80)
     print("  PHASE 7: Decision Intelligence (Causal Analysis)")
     print("-" * 80)
@@ -7015,41 +7382,61 @@ def _run_autonomous_custom_file(
                 if di_result:
                     all_results.append(("Decision Intelligence", "SUCCESS", time.time() - phase7_start))
                     analysis_outputs['decision_intelligence'] = di_result
+                    _emit_progress(p7, total_phases, "Decision Intelligence", "done")
+                else:
+                    all_results.append(("Decision Intelligence", "SKIPPED: No result", time.time() - phase7_start))
+                    _emit_progress(p7, total_phases, "Decision Intelligence", "done", detail="skipped: no result")
             except Exception as e:
                 print(f"  [--] Decision Intelligence skipped: {e}")
                 all_results.append(("Decision Intelligence", f"SKIPPED: {e}", time.time() - phase7_start))
+                _emit_progress(p7, total_phases, "Decision Intelligence", "done", detail=f"skipped: {e}")
         else:
             print("  [--] No treatment column detected. Skipping Decision Intelligence.")
             print("      (Decision Intelligence requires a treatment/intervention column)")
             all_results.append(("Decision Intelligence", "SKIPPED: No treatment column", time.time() - phase7_start))
+            _emit_progress(p7, total_phases, "Decision Intelligence", "done", detail="skipped: no treatment column")
     except Exception as e:
         print(f"  [--] Decision Intelligence not available: {e}")
         all_results.append(("Decision Intelligence", f"SKIPPED: {e}", time.time() - phase7_start))
+        _emit_progress(p7, total_phases, "Decision Intelligence", "done", detail=f"skipped: {e}")
     
-    # Phase 8: Benchmark (ALWAYS run in autonomous mode)
+    # Phase 8: Benchmark (gated on run_benchmark)
+    p8 = phase_offset + 8
+    _render_phase_banner(p8, total_phases, "Benchmark Comparison")
     print("\n" + "-" * 80)
     print("  PHASE 8: AutoML Benchmark Comparison")
     print("-" * 80)
     
-    phase8_start = time.time()
-    try:
-        # Run benchmark on custom file
-        benchmark_summary = run_benchmark_only(
-            time_budget=60,
-            datasets=None,  # Use custom dataset only
-            custom_file=custom_file,
-            target=detected_target,
-            task=detected_task,
-            exclude=exclude,
-        )
-        if benchmark_summary:
-            all_results.append(("Benchmark (Custom File)", "SUCCESS", time.time() - phase8_start))
-            analysis_outputs['benchmark'] = benchmark_summary
-        else:
-            all_results.append(("Benchmark (Custom File)", "FAILED: No results", time.time() - phase8_start))
-    except Exception as e:
-        print(f"\n  [X] Benchmark failed: {e}")
-        all_results.append(("Benchmark (Custom File)", f"FAILED: {e}", time.time() - phase8_start))
+    if not run_benchmark:
+        print("  [--] Benchmark phase skipped (--skip-benchmark / --simple / default custom-file mode).")
+        all_results.append(("Benchmark (Custom File)", "SKIPPED: Benchmark disabled", 0))
+        _emit_progress(p8, total_phases, "Benchmark Comparison", "done", detail="skipped")
+    else:
+        _emit_progress(p8, total_phases, "Benchmark Comparison", "running")
+        phase8_start = time.time()
+        try:
+            # Run benchmark on custom file
+            benchmark_summary = run_benchmark_only(
+                time_budget=60,
+                datasets=None,  # Use custom dataset only
+                custom_file=custom_file,
+                target=detected_target,
+                task=detected_task,
+                exclude=effective_exclude,
+                auto_exclude=auto_exclude,
+                emit_progress=False,
+            )
+            if benchmark_summary:
+                all_results.append(("Benchmark (Custom File)", "SUCCESS", time.time() - phase8_start))
+                analysis_outputs['benchmark'] = benchmark_summary
+                _emit_progress(p8, total_phases, "Benchmark Comparison", "done")
+            else:
+                all_results.append(("Benchmark (Custom File)", "FAILED: No results", time.time() - phase8_start))
+                _emit_progress(p8, total_phases, "Benchmark Comparison", "error", detail="no results")
+        except Exception as e:
+            print(f"\n  [X] Benchmark failed: {e}")
+            all_results.append(("Benchmark (Custom File)", f"FAILED: {e}", time.time() - phase8_start))
+            _emit_progress(p8, total_phases, "Benchmark Comparison", "error", detail=str(e))
     
     # Final Summary
     total_time = time.time() - start_time
@@ -7089,6 +7476,9 @@ def _run_autonomous_custom_file(
         print(f"    {status_icon} {name}: {status} ({duration:.1f}s)")
     
     # Generate comprehensive combined report
+    p9 = phase_offset + 9
+    _render_phase_banner(p9, total_phases, "Report Generation")
+    _emit_progress(p9, total_phases, "Report Generation", "running")
     print("\n  " + "-" * 40)
     print("  GENERATING COMPREHENSIVE COMBINED REPORT...")
     print("  " + "-" * 40)
@@ -7210,7 +7600,7 @@ def _run_autonomous_custom_file(
                 file_path=custom_file,
                 score=acdso_score,
                 fit_time=acdso_fit_time,
-                exclude_cols=exclude,
+                exclude_cols=effective_exclude,
             )
     
     # Add test performance if available
@@ -7339,7 +7729,7 @@ def _run_autonomous_custom_file(
                 file_path=custom_file,
                 score=test_score,
                 fit_time=fit_time,
-                exclude_cols=exclude,
+                exclude_cols=effective_exclude,
             )
             
             combined_report["benchmark_results"].append({
@@ -7366,7 +7756,7 @@ def _run_autonomous_custom_file(
     
     # Save JSON report - include target name in filename if specified
     os.makedirs("reports", exist_ok=True)
-    base_file_name = os.path.basename(custom_file).replace('.csv', '')
+    base_file_name = os.path.splitext(os.path.basename(custom_file))[0]
     target_suffix = f"_{detected_target}" if detected_target else ""
     json_report_path = f"reports/autonomous_{base_file_name}{target_suffix}_combined.json"
     
@@ -7391,6 +7781,7 @@ def _run_autonomous_custom_file(
     print(f"  📋 JSON DATA:   {json_abs_path}")
     print("\n  Open the HTML report in your browser to view all analysis results.")
     print("=" * 80 + "\n")
+    _emit_progress(p9, total_phases, "Report Generation", "done", detail=html_abs_path)
     
     return all_results
 
@@ -7404,6 +7795,10 @@ def run_autonomous_demo(
     exclude: List[str] = None,
     run_benchmark: bool = True,  # Default to True for autonomous mode
     selection_mode: str = "knee_point",  # "knee_point" or "best_score"
+    skip_timeseries: bool = False,
+    auto_exclude: bool = True,
+    phase_offset: int = 0,
+    total_phases: Optional[int] = None,
 ):
     """
     Run EVERYTHING autonomously - the complete ACDSO v3 showcase.
@@ -7447,8 +7842,7 @@ def run_autonomous_demo(
     - Comprehensive testing
     - Showcasing all ACDSO capabilities
     """
-    import os
-    
+    _ensure_ml_deps()
     start_time = time.time()
     
     # Capture all console output for combined report
@@ -7507,16 +7901,23 @@ def run_autonomous_demo(
             task=task,
             exclude=exclude,
             run_benchmark=run_benchmark,
+            skip_timeseries=skip_timeseries,
             has_llm=has_llm,
             start_time=start_time,
             selection_mode=selection_mode,
+            auto_exclude=auto_exclude,
+            phase_offset=phase_offset,
+            total_phases=total_phases or 9,
         )
     
     # =========================================================================
     # STANDARD MODE: Run all demos on built-in datasets
     # =========================================================================
+    demo_total = total_phases or 10
     
     # Phase 1: Core AutoML
+    _render_phase_banner(phase_offset + 1, demo_total, "Core AutoML Demonstrations")
+    _emit_progress(phase_offset + 1, demo_total, "Core AutoML Demonstrations", "running")
     print("\n" + "-" * 80)
     print("  PHASE 1: Core AutoML Demonstrations")
     print("-" * 80)
@@ -7532,8 +7933,11 @@ def run_autonomous_demo(
     ]
     
     phase1_results = _run_demo_phase(phase1_demos, "Phase 1", all_estimators)
+    _emit_progress(phase_offset + 1, demo_total, "Core AutoML Demonstrations", "done")
     
     # Phase 2: LLM Advisor & Real Datasets
+    _render_phase_banner(phase_offset + 2, demo_total, "LLM Advisor & Intelligent Analysis")
+    _emit_progress(phase_offset + 2, demo_total, "LLM Advisor & Intelligent Analysis", "running")
     print("\n" + "-" * 80)
     print("  PHASE 2: LLM Advisor & Intelligent Analysis")
     print("-" * 80)
@@ -7546,8 +7950,11 @@ def run_autonomous_demo(
     if has_llm:
         phase2_demos.append(("LLM-Powered EDA", demo_auto_eda_with_llm))
     phase2_results = _run_demo_phase(phase2_demos, "Phase 2", all_estimators)
+    _emit_progress(phase_offset + 2, demo_total, "LLM Advisor & Intelligent Analysis", "done")
     
     # Phase 3: Auto EDA
+    _render_phase_banner(phase_offset + 3, demo_total, "Auto EDA Suite")
+    _emit_progress(phase_offset + 3, demo_total, "Auto EDA Suite", "running")
     print("\n" + "-" * 80)
     print("  PHASE 3: Auto EDA Suite")
     print("-" * 80)
@@ -7565,8 +7972,11 @@ def run_autonomous_demo(
     ]
     
     phase3_results = _run_demo_phase(phase3_demos, "Phase 3", all_estimators)
+    _emit_progress(phase_offset + 3, demo_total, "Auto EDA Suite", "done")
     
     # Phase 4: v3 Innovations
+    _render_phase_banner(phase_offset + 4, demo_total, "v3 Innovations")
+    _emit_progress(phase_offset + 4, demo_total, "v3 Innovations", "running")
     print("\n" + "-" * 80)
     print("  PHASE 4: v3 Innovations (Stress Testing, Successive Halving, Risk Calibration)")
     print("-" * 80)
@@ -7576,8 +7986,11 @@ def run_autonomous_demo(
     ]
     
     phase4_results = _run_demo_phase(phase4_demos, "Phase 4", all_estimators)
+    _emit_progress(phase_offset + 4, demo_total, "v3 Innovations", "done")
     
     # Phase 5: Time Series
+    _render_phase_banner(phase_offset + 5, demo_total, "Auto Time Series")
+    _emit_progress(phase_offset + 5, demo_total, "Auto Time Series", "running")
     print("\n" + "-" * 80)
     print("  PHASE 5: Auto Time Series")
     print("-" * 80)
@@ -7594,18 +8007,13 @@ def run_autonomous_demo(
             
             if custom_file and (not ts_datetime_col or not ts_target):
                 try:
-                    df_temp = pd.read_csv(custom_file)
+                    df_temp = load_user_file(custom_file)
                     
                     # Auto-detect datetime column
                     if not ts_datetime_col:
-                        for col in df_temp.columns:
-                            try:
-                                pd.to_datetime(df_temp[col])
-                                ts_datetime_col = col
-                                print(f"    Auto-detected datetime column: {ts_datetime_col}")
-                                break
-                            except Exception:
-                                pass
+                        ts_datetime_col = _detect_datetime_column(df_temp)
+                        if ts_datetime_col:
+                            print(f"    Auto-detected datetime column: {ts_datetime_col}")
                     
                     # Auto-detect target (LLM or fallback)
                     if not ts_target:
@@ -7633,6 +8041,7 @@ def run_autonomous_demo(
                     target=ts_target,
                     datetime_col=ts_datetime_col,
                     horizon=horizon,
+                    emit_progress=False,
                 )
                 phase5_results.append(("Auto Time Series (Custom File)", "SUCCESS", time.time() - demo_start))
             else:
@@ -7651,8 +8060,11 @@ def run_autonomous_demo(
             ("Auto Time Series", demo_auto_timeseries),
         ]
         phase5_results = _run_demo_phase(phase5_demos, "Phase 5", all_estimators)
+    _emit_progress(phase_offset + 5, demo_total, "Auto Time Series", "done")
     
     # Phase 6: Decision Intelligence
+    _render_phase_banner(phase_offset + 6, demo_total, "Decision Intelligence")
+    _emit_progress(phase_offset + 6, demo_total, "Decision Intelligence", "running")
     print("\n" + "-" * 80)
     print("  PHASE 6: Decision Intelligence (Causal, Uplift, Optimization)")
     print("-" * 80)
@@ -7663,8 +8075,11 @@ def run_autonomous_demo(
     ]
     
     phase6_results = _run_demo_phase(phase6_demos, "Phase 6", all_estimators)
+    _emit_progress(phase_offset + 6, demo_total, "Decision Intelligence", "done")
     
     # Phase 7: Integrations & Workflows
+    _render_phase_banner(phase_offset + 7, demo_total, "Integrations & Complete Workflows")
+    _emit_progress(phase_offset + 7, demo_total, "Integrations & Complete Workflows", "running")
     print("\n" + "-" * 80)
     print("  PHASE 7: Integrations & Complete Workflows")
     print("-" * 80)
@@ -7676,44 +8091,57 @@ def run_autonomous_demo(
     ]
     
     phase7_results = _run_demo_phase(phase7_demos, "Phase 7", all_estimators)
+    _emit_progress(phase_offset + 7, demo_total, "Integrations & Complete Workflows", "done")
     
-    # Phase 8: Benchmarks (ALWAYS RUN in autonomous mode)
+    # Phase 8: Benchmarks
+    _render_phase_banner(phase_offset + 8, demo_total, "Benchmark Comparisons")
     print("\n" + "-" * 80)
     print("  PHASE 8: Benchmark Comparisons (AutoML & Time Series)")
     print("-" * 80)
-    
-    phase8_demos = [
-        ("AutoML Benchmark Comparison", demo_benchmark_comparison),
-    ]
-    
-    phase8_results = _run_demo_phase(phase8_demos, "Phase 8", all_estimators)
+    if run_benchmark:
+        _emit_progress(phase_offset + 8, demo_total, "Benchmark Comparisons", "running")
+        phase8_demos = [
+            ("AutoML Benchmark Comparison", demo_benchmark_comparison),
+        ]
+        phase8_results = _run_demo_phase(phase8_demos, "Phase 8", all_estimators)
+        _emit_progress(phase_offset + 8, demo_total, "Benchmark Comparisons", "done")
+    else:
+        phase8_results = [("AutoML Benchmark Comparison", "SKIPPED: Benchmark disabled", 0)]
+        _emit_progress(phase_offset + 8, demo_total, "Benchmark Comparisons", "done", detail="skipped")
     
     # Phase 9: Additional Comprehensive Benchmarks (if full benchmark suite available)
+    _render_phase_banner(phase_offset + 9, demo_total, "Comprehensive Benchmark Suite")
     print("\n" + "-" * 80)
     print("  PHASE 9: Comprehensive Benchmark Suite")
     print("-" * 80)
     
     phase9_start = time.time()
     phase9_results = []
-    try:
-        from benchmarks.benchmark_automl import run_benchmark
-        log_console("  Running comprehensive AutoML benchmark on multiple datasets...")
-        benchmark_summary = run_benchmark(
-            dataset_names=["iris", "wine"],  # Quick benchmark on 2 datasets
-            time_budget_s=60,  # 60 seconds per system
-            verbose=True,
-        )
-        if benchmark_summary:
-            phase9_results.append(("Comprehensive AutoML Benchmark", "SUCCESS", time.time() - phase9_start))
-            all_benchmark_results.append(benchmark_summary)
-        else:
-            phase9_results.append(("Comprehensive AutoML Benchmark", "FAILED: No results", time.time() - phase9_start))
-    except ImportError:
-        phase9_results.append(("Comprehensive AutoML Benchmark", "SKIPPED: Full benchmark suite not available", time.time() - phase9_start))
-        log_console("  Note: Full benchmark suite not available. Install for comprehensive benchmarking.")
-    except Exception as e:
-        phase9_results.append(("Comprehensive AutoML Benchmark", f"FAILED: {e}", time.time() - phase9_start))
-        log_console(f"  Benchmark error: {e}")
+    if not run_benchmark:
+        phase9_results.append(("Comprehensive AutoML Benchmark", "SKIPPED: Benchmark disabled", 0))
+        _emit_progress(phase_offset + 9, demo_total, "Comprehensive Benchmark Suite", "done", detail="skipped")
+    else:
+        _emit_progress(phase_offset + 9, demo_total, "Comprehensive Benchmark Suite", "running")
+        try:
+            from benchmarks.benchmark_automl import run_benchmark as _run_full_benchmark
+            log_console("  Running comprehensive AutoML benchmark on multiple datasets...")
+            benchmark_summary = _run_full_benchmark(
+                dataset_names=["iris", "wine"],  # Quick benchmark on 2 datasets
+                time_budget_s=60,  # 60 seconds per system
+                verbose=True,
+            )
+            if benchmark_summary:
+                phase9_results.append(("Comprehensive AutoML Benchmark", "SUCCESS", time.time() - phase9_start))
+                all_benchmark_results.append(benchmark_summary)
+            else:
+                phase9_results.append(("Comprehensive AutoML Benchmark", "FAILED: No results", time.time() - phase9_start))
+        except ImportError:
+            phase9_results.append(("Comprehensive AutoML Benchmark", "SKIPPED: Full benchmark suite not available", time.time() - phase9_start))
+            log_console("  Note: Full benchmark suite not available. Install for comprehensive benchmarking.")
+        except Exception as e:
+            phase9_results.append(("Comprehensive AutoML Benchmark", f"FAILED: {e}", time.time() - phase9_start))
+            log_console(f"  Benchmark error: {e}")
+        _emit_progress(phase_offset + 9, demo_total, "Comprehensive Benchmark Suite", "done")
     
     # Combine all results (handle both 3-tuple and 4-tuple formats for backward compatibility)
     all_results = (
@@ -7774,6 +8202,8 @@ def run_autonomous_demo(
     log_console(f"    Phase 9 (Comprehensive Benchmarks): {count_success(phase9_results)}/{len(phase9_results)}")
     
     # Generate comprehensive report
+    _render_phase_banner(phase_offset + 10, demo_total, "Report Generation")
+    _emit_progress(phase_offset + 10, demo_total, "Report Generation", "running")
     log_console("\n  " + "-" * 40)
     log_console("  GENERATING COMPREHENSIVE REPORT...")
     log_console("  " + "-" * 40)
@@ -7988,6 +8418,7 @@ def run_autonomous_demo(
     html_report_path = generate_html_report_from_combined(combined_report)
     combined_report["html_report_path"] = html_report_path
     log_console(f"  [OK] HTML report saved: {html_report_path}")
+    _emit_progress(phase_offset + 10, demo_total, "Report Generation", "done", detail=str(html_report_path))
     
     # Print summary
     print_combined_report_summary(combined_report)
@@ -8124,11 +8555,11 @@ def _generate_autonomous_report(report_data: dict) -> str:
             is_success = "SUCCESS" in status
             demo_color = "#28a745" if is_success else "#dc3545"
             demo_icon = "&#10004;" if is_success else "&#10008;"
-            demo_details += f'<div style="margin-left: 20px; color: {demo_color};">{demo_icon} {name}</div>'
+            demo_details += f'<div style="margin-left: 20px; color: {demo_color};">{demo_icon} {_esc(name)}</div>'
         
         phase_rows += f"""
         <tr>
-            <td style="font-weight: bold;">{phase_name}</td>
+            <td style="font-weight: bold;">{_esc(phase_name)}</td>
             <td style="text-align: center;">{phase_success}/{phase_total}</td>
             <td style="text-align: center; color: {status_color}; font-weight: bold;">{phase_rate:.0f}%</td>
             <td style="text-align: center; color: {status_color}; font-size: 1.2em;">{status_icon}</td>
@@ -8170,7 +8601,7 @@ def _generate_autonomous_report(report_data: dict) -> str:
         for phase_name, results in report_data['phases'].items():
             for name, status, _ in results:
                 if "FAILED" in status:
-                    failed_demos_html += f"<li><strong>{name}</strong>: {status}</li>"
+                    failed_demos_html += f"<li><strong>{_esc(name)}</strong>: {_esc(status)}</li>"
         failed_demos_html += "</ul>"
     
     html_content = f"""<!DOCTYPE html>
@@ -8300,7 +8731,7 @@ def _generate_autonomous_report(report_data: dict) -> str:
             </div>
         </div>
         
-        {'<div class="section" style="background: linear-gradient(135deg, #1e4d2b 0%, #0f3460 100%);"><h2>Custom File Analysis</h2><table><tr><td><strong>File:</strong></td><td>' + str(report_data.get("custom_file", "N/A")) + '</td></tr><tr><td><strong>Target:</strong></td><td>' + str(report_data.get("target", "auto-detected")) + '</td></tr><tr><td><strong>Datetime Column:</strong></td><td>' + str(report_data.get("datetime_col", "N/A")) + '</td></tr><tr><td><strong>Horizon:</strong></td><td>' + str(report_data.get("horizon", "N/A")) + '</td></tr><tr><td><strong>Task Type:</strong></td><td>' + str(report_data.get("task", "auto-detected")) + '</td></tr></table></div>' if report_data.get('custom_file') else ''}
+        {'<div class="section" style="background: linear-gradient(135deg, #1e4d2b 0%, #0f3460 100%);"><h2>Custom File Analysis</h2><table><tr><td><strong>File:</strong></td><td>' + _esc(report_data.get("custom_file", "N/A")) + '</td></tr><tr><td><strong>Target:</strong></td><td>' + _esc(report_data.get("target", "auto-detected")) + '</td></tr><tr><td><strong>Datetime Column:</strong></td><td>' + _esc(report_data.get("datetime_col", "N/A")) + '</td></tr><tr><td><strong>Horizon:</strong></td><td>' + _esc(report_data.get("horizon", "N/A")) + '</td></tr><tr><td><strong>Task Type:</strong></td><td>' + _esc(report_data.get("task", "auto-detected")) + '</td></tr></table></div>' if report_data.get('custom_file') else ''}
         
         <div class="summary-cards">
             <div class="card">
@@ -8395,7 +8826,7 @@ def _generate_autonomous_report(report_data: dict) -> str:
         </div>
         
         <div class="footer">
-            <p>Generated by ACDSO v3.0 | {report_data['timestamp']}</p>
+            <p>Generated by ACDSO v3.0 | {_esc(report_data.get('timestamp', ''))}</p>
             <p>Risk-Optimized AutoML for Production Systems</p>
         </div>
     </div>
@@ -8432,9 +8863,125 @@ def _generate_autonomous_report(report_data: dict) -> str:
     return str(report_path)
 
 
+def _read_csv_with_fallback(filepath: str) -> "pd.DataFrame":
+    """Read CSV with encoding fallbacks and clear EmptyDataError reporting."""
+    _ensure_ml_deps()
+    last_decode_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(filepath, encoding=enc)
+        except UnicodeDecodeError as e:
+            last_decode_err = e
+        except pd.errors.EmptyDataError as e:
+            raise ValueError(f"Dataset file is empty (no columns/rows): {filepath}") from e
+    raise ValueError(f"Unable to decode CSV file '{filepath}': {last_decode_err}")
+
+
+def _read_xlsx_stdlib(filepath: str) -> "pd.DataFrame":
+    """Pure-stdlib .xlsx reader fallback when openpyxl is not installed."""
+    _ensure_ml_deps()
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    def _col_to_idx(ref: str) -> int:
+        letters = "".join(ch for ch in ref if ch.isalpha()).upper()
+        idx = 0
+        for ch in letters:
+            idx = idx * 26 + (ord(ch) - ord("A") + 1)
+        return max(idx - 1, 0)
+
+    def _strip_ns(tag: str) -> str:
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    def _coerce_num(val_text: str) -> Any:
+        try:
+            if "." not in val_text and "e" not in val_text.lower():
+                return int(val_text)
+            return float(val_text)
+        except ValueError:
+            return val_text
+
+    with zipfile.ZipFile(filepath, "r") as zf:
+        names = set(zf.namelist())
+        shared_strings: List[str] = []
+        if "xl/sharedStrings.xml" in names:
+            ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in ss_root:
+                if _strip_ns(si.tag) == "si":
+                    parts = [elem.text or "" for elem in si.iter() if _strip_ns(elem.tag) == "t"]
+                    shared_strings.append("".join(parts))
+
+        sheet_name = "xl/worksheets/sheet1.xml"
+        if sheet_name not in names:
+            candidates = sorted(
+                n for n in names if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+            )
+            if not candidates:
+                raise ValueError(f"No worksheet found in .xlsx file: {filepath}")
+            sheet_name = candidates[0]
+
+        ws_root = ET.fromstring(zf.read(sheet_name))
+        rows_dict: List[Dict[int, Any]] = []
+        max_col = 0
+        for elem in ws_root.iter():
+            if _strip_ns(elem.tag) == "row":
+                row_map: Dict[int, Any] = {}
+                next_idx = 0
+                for cell in elem:
+                    if _strip_ns(cell.tag) != "c":
+                        continue
+                    ref = cell.attrib.get("r", "")
+                    col_idx = _col_to_idx(ref) if ref else next_idx
+                    next_idx = col_idx + 1
+                    cell_type = cell.attrib.get("t", "")
+                    val_node = None
+                    is_node = None
+                    for child in cell:
+                        cname = _strip_ns(child.tag)
+                        if cname == "v":
+                            val_node = child
+                        elif cname == "is":
+                            is_node = child
+                    val: Any = None
+                    if cell_type == "s" and val_node is not None and val_node.text is not None:
+                        s_idx = int(val_node.text)
+                        val = shared_strings[s_idx] if 0 <= s_idx < len(shared_strings) else ""
+                    elif cell_type == "inlineStr" and is_node is not None:
+                        val = "".join(t.text or "" for t in is_node.iter() if _strip_ns(t.tag) == "t")
+                    elif cell_type == "b" and val_node is not None and val_node.text is not None:
+                        val = val_node.text.strip() in ("1", "true", "TRUE")
+                    elif cell_type in ("str", "e") and val_node is not None:
+                        val = val_node.text or ""
+                    elif val_node is not None and val_node.text is not None:
+                        val = _coerce_num(val_node.text.strip())
+                    row_map[col_idx] = val
+                    if col_idx + 1 > max_col:
+                        max_col = col_idx + 1
+                if row_map:
+                    rows_dict.append(row_map)
+
+    if not rows_dict or max_col == 0:
+        return pd.DataFrame()
+
+    raw_headers = [rows_dict[0].get(i) for i in range(max_col)]
+    headers: List[str] = []
+    seen: Dict[str, int] = {}
+    for i, h in enumerate(raw_headers):
+        col_name = str(h).strip() if h is not None and str(h).strip() else f"Unnamed: {i}"
+        if col_name in seen:
+            seen[col_name] += 1
+            col_name = f"{col_name}.{seen[col_name]}"
+        else:
+            seen[col_name] = 0
+        headers.append(col_name)
+
+    data_rows = [[r.get(i, None) for i in range(max_col)] for r in rows_dict[1:]]
+    return pd.DataFrame(data_rows, columns=headers)
+
+
 def load_user_file(filepath: str) -> pd.DataFrame:
     """
-    Load a data file (CSV, Excel, Parquet, JSON).
+    Load a data file (CSV, Excel, Parquet, JSON, Feather, Pickle).
     
     Parameters
     ----------
@@ -8446,24 +8993,72 @@ def load_user_file(filepath: str) -> pd.DataFrame:
     pd.DataFrame
         Loaded data.
     """
-    import os
+    _ensure_ml_deps()
+    if not filepath or not os.path.isfile(filepath):
+        raise FileNotFoundError(f"Data file not found: {filepath}")
+
     ext = os.path.splitext(filepath)[1].lower()
     
     if ext == '.csv':
-        return pd.read_csv(filepath)
-    elif ext in ['.xlsx', '.xls']:
-        return pd.read_excel(filepath)
+        return _read_csv_with_fallback(filepath)
+    elif ext == '.xlsx':
+        try:
+            return pd.read_excel(filepath)
+        except ImportError:
+            return _read_xlsx_stdlib(filepath)
+    elif ext == '.xls':
+        try:
+            return pd.read_excel(filepath)
+        except ImportError as e:
+            raise ImportError(
+                f"Cannot read '.xls' file '{filepath}': missing optional dependency ({e}). "
+                "Install 'xlrd' or convert the file to .xlsx or .csv."
+            ) from e
     elif ext == '.parquet':
-        return pd.read_parquet(filepath)
+        try:
+            return pd.read_parquet(filepath)
+        except ImportError as e:
+            raise ImportError(
+                f"Cannot read '.parquet' file '{filepath}': missing optional dependency ({e}). "
+                "Install 'pyarrow' or 'fastparquet'."
+            ) from e
     elif ext == '.json':
-        return pd.read_json(filepath)
+        try:
+            obj = pd.read_json(filepath)
+        except ValueError as e:
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    raw = json.load(f)
+                if isinstance(raw, (list, dict)):
+                    obj = pd.DataFrame(raw)
+                else:
+                    raise ValueError(f"JSON file '{filepath}' is not tabular.") from e
+            except Exception as inner_e:
+                raise ValueError(f"JSON file '{filepath}' could not be parsed as a table: {inner_e}") from inner_e
+        if not isinstance(obj, pd.DataFrame):
+            raise ValueError(f"JSON file '{filepath}' did not produce a tabular DataFrame.")
+        return obj
     elif ext == '.feather':
-        return pd.read_feather(filepath)
-    elif ext == '.pkl' or ext == '.pickle':
-        return pd.read_pickle(filepath)
+        try:
+            return pd.read_feather(filepath)
+        except ImportError as e:
+            raise ImportError(
+                f"Cannot read '.feather' file '{filepath}': missing optional dependency ({e}). "
+                "Install 'pyarrow'."
+            ) from e
+    elif ext in ('.pkl', '.pickle'):
+        obj = pd.read_pickle(filepath)
+        if isinstance(obj, pd.DataFrame):
+            return obj
+        if isinstance(obj, (list, dict)):
+            try:
+                return pd.DataFrame(obj)
+            except Exception as e:
+                raise ValueError(f"Pickle file '{filepath}' is not tabular: {e}") from e
+        raise ValueError(f"Pickle file '{filepath}' does not contain a pandas DataFrame (got {type(obj).__name__}).")
     else:
         # Try CSV as default
-        return pd.read_csv(filepath)
+        return _read_csv_with_fallback(filepath)
 
 
 def demo_user_file(filepath: str, target: str = None, task: str = "auto", 
@@ -8484,17 +9079,22 @@ def demo_user_file(filepath: str, target: str = None, task: str = "auto",
     manual_exclude : list, optional
         List of column names to manually exclude.
     """
+    _ensure_ml_deps()
+    _render_phase_banner(1, 1, "User File Analysis")
+    _emit_progress(1, 1, "User File Analysis", "running", detail=os.path.basename(filepath))
     print_header(f"ACDSO Demo: User File", 80)
     
     # Load data
     print_subheader("Loading Data")
     try:
         df = load_user_file(filepath)
+        _validate_dataframe_nonempty(df, filepath)
         print(f"  [OK] Loaded: {filepath}")
         print(f"  • Shape: {df.shape[0]} rows × {df.shape[1]} columns")
         print(f"  • Columns: {list(df.columns)}")
     except Exception as e:
         print(f"  [X] Error loading file: {e}")
+        _emit_progress(1, 1, "User File Analysis", "error", detail=str(e))
         return None
     
     # Show sample
@@ -8522,6 +9122,14 @@ def demo_user_file(filepath: str, target: str = None, task: str = "auto",
     if target not in df.columns:
         print(f"  [X] Error: Target column '{target}' not found in data")
         print(f"  Available columns: {list(df.columns)}")
+        _emit_progress(1, 1, "User File Analysis", "error", detail=f"Target '{target}' not found")
+        return None
+    
+    try:
+        df = _sanitize_target_rows(df, [target], min_rows=2)
+    except Exception as e:
+        print(f"  [X] Error: {e}")
+        _emit_progress(1, 1, "User File Analysis", "error", detail=str(e))
         return None
     
     # Auto-exclude problematic columns using LLM/rules
@@ -8594,11 +9202,11 @@ def demo_user_file(filepath: str, target: str = None, task: str = "auto",
     else:
         print(f"  • Task: {task}")
     
-    # Handle categorical columns
-    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    # Handle categorical columns safely
+    categorical_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
     if categorical_cols:
         print(f"  • Encoding categorical columns: {categorical_cols}")
-        X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+        X = _encode_categoricals_safe(X, categorical_cols)
     
     # Handle target encoding for classification
     if task == "classification":
@@ -8618,7 +9226,8 @@ def demo_user_file(filepath: str, target: str = None, task: str = "auto",
     print(f"  • Target: {target}")
     
     # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    ts_split = 0.2 if len(X) >= 5 else 1
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=ts_split, random_state=42)
     print(f"  • Train/test split: {len(X_train)}/{len(X_test)}")
     
     # Run Auto EDA
@@ -8710,13 +9319,14 @@ def demo_user_file(filepath: str, target: str = None, task: str = "auto",
     print(f"""
   Summary for {filepath}:
   +-----------------------------------------------------------------+
-  |  Dataset:      {df.shape[0]} rows × {df.shape[1]} columns{' ' * (35 - len(str(df.shape[0])) - len(str(df.shape[1])))}|
-  |  Task:         {task}{' ' * (50 - len(task))}|
-  |  Target:       {target}{' ' * (50 - len(target))}|
-  |  Model:        {selected['name']}{' ' * (50 - len(selected['name']))}|
+  |  Dataset:      {df.shape[0]} rows × {df.shape[1]} columns{' ' * max(0, 35 - len(str(df.shape[0])) - len(str(df.shape[1])))}|
+  |  Task:         {task}{' ' * max(0, 50 - len(task))}|
+  |  Target:       {target}{' ' * max(0, 50 - len(target))}|
+  |  Model:        {selected['name']}{' ' * max(0, 50 - len(selected['name']))}|
   |  Quality:      {eda.data_quality_.quality_score:.1f}/100{' ' * 40}|
   +-----------------------------------------------------------------┘
 """)
+    _emit_progress(1, 1, "User File Analysis", "done", detail=str(selected['name']))
     
     return model
 
@@ -9146,7 +9756,7 @@ def _generate_html_report(summary, output_path: str):
         <div class="header">
             <h1>ACDSO Benchmark Report</h1>
             <p class="subtitle">Complete AutoML Performance Analysis</p>
-            <p style="color: var(--text-muted); font-size: 0.85rem;">Generated: {summary.timestamp}</p>
+            <p style="color: var(--text-muted); font-size: 0.85rem;">Generated: {_esc(summary.timestamp)}</p>
         </div>
         
         <!-- Table of Contents -->
@@ -9173,13 +9783,13 @@ def _generate_html_report(summary, output_path: str):
             <div class="summary-grid">
                 <div class="summary-item">
                     <div class="summary-label">Best Performing System</div>
-                    <div class="summary-value">{sorted_results[0].system if sorted_results else 'N/A'}</div>
-                    <div class="summary-detail">Score: {best_score:.4f} ({task_type})</div>
+                    <div class="summary-value">{_esc(sorted_results[0].system) if sorted_results else 'N/A'}</div>
+                    <div class="summary-detail">Score: {best_score:.4f} ({_esc(task_type)})</div>
                 </div>
                 <div class="summary-item">
                     <div class="summary-label">Fastest System</div>
-                    <div class="summary-value">{min(sorted_results, key=lambda x: x.fit_time_s).system if sorted_results else 'N/A'}</div>
-                    <div class="summary-detail">Time: {min(times):.1f}s (avg: {avg_time:.1f}s)</div>
+                    <div class="summary-value">{_esc(min(sorted_results, key=lambda x: x.fit_time_s).system) if sorted_results else 'N/A'}</div>
+                    <div class="summary-detail">Time: {min(times) if times else 0:.1f}s (avg: {avg_time:.1f}s)</div>
                 </div>
                 <div class="summary-item">
                     <div class="summary-label">Most Production-Ready</div>
@@ -9200,11 +9810,11 @@ def _generate_html_report(summary, output_path: str):
             <div class="metric-grid">
                 <div class="metric-item">
                     <div class="metric-label">Dataset</div>
-                    <div class="metric-value">{', '.join(summary.datasets_tested) or 'Custom'}</div>
+                    <div class="metric-value">{_esc(', '.join(summary.datasets_tested)) or 'Custom'}</div>
                 </div>
                 <div class="metric-item">
                     <div class="metric-label">Task Type</div>
-                    <div class="metric-value">{task_type.title()}</div>
+                    <div class="metric-value">{_esc(task_type.title())}</div>
                 </div>
                 <div class="metric-item">
                     <div class="metric-label">Training Samples</div>
@@ -9257,7 +9867,7 @@ def _generate_html_report(summary, output_path: str):
         
         html += f"""                    <tr>
                         <td{winner_class}>{rank}</td>
-                        <td{winner_class}>{result.system}</td>
+                        <td{winner_class}>{_esc(result.system)}</td>
                         <td{winner_class}>{result.test_score:.4f}</td>
                         <td>{secondary}</td>
                         <td>{tertiary}</td>
@@ -9274,8 +9884,8 @@ def _generate_html_report(summary, output_path: str):
     for result in failed_results:
         html += f"""                    <tr>
                         <td>-</td>
-                        <td>{result.system}</td>
-                        <td colspan="9" class="error">ERROR: {result.error[:80] if result.error else 'Unknown error'}</td>
+                        <td>{_esc(result.system)}</td>
+                        <td colspan="9" class="error">ERROR: {_esc(result.error[:80] if result.error else 'Unknown error')}</td>
                     </tr>
 """
     
@@ -9304,7 +9914,7 @@ def _generate_html_report(summary, output_path: str):
         for r in sorted_results:
             pct = (r.test_score / max_score) * 100
             html += f"""                            <div class="bar-row">
-                                <span class="bar-label">{r.system}</span>
+                                <span class="bar-label">{_esc(r.system)}</span>
                                 <div class="bar-container">
                                     <div class="bar bar-score" style="width: {pct:.1f}%">{r.test_score:.3f}</div>
                                 </div>
@@ -9321,7 +9931,7 @@ def _generate_html_report(summary, output_path: str):
         for r in sorted_results:
             pct = (r.fit_time_s / max_time) * 100
             html += f"""                            <div class="bar-row">
-                                <span class="bar-label">{r.system}</span>
+                                <span class="bar-label">{_esc(r.system)}</span>
                                 <div class="bar-container">
                                     <div class="bar bar-time" style="width: {pct:.1f}%">{r.fit_time_s:.1f}s</div>
                                 </div>
@@ -9340,7 +9950,7 @@ def _generate_html_report(summary, output_path: str):
         for r in sorted_results:
             pct = (r.latency_ms_per_row / max_latency) * 100
             html += f"""                            <div class="bar-row">
-                                <span class="bar-label">{r.system}</span>
+                                <span class="bar-label">{_esc(r.system)}</span>
                                 <div class="bar-container">
                                     <div class="bar bar-latency" style="width: {pct:.1f}%">{r.latency_ms_per_row:.2f}ms</div>
                                 </div>
@@ -9358,7 +9968,7 @@ def _generate_html_report(summary, output_path: str):
             eff = (r.test_score / max(0.001, r.fit_time_s)) * 100
             pct = (eff / max_efficiency) * 100
             html += f"""                            <div class="bar-row">
-                                <span class="bar-label">{r.system}</span>
+                                <span class="bar-label">{_esc(r.system)}</span>
                                 <div class="bar-container">
                                     <div class="bar bar-efficiency" style="width: {pct:.1f}%">{eff:.2f}</div>
                                 </div>
@@ -9415,8 +10025,8 @@ def _generate_html_report(summary, output_path: str):
     for metric, winner in summary.winner_by_metric.items():
         metric_name = metric.replace('_', ' ').title()
         html += f"""                <div class="metric-item">
-                    <div class="metric-label">{metric_name}</div>
-                    <div class="metric-value">{winner}</div>
+                    <div class="metric-label">{_esc(metric_name)}</div>
+                    <div class="metric-value">{_esc(winner)}</div>
                 </div>
 """
     
@@ -9438,7 +10048,7 @@ def _generate_html_report(summary, output_path: str):
                 <div class="system-header">
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
                         <span class="system-rank {rank_class}">{rank}</span>
-                        <span class="system-name">{result.system}</span>
+                        <span class="system-name">{_esc(result.system)}</span>
                         {'<span class="badge badge-success">BEST</span>' if is_winner else ''}
                     </div>
                     <span class="badge badge-info">Efficiency: {efficiency:.2f}</span>
@@ -9517,7 +10127,7 @@ def _generate_html_report(summary, output_path: str):
         # Add model info if available
         if hasattr(result, 'model_name') and result.model_name:
             html += f"""                <p style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.85rem;">
-                    <strong>Selected Model:</strong> {result.model_name}
+                    <strong>Selected Model:</strong> {_esc(result.model_name)}
                 </p>
 """
         
@@ -9530,11 +10140,11 @@ def _generate_html_report(summary, output_path: str):
                 <div class="system-header">
                     <div style="display: flex; align-items: center; gap: 0.75rem;">
                         <span class="system-rank rank-other">-</span>
-                        <span class="system-name" style="color: var(--danger)">{result.system}</span>
+                        <span class="system-name" style="color: var(--danger)">{_esc(result.system)}</span>
                     </div>
                     <span class="badge badge-danger">FAILED</span>
                 </div>
-                <p style="color: var(--danger); margin-top: 0.5rem;">Error: {result.error}</p>
+                <p style="color: var(--danger); margin-top: 0.5rem;">Error: {_esc(result.error)}</p>
             </div>
 """
     
@@ -9561,10 +10171,10 @@ def _generate_html_report(summary, output_path: str):
     for lt in summary.leakage_tests:
         status_badge = '<span class="badge badge-success">DETECTED</span>' if lt.detected else '<span class="badge badge-danger">NOT DETECTED</span>'
         html += f"""                    <tr>
-                        <td>{lt.system}</td>
-                        <td>{lt.leakage_type}</td>
+                        <td>{_esc(lt.system)}</td>
+                        <td>{_esc(lt.leakage_type)}</td>
                         <td>{status_badge}</td>
-                        <td>{lt.detection_method or 'N/A'}</td>
+                        <td>{_esc(lt.detection_method or 'N/A')}</td>
                     </tr>
 """
     
@@ -9585,28 +10195,28 @@ def _generate_html_report(summary, output_path: str):
         most_stable = min(sorted_results, key=lambda x: x.cv_score_std)
         
         html += f"""            <div class="recommendation">
-                <h3 style="margin-top: 0;">Best Overall: {best.system}</h3>
+                <h3 style="margin-top: 0;">Best Overall: {_esc(best.system)}</h3>
                 <p>Achieved the highest score of {best.test_score:.4f} on this benchmark.</p>
             </div>
 """
         
         if fastest.system != best.system:
             html += f"""            <div class="recommendation">
-                <h3 style="margin-top: 0;">Fastest Training: {fastest.system}</h3>
+                <h3 style="margin-top: 0;">Fastest Training: {_esc(fastest.system)}</h3>
                 <p>Completed training in {fastest.fit_time_s:.1f}s (Score: {fastest.test_score:.4f}).</p>
             </div>
 """
         
         if lowest_latency.system != best.system:
             html += f"""            <div class="recommendation">
-                <h3 style="margin-top: 0;">Best for Production (Low Latency): {lowest_latency.system}</h3>
+                <h3 style="margin-top: 0;">Best for Production (Low Latency): {_esc(lowest_latency.system)}</h3>
                 <p>Lowest inference latency at {lowest_latency.latency_ms_per_row:.3f} ms/row.</p>
             </div>
 """
         
         if most_stable.system != best.system:
             html += f"""            <div class="recommendation">
-                <h3 style="margin-top: 0;">Most Stable: {most_stable.system}</h3>
+                <h3 style="margin-top: 0;">Most Stable: {_esc(most_stable.system)}</h3>
                 <p>Lowest CV score standard deviation: {most_stable.cv_score_std:.4f}.</p>
             </div>
 """
@@ -9627,7 +10237,7 @@ def _generate_html_report(summary, output_path: str):
                 <ul style="margin-left: 1.5rem; margin-top: 0.5rem;">
 """
         for result in failed_results:
-            html += f"""                    <li><strong>{result.system}</strong>: {result.error[:100] if result.error else 'Unknown error'}</li>
+            html += f"""                    <li><strong>{_esc(result.system)}</strong>: {_esc(result.error[:100] if result.error else 'Unknown error')}</li>
 """
         html += """                </ul>
             </div>
@@ -9661,10 +10271,10 @@ def _generate_html_report(summary, output_path: str):
                 </div>
             </div>
             <p style="margin-top: 1rem; color: var(--text-muted);">
-                Datasets: {', '.join(summary.datasets_tested) or 'Custom dataset'}
+                Datasets: {_esc(', '.join(summary.datasets_tested)) or 'Custom dataset'}
             </p>
             <p style="color: var(--text-muted);">
-                Systems: {', '.join(summary.systems_tested)}
+                Systems: {_esc(', '.join(summary.systems_tested))}
             </p>
         </div>
         
@@ -9698,7 +10308,7 @@ def _generate_html_report(summary, output_path: str):
         
         <div class="footer">
             <p>Generated by ACDSO Benchmark Suite</p>
-            <p>{summary.timestamp}</p>
+            <p>{_esc(summary.timestamp)}</p>
             <p style="font-size: 0.8rem; margin-top: 0.5rem;">
                 For questions or issues, please visit the ACDSO documentation.
             </p>
@@ -9724,6 +10334,7 @@ def run_decision_intelligence_demo(
     target: str = None,
     treatment: str = None,
     budget: float = None,
+    emit_progress: bool = True,
 ):
     """
     Run Decision Intelligence demo with causal analysis, uplift modeling,
@@ -9740,6 +10351,10 @@ def run_decision_intelligence_demo(
     budget : float, optional
         Budget constraint for optimization.
     """
+    _ensure_ml_deps()
+    if emit_progress:
+        _render_phase_banner(1, 1, "Decision Intelligence")
+        _emit_progress(1, 1, "Decision Intelligence", "running")
     print("\n" + "=" * 70)
     print("=" + " " * 68 + "=")
     print("=" + "  ACDSO DECISION INTELLIGENCE DEMO  ".center(68) + "=")
@@ -9761,29 +10376,80 @@ def run_decision_intelligence_demo(
         print(f"Install with: pip install acdso[decision]")
         print(f"Or: pip install dowhy econml ortools")
         print(f"\nError: {e}")
-        return
+        if emit_progress:
+            _emit_progress(1, 1, "Decision Intelligence", "error", detail=str(e))
+        return False
     
     # Load or generate data
     if file_path:
         print(f"\nLoading custom data from: {file_path}")
-        df = load_user_file(file_path)
+        try:
+            df = load_user_file(file_path)
+            _validate_dataframe_nonempty(df, file_path)
+        except Exception as e:
+            print(f"ERROR: Could not load file '{file_path}': {e}")
+            if emit_progress:
+                _emit_progress(1, 1, "Decision Intelligence", "error", detail=str(e))
+            return False
         
-        if target is None:
+        if target is None or not str(target).strip():
             print("ERROR: Must specify --target for custom datasets")
-            return
+            if emit_progress:
+                _emit_progress(1, 1, "Decision Intelligence", "error", detail="Missing --target")
+            return False
+        if target not in df.columns:
+            print(f"ERROR: Target column '{target}' not found in dataset. Available: {list(df.columns)}")
+            if emit_progress:
+                _emit_progress(1, 1, "Decision Intelligence", "error", detail=f"Target '{target}' not found")
+            return False
         
         if treatment is None:
-            # Try to auto-detect treatment column
-            binary_cols = [c for c in df.columns if df[c].nunique() == 2 and c != target]
+            # Prefer numeric/boolean 0/1 binary columns before non-numeric 2-value columns
+            non_target = [c for c in df.columns if c != target]
+            strict_bin = [
+                c for c in non_target
+                if pd.api.types.is_numeric_dtype(df[c])
+                and df[c].dropna().nunique() == 2
+                and set(df[c].dropna().unique()).issubset({0, 1, 0.0, 1.0, True, False})
+            ]
+            num_bin = strict_bin or [
+                c for c in non_target
+                if pd.api.types.is_numeric_dtype(df[c]) and df[c].dropna().nunique() == 2
+            ]
+            str_bin = [c for c in non_target if df[c].dropna().nunique() == 2]
+            binary_cols = num_bin or str_bin
             if binary_cols:
                 treatment = binary_cols[0]
                 print(f"Auto-detected treatment column: {treatment}")
             else:
                 print("ERROR: Must specify --treatment for custom datasets")
-                return
-        
+                if emit_progress:
+                    _emit_progress(1, 1, "Decision Intelligence", "error", detail="Missing --treatment")
+                return False
+        elif treatment not in df.columns:
+            print(f"ERROR: Treatment column '{treatment}' not found in dataset. Available: {list(df.columns)}")
+            if emit_progress:
+                _emit_progress(1, 1, "Decision Intelligence", "error", detail=f"Treatment '{treatment}' not found")
+            return False
+
         outcome_col = target
         treatment_col = treatment
+
+        # Normalize binary treatment column to 0/1 numeric if boolean or 2-value string
+        t_series = df[treatment_col]
+        if pd.api.types.is_bool_dtype(t_series) or not pd.api.types.is_numeric_dtype(t_series):
+            uniq_vals = list(pd.Series(t_series.dropna().unique()))
+            if len(uniq_vals) != 2:
+                print(f"ERROR: Treatment column '{treatment_col}' must have exactly 2 distinct values (got {len(uniq_vals)}).")
+                if emit_progress:
+                    _emit_progress(1, 1, "Decision Intelligence", "error", detail="Invalid treatment cardinality")
+                return False
+            sorted_vals = sorted(uniq_vals, key=lambda x: str(x))
+            pos_val = sorted_vals[1]
+            df[treatment_col] = (t_series == pos_val).astype(int)
+            print(f"Encoded binary treatment '{treatment_col}': {sorted_vals[0]!r}->0, {pos_val!r}->1")
+        else:
+            df[treatment_col] = pd.to_numeric(t_series, errors="coerce")
         
     else:
         # Generate synthetic customer churn data for demo
@@ -9847,15 +10513,37 @@ def run_decision_intelligence_demo(
     # Set default budget
     if budget is None:
         if 'incentive_cost' in df.columns:
-            budget = df['incentive_cost'].sum() * 0.5  # 50% of total potential cost
+            cost_vals = pd.to_numeric(df['incentive_cost'], errors="coerce").to_numpy(
+                dtype=np.float64, na_value=np.nan
+            )
+            finite_nonneg = cost_vals[np.isfinite(cost_vals) & (cost_vals >= 0)]
+            total_cost = float(np.sum(finite_nonneg)) if len(finite_nonneg) > 0 else 0.0
+            budget = total_cost * 0.5 if total_cost > 0 else 5000.0
         else:
             budget = 5000.0
+    elif not np.isfinite(float(budget)) or float(budget) < 0:
+        print(f"ERROR: Invalid --budget value: {budget!r}. Must be a finite non-negative number.")
+        if emit_progress:
+            _emit_progress(1, 1, "Decision Intelligence", "error", detail=f"Invalid budget: {budget!r}")
+        return False
     
     print(f"\n  Budget constraint: ${budget:,.2f}")
     
-    # Determine feature columns
+    # Determine feature columns (all numeric non-bool dtypes including float32/int32/Int64)
     exclude_cols = {treatment_col, outcome_col, 'customer_id', 'incentive_cost'}
-    feature_cols = [c for c in df.columns if c not in exclude_cols and df[c].dtype in [np.float64, np.int64, float, int]]
+    feature_cols = [
+        c for c in df.columns
+        if c not in exclude_cols
+        and pd.api.types.is_numeric_dtype(df[c])
+        and not pd.api.types.is_bool_dtype(df[c])
+    ]
+    for fc in feature_cols:
+        df[fc] = pd.to_numeric(df[fc], errors="coerce").astype(np.float64)
+    if not feature_cols:
+        print("ERROR: No numeric feature columns available for Decision Intelligence.")
+        if emit_progress:
+            _emit_progress(1, 1, "Decision Intelligence", "error", detail="No numeric feature columns")
+        return False
     
     print(f"  Feature columns: {feature_cols}")
     
@@ -9867,50 +10555,59 @@ def run_decision_intelligence_demo(
     # Determine cost column
     cost_col = 'incentive_cost' if 'incentive_cost' in df.columns else None
     
-    di = DecisionIntelligence(
-        treatment_col=treatment_col,
-        outcome_col=outcome_col,
-        cost_col=cost_col,
-        feature_cols=feature_cols,
-        outcome_type='minimize',  # Minimize churn
-    )
-    
-    result = di.fit(
-        df,
-        budget=budget,
-        run_causal=True,
-        run_uplift=True,
-        run_optimization=True,
-        run_policy=False,  # Skip policy learning (slow)
-        verbose=True,
-    )
-    
-    # Print detailed results
-    print("\n" + "=" * 70)
-    print("DECISION INTELLIGENCE RESULTS SUMMARY")
-    print("=" * 70)
-    
-    print(result.summary())
-    
-    # Show top recommendations
-    if result.recommendations_df is not None:
-        top_targets = result.get_recommendations(top_n=10)
-        print("\nTop 10 Recommended Targets:")
-        print("-" * 50)
-        print(top_targets.to_string())
-    
-    # Save audit trail
-    audit_path = "reports/decision_audit_trail.json"
-    import os
-    os.makedirs("reports", exist_ok=True)
-    
-    with open(audit_path, 'w') as f:
-        f.write(result.audit_trail.to_json())
-    
-    print(f"\n  Audit trail saved: {audit_path}")
+    try:
+        di = DecisionIntelligence(
+            treatment_col=treatment_col,
+            outcome_col=outcome_col,
+            cost_col=cost_col,
+            feature_cols=feature_cols,
+            outcome_type='minimize',  # Minimize churn
+        )
+
+        result = di.fit(
+            df,
+            budget=budget,
+            run_causal=True,
+            run_uplift=True,
+            run_optimization=True,
+            run_policy=False,  # Skip policy learning (slow)
+            verbose=True,
+        )
+
+        # Print detailed results
+        print("\n" + "=" * 70)
+        print("DECISION INTELLIGENCE RESULTS SUMMARY")
+        print("=" * 70)
+
+        print(result.summary())
+
+        # Show top recommendations
+        if result.recommendations_df is not None:
+            top_targets = result.get_recommendations(top_n=10)
+            print("\nTop 10 Recommended Targets:")
+            print("-" * 50)
+            print(top_targets.to_string())
+
+        # Save audit trail
+        audit_path = "reports/decision_audit_trail.json"
+        import os
+        os.makedirs("reports", exist_ok=True)
+
+        with open(audit_path, 'w', encoding='utf-8') as f:
+            f.write(result.audit_trail.to_json())
+
+        print(f"\n  Audit trail saved: {audit_path}")
+    except Exception as e:
+        print(f"\n  [X] ERROR: Decision Intelligence failed: {e}")
+        if emit_progress:
+            _emit_progress(1, 1, "Decision Intelligence", "error", detail=str(e))
+        return False
     print("\n" + "=" * 70)
     print("Decision Intelligence Demo Complete!")
     print("=" * 70)
+    if emit_progress:
+        _emit_progress(1, 1, "Decision Intelligence", "done")
+    return True
 
 
 # ============================================================================
@@ -9922,6 +10619,7 @@ def run_timeseries_demo(
     target: str = None,
     datetime_col: str = None,
     horizon: int = 7,
+    emit_progress: bool = True,
 ):
     """
     Run Auto Time Series demo with forecasting and benchmarking.
@@ -9938,7 +10636,10 @@ def run_timeseries_demo(
         Forecast horizon.
     """
     import logging
-    import warnings
+    _ensure_ml_deps()
+    if emit_progress:
+        _render_phase_banner(1, 1, "Auto Time Series")
+        _emit_progress(1, 1, "Auto Time Series", "running")
     
     # Suppress verbose output from external time series libraries
     for logger_name in ['cmdstanpy', 'prophet', 'autots', 'statsforecast', 
@@ -9964,31 +10665,48 @@ def run_timeseries_demo(
         print(f"Install with: pip install acdso[timeseries]")
         print(f"Or: pip install statsmodels prophet pmdarima")
         print(f"\nError: {e}")
-        return
+        if emit_progress:
+            _emit_progress(1, 1, "Auto Time Series", "error", detail=str(e))
+        return False
     
     # Load or generate data
     if file_path:
         print(f"\nLoading custom data from: {file_path}")
-        df = load_user_file(file_path)
+        try:
+            df = load_user_file(file_path)
+            _validate_dataframe_nonempty(df, file_path)
+        except Exception as e:
+            print(f"ERROR: Could not load file '{file_path}': {e}")
+            if emit_progress:
+                _emit_progress(1, 1, "Auto Time Series", "error", detail=str(e))
+            return False
         
-        if target is None:
+        if target is None or not str(target).strip():
             print("ERROR: Must specify --target for custom datasets")
-            return
+            if emit_progress:
+                _emit_progress(1, 1, "Auto Time Series", "error", detail="Missing --target")
+            return False
+        if target not in df.columns:
+            print(f"ERROR: Target column '{target}' not found in dataset. Available: {list(df.columns)}")
+            if emit_progress:
+                _emit_progress(1, 1, "Auto Time Series", "error", detail=f"Target '{target}' not found")
+            return False
         
         if datetime_col is None:
-            # Try to auto-detect datetime column
-            for col in df.columns:
-                try:
-                    pd.to_datetime(df[col])
-                    datetime_col = col
-                    print(f"Auto-detected datetime column: {datetime_col}")
-                    break
-                except Exception:
-                    pass
+            datetime_col = _detect_datetime_column(df)
+            if datetime_col:
+                print(f"Auto-detected datetime column: {datetime_col}")
         
         if datetime_col is None:
             print("ERROR: Must specify --datetime-col for custom datasets")
-            return
+            if emit_progress:
+                _emit_progress(1, 1, "Auto Time Series", "error", detail="Missing --datetime-col")
+            return False
+        if datetime_col not in df.columns:
+            print(f"ERROR: Datetime column '{datetime_col}' not found in dataset. Available: {list(df.columns)}")
+            if emit_progress:
+                _emit_progress(1, 1, "Auto Time Series", "error", detail=f"Datetime '{datetime_col}' not found")
+            return False
         
     else:
         # Generate synthetic time series for demo
@@ -10030,31 +10748,37 @@ def run_timeseries_demo(
     print("Running Auto Time Series Pipeline...")
     print("-" * 70)
     
-    ts = AutoTS(
-        datetime_col=datetime_col,
-        target_col=target,
-        horizon=horizon,
-        cv_type='expanding',
-        n_splits=5,
-        primary_metric='rmse',
-        include_baselines=True,
-        verbose=True,
-    )
-    
-    result = ts.fit(df)
-    
-    # Print detailed results
-    print("\n" + "=" * 70)
-    print("AUTO TIME SERIES RESULTS")
-    print("=" * 70)
-    
-    print(result.summary())
-    
-    # Show leaderboard
-    leaderboard = result.get_leaderboard(top_n=10)
-    print("\nModel Leaderboard:")
-    print("-" * 60)
-    print(leaderboard.to_string())
+    try:
+        ts = AutoTS(
+            datetime_col=datetime_col,
+            target_col=target,
+            horizon=horizon,
+            cv_type='expanding',
+            n_splits=5,
+            primary_metric='rmse',
+            include_baselines=True,
+            verbose=True,
+        )
+
+        result = ts.fit(df)
+
+        # Print detailed results
+        print("\n" + "=" * 70)
+        print("AUTO TIME SERIES RESULTS")
+        print("=" * 70)
+
+        print(result.summary())
+
+        # Show leaderboard
+        leaderboard = result.get_leaderboard(top_n=10)
+        print("\nModel Leaderboard:")
+        print("-" * 60)
+        print(leaderboard.to_string())
+    except Exception as e:
+        print(f"\n  [X] ERROR: Auto Time Series failed: {e}")
+        if emit_progress:
+            _emit_progress(1, 1, "Auto Time Series", "error", detail=str(e))
+        return False
     
     # Benchmark against other TS tools (if available)
     print("\n" + "-" * 70)
@@ -10092,6 +10816,9 @@ def run_timeseries_demo(
     print("\n" + "=" * 70)
     print("Auto Time Series Demo Complete!")
     print("=" * 70)
+    if emit_progress:
+        _emit_progress(1, 1, "Auto Time Series", "done")
+    return True
 
 
 def run_benchmark_only(
@@ -10102,6 +10829,8 @@ def run_benchmark_only(
     target: str = None,
     task: str = "auto",
     exclude: list = None,
+    auto_exclude: bool = True,
+    emit_progress: bool = True,
 ):
     """
     Run benchmark comparison as standalone.
@@ -10123,6 +10852,10 @@ def run_benchmark_only(
     exclude : list, optional
         Columns to exclude.
     """
+    _ensure_ml_deps()
+    if emit_progress:
+        _render_phase_banner(1, 1, "AutoML Benchmark")
+        _emit_progress(1, 1, "AutoML Benchmark", "running")
     # Capture console output for combined report
     console_output_lines = []
     
@@ -10138,26 +10871,17 @@ def run_benchmark_only(
     log_console("=" * 80)
     
     # Try to use full benchmark suite
+    tmp_bench_csv = None
     try:
         from benchmarks.benchmark_automl import run_benchmark, load_custom_dataset
         
         # Load custom dataset if provided
         custom_datasets = None
         if custom_file:
-            import os
-            import pandas as pd
-            
             try:
-                # First load the raw data to run auto-exclusion
-                ext = os.path.splitext(custom_file)[1].lower()
-                if ext == '.csv':
-                    df = pd.read_csv(custom_file)
-                elif ext in ['.xls', '.xlsx']:
-                    df = pd.read_excel(custom_file)
-                elif ext == '.parquet':
-                    df = pd.read_parquet(custom_file)
-                else:
-                    df = pd.read_csv(custom_file)
+                # First load the raw data uniformly via load_user_file
+                df = load_user_file(custom_file)
+                _validate_dataframe_nonempty(df, custom_file)
                 
                 # Auto-detect target if not provided
                 if not target:
@@ -10165,26 +10889,47 @@ def run_benchmark_only(
                     target = df.columns[-1]
                     log_console(f"\n  No --target specified. Using last column: '{target}'")
                     log_console(f"  Available columns: {list(df.columns)}")
+                elif target not in df.columns:
+                    raise ValueError(f"Target column '{target}' not found. Available: {list(df.columns)}")
                 
-                # Auto-detect problematic columns (no hardcoding!)
+                # Auto-detect problematic columns (unless --no-auto-exclude)
                 auto_excluded = []
-                try:
-                    from acdso.advisors import auto_exclude_columns
-                    log_console("\n  Running Smart Column Analysis...")
-                    result = auto_exclude_columns(df, target_column=target, provider=None, verbose=False)
-                    auto_excluded = result.columns_to_exclude
-                    if auto_excluded:
-                        log_console(f"  Auto-detected problematic columns: {auto_excluded}")
-                        for col, reason in result.exclusion_reasons.items():
-                            log_console(f"    - {col}: {reason}")
-                except Exception as e:
-                    log_console(f"  Auto-exclusion not available: {e}")
+                if auto_exclude:
+                    try:
+                        from acdso.advisors import auto_exclude_columns
+                        log_console("\n  Running Smart Column Analysis...")
+                        result = auto_exclude_columns(df, target_column=target, provider=None, verbose=False)
+                        auto_excluded = [c for c in result.columns_to_exclude if c != target]
+                        if auto_excluded:
+                            log_console(f"  Auto-detected problematic columns: {auto_excluded}")
+                            for col, reason in result.exclusion_reasons.items():
+                                if col != target:
+                                    log_console(f"    - {col}: {reason}")
+                    except Exception as e:
+                        log_console(f"  Auto-exclusion not available: {e}")
                 
                 # Combine auto-excluded with manual exclusions
                 all_excluded = list(set((exclude or []) + auto_excluded))
                 
+                # If file format is unsupported by load_custom_dataset (e.g. .pkl/.feather or .xlsx without openpyxl),
+                # materialize a temp CSV for benchmark_automl
+                bench_file_path = custom_file
+                ext = os.path.splitext(custom_file)[1].lower()
+                needs_csv_bridge = ext in ('.pkl', '.pickle', '.feather')
+                if ext == '.xlsx':
+                    try:
+                        import openpyxl  # noqa: F401
+                    except ImportError:
+                        needs_csv_bridge = True
+                if needs_csv_bridge:
+                    import tempfile
+                    fd, tmp_bench_csv = tempfile.mkstemp(suffix=".csv")
+                    os.close(fd)
+                    df.to_csv(tmp_bench_csv, index=False)
+                    bench_file_path = tmp_bench_csv
+                
                 custom_data = load_custom_dataset(
-                    file_path=custom_file,
+                    file_path=bench_file_path,
                     target_column=target,
                     task=task,
                     exclude_columns=all_excluded if all_excluded else None,
@@ -10198,6 +10943,8 @@ def run_benchmark_only(
                     log_console(f"  Excluded columns: {all_excluded}")
             except Exception as e:
                 log_console(f"\n  Error loading custom dataset: {e}")
+                if emit_progress:
+                    _emit_progress(1, 1, "AutoML Benchmark", "error", detail=str(e))
                 return None
         
         # Determine which built-in datasets to include
@@ -10402,11 +11149,91 @@ def run_benchmark_only(
             print(f"  HTML Report: {html_report_path}")
             print("=" * 80 + "\n")
         
+        if emit_progress:
+            _emit_progress(1, 1, "AutoML Benchmark", "done")
         return summary
     except ImportError:
         # Fall back to demo benchmark
         log_console("\n  Note: Full benchmark suite not found. Running demo benchmark...")
-        return demo_benchmark_comparison()
+        res = demo_benchmark_comparison()
+        if emit_progress:
+            _emit_progress(1, 1, "AutoML Benchmark", "done")
+        return res
+    finally:
+        if tmp_bench_csv and os.path.exists(tmp_bench_csv):
+            try:
+                os.unlink(tmp_bench_csv)
+            except OSError:
+                pass
+
+
+def _encode_categoricals_safe(
+    X,
+    cat_cols=None,
+    max_cardinality=100,
+    encoding_meta: Optional[Dict[str, Any]] = None,
+    return_meta: bool = False,
+    feature_columns: Optional[List[str]] = None,
+):
+    """One-hot encode low-cardinality categoricals; frequency-encode the rest.
+
+    Unbounded get_dummies() on a high-cardinality column (e.g. an ID-like
+    field with tens of thousands of uniques) times the row count produces a
+    dense boolean matrix that can exceed available memory on large datasets.
+    Supports returning and reapplying encoding metadata across train/--predict.
+    """
+    _ensure_ml_deps()
+    X = X.copy()
+    if cat_cols is None:
+        cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+
+    if encoding_meta is not None:
+        high_card_freqs = encoding_meta.get('high_card_freqs', {}) or {}
+        low_card_cols = encoding_meta.get('low_card_cols', []) or []
+        for c, freq_map in high_card_freqs.items():
+            if c in X.columns:
+                X[c] = X[c].map(freq_map).fillna(0.0).astype('float64')
+        low_to_encode = [c for c in low_card_cols if c in X.columns]
+        extra_cats = [
+            c for c in cat_cols
+            if c in X.columns and c not in high_card_freqs and c not in low_card_cols
+        ]
+        low_to_encode.extend(extra_cats)
+        if low_to_encode:
+            X = pd.get_dummies(X, columns=low_to_encode, drop_first=False, dtype=int)
+        return (X, encoding_meta) if return_meta else X
+
+    if feature_columns is not None:
+        # Legacy .pkl fallback when categorical_encoding metadata was not saved
+        high_card_legacy = [c for c in cat_cols if c in feature_columns and c in X.columns]
+        low_card_legacy = [c for c in cat_cols if c not in feature_columns and c in X.columns]
+        high_card_freqs = {}
+        for c in high_card_legacy:
+            freq_map = X[c].value_counts(dropna=False).to_dict()
+            high_card_freqs[c] = freq_map
+            X[c] = X[c].map(freq_map).fillna(0.0).astype('float64')
+        if low_card_legacy:
+            X = pd.get_dummies(X, columns=low_card_legacy, drop_first=False, dtype=int)
+        meta = {"low_card_cols": low_card_legacy, "high_card_freqs": high_card_freqs}
+        return (X, meta) if return_meta else X
+
+    low_card = [c for c in cat_cols if X[c].nunique(dropna=False) <= max_cardinality]
+    high_card = [c for c in cat_cols if c not in low_card]
+    high_card_freqs: Dict[str, Dict[Any, Any]] = {}
+
+    if high_card:
+        print(f"    [WARN] {len(high_card)} high-cardinality column(s) frequency-encoded "
+              f"instead of one-hot (> {max_cardinality} uniques): {high_card}")
+        for c in high_card:
+            freq_map = X[c].value_counts(dropna=False).to_dict()
+            high_card_freqs[c] = freq_map
+            X[c] = X[c].map(freq_map).fillna(0.0).astype('float64')
+
+    if low_card:
+        X = pd.get_dummies(X, columns=low_card, drop_first=True, dtype=int)
+
+    meta = {"low_card_cols": low_card, "high_card_freqs": high_card_freqs}
+    return (X, meta) if return_meta else X
 
 
 def run_multi_target_training(
@@ -10416,6 +11243,7 @@ def run_multi_target_training(
     exclude: List[str] = None,
     multi_output: bool = False,
     run_benchmark: bool = True,
+    auto_exclude: bool = True,
 ):
     """
     Train models for multiple target columns.
@@ -10435,12 +11263,18 @@ def run_multi_target_training(
         If False, train separate models for each target.
     run_benchmark : bool
         Whether to run benchmarks.
+    auto_exclude : bool
+        Whether to automatically exclude ID/leakage columns.
         
     Returns
     -------
     dict
         Combined results for all targets.
     """
+    _ensure_ml_deps()
+    total_mt = 4 if multi_output else (len(targets) + 2)
+    _render_phase_banner(1, total_mt, "Data Loading & Validation")
+    _emit_progress(1, total_mt, "Data Loading & Validation", "running", detail=os.path.basename(file_path))
     print("\n" + "=" * 80)
     print("=" + " " * 78 + "=")
     print("=" + "  ACDSO MULTI-TARGET TRAINING  ".center(78) + "=")
@@ -10448,12 +11282,15 @@ def run_multi_target_training(
     print("=" + " " * 78 + "=")
     print("=" * 80)
     
-    # Import required modules
-    import os
-    import pandas as pd
     from acdso import ACDSOClassifier, ACDSORegressor
     
-    df = pd.read_csv(file_path)
+    try:
+        df = load_user_file(file_path)
+        _validate_dataframe_nonempty(df, file_path)
+    except Exception as e:
+        print(f"\n  [X] ERROR: Failed to load '{file_path}': {e}")
+        _emit_progress(1, total_mt, "Data Loading & Validation", "error", detail=str(e))
+        return None
     print(f"\n  [OK] Loaded: {file_path}")
     print(f"      Shape: {df.shape[0]} rows x {df.shape[1]} columns")
     print(f"      Targets: {targets}")
@@ -10463,7 +11300,21 @@ def run_multi_target_training(
     if missing_targets:
         print(f"\n  [X] ERROR: Target columns not found: {missing_targets}")
         print(f"      Available columns: {list(df.columns)}")
+        _emit_progress(1, total_mt, "Data Loading & Validation", "error", detail=f"Missing targets: {missing_targets}")
         return None
+    
+    effective_exclude = list(exclude) if exclude else []
+    if auto_exclude:
+        try:
+            from acdso.advisors import auto_exclude_columns
+            excl_result = auto_exclude_columns(df, target_column=targets[0], provider=None, verbose=False)
+            for col in excl_result.columns_to_exclude:
+                if col not in targets and col not in effective_exclude:
+                    effective_exclude.append(col)
+        except Exception as e:
+            print(f"  [--] Auto-exclusion skipped: {e}")
+    
+    _emit_progress(1, total_mt, "Data Loading & Validation", "done", detail=f"{df.shape[0]}x{df.shape[1]}")
     
     all_results = {
         "file": file_path,
@@ -10473,44 +11324,82 @@ def run_multi_target_training(
         "predictions": {},
     }
     
+    # Detect task type (aligned with single-target dtype rules: never float continuous)
+    def _is_clf_target_series(s: pd.Series) -> bool:
+        if (
+            pd.api.types.is_bool_dtype(s.dtype)
+            or isinstance(s.dtype, (pd.CategoricalDtype, pd.StringDtype))
+            or s.dtype == object
+        ):
+            return True
+        if pd.api.types.is_integer_dtype(s.dtype) and s.nunique(dropna=True) <= 10:
+            return True
+        return False
+
     if multi_output:
         # ===== MULTI-OUTPUT MODE: Single model for all targets =====
+        _render_phase_banner(2, total_mt, "Feature Preparation")
+        _emit_progress(2, total_mt, "Feature Preparation", "running")
         print("\n" + "-" * 80)
         print("  MODE: Multi-Output (single model predicting all targets)")
         print("-" * 80)
         
         from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
         
+        try:
+            df_clean = _sanitize_target_rows(df, targets, min_rows=2)
+        except Exception as e:
+            print(f"\n  [X] ERROR: {e}")
+            _emit_progress(2, total_mt, "Feature Preparation", "error", detail=str(e))
+            return None
+        
         # Prepare features
-        feature_cols = [c for c in df.columns if c not in targets and c not in (exclude or [])]
-        X = df[feature_cols].copy()
-        y = df[targets].copy()
+        feature_cols = [c for c in df_clean.columns if c not in targets and c not in effective_exclude]
+        if not feature_cols:
+            print("\n  [X] ERROR: No feature columns remaining after target/column exclusions.")
+            _emit_progress(2, total_mt, "Feature Preparation", "error", detail="No features")
+            return None
+        X = df_clean[feature_cols].copy()
+        y = df_clean[targets].copy()
         
         # Encode categorical features
-        cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+        cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
         if cat_cols:
-            X = pd.get_dummies(X, columns=cat_cols, drop_first=True)
-        
-        # Detect task type
+            X, enc_meta = _encode_categoricals_safe(X, cat_cols, return_meta=True)
+        else:
+            enc_meta = {"low_card_cols": [], "high_card_freqs": {}}
+
         detected_task = task
         if task == "auto":
-            # Check if all targets are classification or regression
-            is_classification = all(df[t].nunique() <= 20 for t in targets)
+            is_classification = all(_is_clf_target_series(df_clean[t]) for t in targets)
             detected_task = "classification" if is_classification else "regression"
         
+        if detected_task == "classification" and any(df_clean[t].nunique(dropna=True) < 2 for t in targets):
+            print("\n  [X] ERROR: Classification target has fewer than 2 distinct classes.")
+            _emit_progress(2, total_mt, "Feature Preparation", "error", detail="Fewer than 2 classes")
+            return None
+        
+        if len(X) < 5:
+            print(f"\n  [X] ERROR: Need at least 5 clean rows for multi-output training (got {len(X)}).")
+            _emit_progress(2, total_mt, "Feature Preparation", "error", detail="Insufficient rows")
+            return None
+
         print(f"\n  Task: {detected_task}")
         print(f"  Features: {len(X.columns)}")
         print(f"  Targets: {targets}")
+        _emit_progress(2, total_mt, "Feature Preparation", "done")
         
-        from sklearn.model_selection import train_test_split
+        _render_phase_banner(3, total_mt, "Multi-Output Training")
+        _emit_progress(3, total_mt, "Multi-Output Training", "running")
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        cv_mo = max(2, min(5, len(X_train) // 2))
         
         # Train multi-output model
         if detected_task == "classification":
-            base_model = ACDSOClassifier(scorer='f1', cv=5, verbose=1)
+            base_model = ACDSOClassifier(scorer='f1', cv=cv_mo, verbose=1)
             model = MultiOutputClassifier(base_model)
         else:
-            base_model = ACDSORegressor(scorer='r2', cv=5, verbose=1)
+            base_model = ACDSORegressor(scorer='r2', cv=cv_mo, verbose=1)
             model = MultiOutputRegressor(base_model)
         
         print(f"\n  Training multi-output {detected_task} model...")
@@ -10537,18 +11426,19 @@ def run_multi_target_training(
             y_pred = predictions[:, i]
             
             if detected_task == "classification":
-                from sklearn.metrics import accuracy_score, f1_score
                 acc = accuracy_score(y_true, y_pred)
                 f1 = f1_score(y_true, y_pred, average='weighted')
                 print(f"    {target}: Accuracy={acc:.4f}, F1={f1:.4f}")
                 all_results["models"]["multi_output"][target] = {"accuracy": acc, "f1": f1}
             else:
-                from sklearn.metrics import r2_score, mean_squared_error
                 r2 = r2_score(y_true, y_pred)
                 rmse = np.sqrt(mean_squared_error(y_true, y_pred))
                 print(f"    {target}: R2={r2:.4f}, RMSE={rmse:.4f}")
                 all_results["models"]["multi_output"][target] = {"r2": r2, "rmse": rmse}
         
+        _emit_progress(3, total_mt, "Multi-Output Training", "done")
+        _render_phase_banner(4, total_mt, "Model & Report Export")
+        _emit_progress(4, total_mt, "Model & Report Export", "running")
         # Save model
         try:
             import joblib
@@ -10560,7 +11450,8 @@ def run_multi_target_training(
                 'targets': targets,
                 'task': detected_task,
                 'feature_columns': list(X.columns),
-                'exclude': exclude,
+                'exclude': effective_exclude,
+                'categorical_encoding': enc_meta,
             }, model_path)
             print(f"\n  [OK] Model saved: {model_path}")
             all_results["model_path"] = model_path
@@ -10574,40 +11465,66 @@ def run_multi_target_training(
         print("-" * 80)
         
         for i, target in enumerate(targets, 1):
+            phase_num = i + 1
+            _render_phase_banner(phase_num, total_mt, f"Train Target: {target}")
+            _emit_progress(phase_num, total_mt, f"Train Target: {target}", "running")
             print(f"\n  {'=' * 70}")
             print(f"  TARGET {i}/{len(targets)}: {target}")
             print(f"  {'=' * 70}")
             
+            try:
+                df_clean = _sanitize_target_rows(df, [target], min_rows=2)
+            except Exception as e:
+                print(f"\n  [X] ERROR for '{target}': {e}")
+                _emit_progress(phase_num, total_mt, f"Train Target: {target}", "error", detail=str(e))
+                return None
+            
             # Prepare features (exclude other targets from features)
             other_targets = [t for t in targets if t != target]
-            excluded = list(set((exclude or []) + other_targets))
+            excluded = list(set(effective_exclude + other_targets))
             
-            feature_cols = [c for c in df.columns if c != target and c not in excluded]
-            X = df[feature_cols].copy()
-            y = df[target].copy()
+            feature_cols = [c for c in df_clean.columns if c != target and c not in excluded]
+            if not feature_cols:
+                print(f"\n  [X] ERROR: No feature columns remaining for target '{target}'.")
+                _emit_progress(phase_num, total_mt, f"Train Target: {target}", "error", detail="No features")
+                return None
+            X = df_clean[feature_cols].copy()
+            y = df_clean[target].copy()
             
             # Encode categorical features
-            cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+            cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
             if cat_cols:
-                X = pd.get_dummies(X, columns=cat_cols, drop_first=True)
-            
-            # Detect task type
+                X, enc_meta = _encode_categoricals_safe(X, cat_cols, return_meta=True)
+            else:
+                enc_meta = {"low_card_cols": [], "high_card_freqs": {}}
+
+            # Detect task type (aligned with single-target dtype rules: never float continuous)
             detected_task = task
             if task == "auto":
-                is_classification = y.nunique() <= 20 and y.dtype in ['object', 'category', 'bool'] or y.nunique() <= 10
+                is_classification = _is_clf_target_series(y)
                 detected_task = "classification" if is_classification else "regression"
+            
+            if detected_task == "classification" and y.nunique(dropna=True) < 2:
+                print(f"\n  [X] ERROR: Classification target '{target}' has fewer than 2 distinct classes.")
+                _emit_progress(phase_num, total_mt, f"Train Target: {target}", "error", detail="Fewer than 2 classes")
+                return None
+            
+            if len(X) < 5:
+                print(f"\n  [X] ERROR: Need at least 5 clean rows for sequential target '{target}' (got {len(X)}).")
+                _emit_progress(phase_num, total_mt, f"Train Target: {target}", "error", detail="Insufficient rows")
+                return None
             
             print(f"\n    Task: {detected_task}")
             print(f"    Features: {len(X.columns)}")
             
-            from sklearn.model_selection import train_test_split
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            cv_seq = max(2, min(5, len(X_train) // 2))
             
             # Train model
             if detected_task == "classification":
-                model = ACDSOClassifier(scorer='f1', cv=5, verbose=1)
+                model = ACDSOClassifier(scorer='f1', cv=cv_seq, verbose=1)
             else:
-                model = ACDSORegressor(scorer='r2', cv=5, verbose=1)
+                model = ACDSORegressor(scorer='r2', cv=cv_seq, verbose=1)
             
             print(f"\n    Training {detected_task} model for '{target}'...")
             start_time = time.time()
@@ -10645,11 +11562,15 @@ def run_multi_target_training(
                     'task': detected_task,
                     'feature_columns': list(X.columns),
                     'exclude': excluded,
+                    'categorical_encoding': enc_meta,
                 }, model_path)
                 print(f"    [OK] Model saved: {model_path}")
                 all_results["models"][target]["model_path"] = model_path
             except Exception as e:
                 print(f"    [--] Could not save model: {e}")
+            _emit_progress(phase_num, total_mt, f"Train Target: {target}", "done", detail=selected_model)
+        _render_phase_banner(total_mt, total_mt, "Results Export")
+        _emit_progress(total_mt, total_mt, "Results Export", "running")
     
     # Generate combined report
     print("\n" + "=" * 80)
@@ -10682,19 +11603,20 @@ def run_multi_target_training(
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         report_path = f"reports/multi_target_{base_name}_results.json"
         os.makedirs("reports", exist_ok=True)
-        with open(report_path, 'w') as f:
-            json.dump(all_results, f, indent=2, default=str)
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(_sanitize_json_payload(all_results), f, indent=2, allow_nan=False)
         print(f"\n  [OK] Results saved: {report_path}")
     except Exception as e:
         print(f"\n  [--] Could not save results: {e}")
     
+    _emit_progress(total_mt, total_mt, "Model & Report Export" if multi_output else "Results Export", "done")
     return all_results
 
 
 def main():
     """Main entry point with argument parsing."""
     import argparse
-    import os
+    _configure_console()
 
     parser = argparse.ArgumentParser(
         description="ACDSO Demo Suite - Risk-Aware AutoML with LLM-Powered Analysis",
@@ -11037,225 +11959,286 @@ Supported file formats:
     
     args = parser.parse_args()
     
-    # AUTONOMOUS MODE IS DEFAULT for all operations with --file
-    # --simple/--quick runs EDA + AutoML only (skips Time Series and Benchmarks)
-    if args.file:
-        if getattr(args, 'simple', False):
-            args.autonomous = True  # Still run autonomous but skip some phases
-            args.skip_benchmark = True  # Skip benchmarks in simple mode
-            print("\n  [INFO] Quick mode: Running EDA + AutoML (skipping Time Series and Benchmarks)")
-        else:
-            # Autonomous is now the default for any operation with --file
-            args.autonomous = True
-            print("\n  [INFO] Autonomous mode enabled by default (full pipeline: EDA → Risk → AutoML → Time Series)")
+    # Cheap preflight argument validation BEFORE importing heavy ML deps
+    if args.horizon is not None and args.horizon <= 0:
+        print(f"\n  [X] ERROR: --horizon must be > 0 (got {args.horizon})")
+        sys.exit(1)
+    if args.budget is not None and args.budget < 0:
+        print(f"\n  [X] ERROR: --budget must be >= 0 (got {args.budget})")
+        sys.exit(1)
+    if args.time_budget is not None and args.time_budget <= 0:
+        print(f"\n  [X] ERROR: --time-budget must be > 0 (got {args.time_budget})")
+        sys.exit(1)
+    if args.predict and not args.file:
+        print("\n  [X] ERROR: --predict requires --file to specify the data file.")
+        sys.exit(1)
+    if args.target and ',' in args.target and not args.predict and not args.file:
+        print("\n  [X] ERROR: Multi-target training requires --file.")
+        sys.exit(1)
+    if args.file and not args.all and not os.path.isfile(args.file):
+        print(f"\n  [X] ERROR: File not found: {args.file}")
+        sys.exit(1)
     
-    # Handle --force flag: clean up old models and reports
-    if getattr(args, 'force', False):
-        import glob
-        import shutil
-        
-        print("\n" + "=" * 80)
-        print("  FORCE MODE: Cleaning up old models and reports...")
-        print("=" * 80)
-        
-        # Get base name for file-specific cleanup
+    # Import heavy scientific/ML dependencies only after CLI flags & paths pass preflight
+    _ensure_ml_deps()
+    
+    try:
+        is_simple = bool(getattr(args, 'simple', False))
+        effective_skip_ts = is_simple
         if args.file:
-            base_name = os.path.splitext(os.path.basename(args.file))[0]
-            patterns = [
-                f"reports/model_{base_name}*.pkl",
-                f"reports/audit_{base_name}*.json",
-                f"reports/autonomous_{base_name}*.json",
-                f"reports/autonomous_{base_name}*.html",
-                f"reports/predictions_{base_name}*.csv",
-                f"reports/multi_target_{base_name}*.json",
-                f"reports/multi_target_{base_name}*.html",
-                f"reports/ts_benchmark_{base_name}*.html",
-                f"reports/eda_{base_name}*.html",
-            ]
+            effective_run_benchmark = bool(getattr(args, 'benchmark', False)) and not is_simple
         else:
-            # Clean all reports if no specific file
-            patterns = [
-                "reports/model_*.pkl",
-                "reports/audit_*.json",
-                "reports/autonomous_*.json",
-                "reports/autonomous_*.html",
-                "reports/predictions_*.csv",
-                "reports/multi_target_*.json",
-                "reports/multi_target_*.html",
-                "reports/ts_benchmark_*.html",
-                "reports/eda_*.html",
-            ]
+            effective_run_benchmark = not bool(getattr(args, 'skip_benchmark', False)) and not is_simple
+        effective_auto_exclude = not bool(getattr(args, 'no_auto_exclude', False))
+
+        # AUTONOMOUS MODE IS DEFAULT for all operations with --file
+        # --simple/--quick runs EDA + AutoML only (skips Time Series and Benchmarks)
+        if args.file:
+            if is_simple:
+                args.autonomous = True  # Still run autonomous but skip some phases
+                args.skip_benchmark = True  # Skip benchmarks in simple mode
+                print("\n  [INFO] Quick mode: Running EDA + AutoML (skipping Time Series and Benchmarks)")
+            else:
+                # Autonomous is now the default for any operation with --file
+                args.autonomous = True
+                print("\n  [INFO] Autonomous mode enabled by default (full pipeline: EDA → Risk → AutoML → Time Series)")
         
-        deleted_count = 0
-        for pattern in patterns:
-            for filepath in glob.glob(pattern):
-                try:
-                    os.remove(filepath)
-                    print(f"    [DELETED] {filepath}")
-                    deleted_count += 1
-                except Exception as e:
-                    print(f"    [WARN] Could not delete {filepath}: {e}")
-        
-        if deleted_count > 0:
-            print(f"\n  Cleaned {deleted_count} old files. Starting fresh training...")
-        else:
-            print(f"\n  No old files found. Starting fresh training...")
-        print("=" * 80 + "\n")
-    
-    # Check for multi-target training
-    if args.target and ',' in args.target:
-        targets = [t.strip() for t in args.target.split(',')]
-        
-        if not args.file:
-            print("\n  [X] ERROR: Multi-target training requires --file")
-            print(f"      Targets specified: {targets}")
-            print(f"\n  Usage:")
-            print(f"      python demo.py --file your_data.csv --target {args.target}")
-            print(f"      python demo.py --file your_data.csv --target {args.target} --multi-output")
-            return
-        
-        print(f"\n  [INFO] Multiple targets detected: {targets}")
-        run_multi_target_training(
-            file_path=args.file,
-            targets=targets,
-            task=args.task,
-            exclude=args.exclude.split(",") if args.exclude else None,
-            multi_output=args.multi_output if hasattr(args, 'multi_output') else False,
-            run_benchmark=args.benchmark if hasattr(args, 'benchmark') else False,
-        )
-        return
-    
-    # Handle --predict flag: ALWAYS train fresh models first, then make predictions
-    # Note: --predict now implies training (no model caching/loading)
-    if args.predict:
-        # Check if --predict contains multiple targets (comma-separated)
-        if ',' in args.predict:
-            predict_targets = [t.strip() for t in args.predict.split(',')]
-            
-            # Determine if benchmarks should run (skip by default for multi-target unless explicitly asked)
-            run_benchmarks = args.benchmark and not getattr(args, 'skip_benchmark', False)
+        # Handle --force flag: clean up old models and reports
+        if getattr(args, 'force', False):
+            import glob
             
             print("\n" + "=" * 80)
-            print("  MULTI-TARGET AUTONOMOUS + PREDICTIONS")
+            print("  FORCE MODE: Cleaning up old models and reports...")
             print("=" * 80)
-            print(f"  Targets: {predict_targets}")
-            print(f"  Mode: Run autonomous pipeline for each target, then make predictions")
-            if run_benchmarks:
-                print("  Includes: EDA, Time Series, AutoML, Benchmarks for EACH target")
-                print("  WARNING: Benchmarks can take 10-30 minutes PER TARGET!")
-                print("           Use --skip-benchmark to skip this phase.")
+            
+            # Get base name for file-specific cleanup
+            if args.file:
+                base_name = os.path.splitext(os.path.basename(args.file))[0]
+                patterns = [
+                    f"reports/model_{base_name}*.pkl",
+                    f"reports/audit_{base_name}*.json",
+                    f"reports/autonomous_{base_name}*.json",
+                    f"reports/autonomous_{base_name}*.html",
+                    f"reports/predictions_{base_name}*.csv",
+                    f"reports/multi_target_{base_name}*.json",
+                    f"reports/multi_target_{base_name}*.html",
+                    f"reports/ts_benchmark_{base_name}*.html",
+                    f"reports/eda_{base_name}*.html",
+                ]
             else:
-                print("  Includes: EDA, Time Series, AutoML (benchmarks skipped for speed)")
-            print("=" * 80)
+                # Clean all reports if no specific file
+                patterns = [
+                    "reports/model_*.pkl",
+                    "reports/audit_*.json",
+                    "reports/autonomous_*.json",
+                    "reports/autonomous_*.html",
+                    "reports/predictions_*.csv",
+                    "reports/multi_target_*.json",
+                    "reports/multi_target_*.html",
+                    "reports/ts_benchmark_*.html",
+                    "reports/eda_*.html",
+                ]
+            
+            deleted_count = 0
+            for pattern in patterns:
+                for filepath in glob.glob(pattern):
+                    try:
+                        os.remove(filepath)
+                        print(f"    [DELETED] {filepath}")
+                        deleted_count += 1
+                    except Exception as e:
+                        print(f"    [WARN] Could not delete {filepath}: {e}")
+            
+            if deleted_count > 0:
+                print(f"\n  Cleaned {deleted_count} old files. Starting fresh training...")
+            else:
+                print(f"\n  No old files found. Starting fresh training...")
+            print("=" * 80 + "\n")
+        
+        # Check for multi-target training (when --predict is not specified)
+        if args.target and ',' in args.target and not args.predict:
+            targets = [t.strip() for t in args.target.split(',') if t.strip()]
             
             if not args.file:
                 print("\n  [X] ERROR: Multi-target training requires --file")
-                return
+                print(f"      Targets specified: {targets}")
+                print(f"\n  Usage:")
+                print(f"      python run_acdso.py --file your_data.csv --target {args.target}")
+                print(f"      python run_acdso.py --file your_data.csv --target {args.target} --multi-output")
+                sys.exit(1)
             
-            import os
-            import pandas as pd
-            import json
-            try:
-                import joblib
-            except ImportError:
-                import pickle as joblib
-            
-            df = pd.read_csv(args.file)
-            base_name = os.path.splitext(os.path.basename(args.file))[0]
-            
-            # Validate all target columns exist
-            invalid_targets = [t for t in predict_targets if t not in df.columns]
-            if invalid_targets:
-                print(f"\n  [X] ERROR: Target column(s) not found in dataset: {invalid_targets}")
-                print(f"      Available columns: {list(df.columns)}")
-                print(f"\n      Please use columns that exist in your dataset.")
-                return
-            
-            # Collect all results for combined report
-            all_target_results = {
-                "file": args.file,
-                "targets": predict_targets,
-                "mode": "multi_target_autonomous",
-                "target_reports": {},
-                "predictions": {},
-            }
-            
-            # Run autonomous pipeline for each target
-            for i, target in enumerate(predict_targets, 1):
-                print("\n" + "#" * 80)
-                print(f"#  TARGET {i}/{len(predict_targets)}: {target}")
+            print(f"\n  [INFO] Multiple targets detected: {targets}")
+            mt_res = run_multi_target_training(
+                file_path=args.file,
+                targets=targets,
+                task=args.task,
+                exclude=args.exclude.split(",") if args.exclude else None,
+                multi_output=args.multi_output if hasattr(args, 'multi_output') else False,
+                run_benchmark=effective_run_benchmark,
+                auto_exclude=effective_auto_exclude,
+            )
+            if mt_res is None:
+                sys.exit(1)
+            return
+        
+        # Handle --predict flag: ALWAYS train fresh models first, then make predictions
+        # Note: --predict now implies training (no model caching/loading)
+        if args.predict:
+            # Check if --predict contains multiple targets (comma-separated)
+            if ',' in args.predict:
+                predict_targets = [t.strip() for t in args.predict.split(',') if t.strip()]
+                if getattr(args, 'multi_output', False):
+                    print("\n  [WARN] --multi-output is not supported with --predict; running independent per-target autonomous pipelines.")
+                
+                # Determine if benchmarks should run
+                run_benchmarks = effective_run_benchmark
+                
+                print("\n" + "=" * 80)
+                print("  MULTI-TARGET AUTONOMOUS + PREDICTIONS")
+                print("=" * 80)
+                print(f"  Targets: {predict_targets}")
+                print(f"  Mode: Run autonomous pipeline for each target, then make predictions")
                 if run_benchmarks:
-                    print(f"#  Running FULL Autonomous Pipeline (EDA, Time Series, AutoML, Benchmarks)")
+                    print("  Includes: EDA, Time Series, AutoML, Benchmarks for EACH target")
+                    print("  WARNING: Benchmarks can take 10-30 minutes PER TARGET!")
+                    print("           Use --skip-benchmark to skip this phase.")
                 else:
-                    print(f"#  Running Autonomous Pipeline (EDA, Time Series, AutoML)")
-                print("#" * 80)
+                    print("  Includes: EDA, Time Series, AutoML (benchmarks skipped for speed)")
+                print("=" * 80)
                 
-                # Run autonomous demo for this target
-                run_autonomous_demo(
-                    custom_file=args.file,
-                    target=target,
-                    datetime_col=args.datetime_col,
-                    horizon=args.horizon,
-                    task=args.task,
-                    exclude=args.exclude.split(",") if args.exclude else None,
-                    run_benchmark=run_benchmarks,
-                    selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
-                )
+                if not args.file:
+                    print("\n  [X] ERROR: Multi-target training requires --file")
+                    sys.exit(1)
                 
-                # Store the report path for this target (includes target name suffix)
-                target_report_path = f"reports/autonomous_{base_name}_{target}_combined.json"
-                print(f"\n  Looking for report: {target_report_path}")
-                if os.path.exists(target_report_path):
-                    try:
-                        with open(target_report_path, 'r') as f:
-                            all_target_results["target_reports"][target] = json.load(f)
-                        print(f"  [OK] Loaded report for '{target}'")
-                    except Exception as e:
-                        print(f"  [X] Failed to load report for '{target}': {e}")
-                else:
-                    # Try alternative path without target suffix (might be overwritten)
-                    alt_report_path = f"reports/autonomous_{base_name}_combined.json"
-                    if os.path.exists(alt_report_path):
-                        try:
-                            with open(alt_report_path, 'r') as f:
-                                all_target_results["target_reports"][target] = json.load(f)
-                            print(f"  [OK] Loaded report from {alt_report_path}")
-                        except Exception as e:
-                            print(f"  [X] Failed to load alt report: {e}")
+                try:
+                    import joblib
+                except ImportError:
+                    import pickle as joblib
+                
+                try:
+                    df = load_user_file(args.file)
+                    _validate_dataframe_nonempty(df, args.file)
+                except Exception as e:
+                    print(f"\n  [X] ERROR: Could not load file '{args.file}': {e}")
+                    sys.exit(1)
+                base_name = os.path.splitext(os.path.basename(args.file))[0]
+                
+                # Validate all target columns exist
+                invalid_targets = [t for t in predict_targets if t not in df.columns]
+                if invalid_targets:
+                    print(f"\n  [X] ERROR: Target column(s) not found in dataset: {invalid_targets}")
+                    print(f"      Available columns: {list(df.columns)}")
+                    print(f"\n      Please use columns that exist in your dataset.")
+                    sys.exit(1)
+                
+                # Collect all results for combined report
+                all_target_results = {
+                    "file": args.file,
+                    "targets": predict_targets,
+                    "mode": "multi_target_autonomous",
+                    "target_reports": {},
+                    "predictions": {},
+                }
+                
+                total_mt_phases = len(predict_targets) * 9 + 2
+                
+                # Run autonomous pipeline for each target
+                for i, target in enumerate(predict_targets, 1):
+                    print("\n" + "#" * 80)
+                    print(f"#  TARGET {i}/{len(predict_targets)}: {target}")
+                    if run_benchmarks:
+                        print(f"#  Running FULL Autonomous Pipeline (EDA, Time Series, AutoML, Benchmarks)")
                     else:
-                        print(f"  [--] Report not found for '{target}'")
-            
-            # Make predictions for each target
-            print("\n" + "=" * 80)
-            print("  MAKING PREDICTIONS FOR ALL TARGETS")
-            print("=" * 80)
-            
-            for target in predict_targets:
-                # Look for target-specific model path first (used by autonomous mode)
-                target_model_path = f"reports/model_{base_name}_{target}.pkl"
-                # Fallback to generic model path
-                generic_model_path = f"reports/model_{base_name}.pkl"
-                actual_model_path = target_model_path if os.path.exists(target_model_path) else generic_model_path
+                        print(f"#  Running Autonomous Pipeline (EDA, Time Series, AutoML)")
+                    print("#" * 80)
+                    
+                    # Run autonomous demo for this target
+                    target_res = run_autonomous_demo(
+                        custom_file=args.file,
+                        target=target,
+                        datetime_col=args.datetime_col,
+                        horizon=args.horizon,
+                        task=args.task,
+                        exclude=args.exclude.split(",") if args.exclude else None,
+                        run_benchmark=run_benchmarks,
+                        selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
+                        skip_timeseries=effective_skip_ts,
+                        auto_exclude=effective_auto_exclude,
+                        phase_offset=(i - 1) * 9,
+                        total_phases=total_mt_phases,
+                    )
+                    if target_res is None:
+                        print(f"\n  [X] ERROR: Autonomous training failed for target '{target}'")
+                        sys.exit(1)
+                    
+                    # Store the report path for this target (includes target name suffix)
+                    target_report_path = f"reports/autonomous_{base_name}_{target}_combined.json"
+                    print(f"\n  Looking for report: {target_report_path}")
+                    if os.path.exists(target_report_path):
+                        try:
+                            with open(target_report_path, 'r', encoding='utf-8') as f:
+                                all_target_results["target_reports"][target] = json.load(f)
+                            print(f"  [OK] Loaded report for '{target}'")
+                        except Exception as e:
+                            print(f"  [X] Failed to load report for '{target}': {e}")
+                    else:
+                        # Try alternative path without target suffix (might be overwritten)
+                        alt_report_path = f"reports/autonomous_{base_name}_combined.json"
+                        if os.path.exists(alt_report_path):
+                            try:
+                                with open(alt_report_path, 'r', encoding='utf-8') as f:
+                                    all_target_results["target_reports"][target] = json.load(f)
+                                print(f"  [OK] Loaded report from {alt_report_path}")
+                            except Exception as e:
+                                print(f"  [X] Failed to load alt report: {e}")
+                        else:
+                            print(f"  [--] Report not found for '{target}'")
                 
-                if os.path.exists(actual_model_path):
+                # Make predictions for each target
+                pred_phase = total_mt_phases - 1
+                _render_phase_banner(pred_phase, total_mt_phases, "Multi-Target Predictions")
+                _emit_progress(pred_phase, total_mt_phases, "Multi-Target Predictions", "running")
+                print("\n" + "=" * 80)
+                print("  MAKING PREDICTIONS FOR ALL TARGETS")
+                print("=" * 80)
+                
+                os.makedirs("reports", exist_ok=True)
+                for target in predict_targets:
+                    # Look for target-specific model path first (used by autonomous mode)
+                    target_model_path = f"reports/model_{base_name}_{target}.pkl"
+                    # Fallback to generic model path
+                    generic_model_path = f"reports/model_{base_name}.pkl"
+                    actual_model_path = target_model_path if os.path.exists(target_model_path) else generic_model_path
+                    
+                    if not os.path.exists(actual_model_path):
+                        print(f"  [X] Model not found for '{target}': {actual_model_path}")
+                        _emit_progress(pred_phase, total_mt_phases, "Multi-Target Predictions", "error", detail=f"Model missing for {target}")
+                        sys.exit(1)
+                    
                     print(f"\n  Loading model for '{target}' from {actual_model_path}...")
                     model_data = joblib.load(actual_model_path)
                     model = model_data['model']
                     feature_columns = model_data['feature_columns']
                     task_type = model_data['task']
                     exclude_cols = model_data.get('exclude') or []  # Handle None
+                    datetime_col_saved = model_data.get('datetime_col')
                     
                     # Prepare features
-                    X = df.drop(columns=[target] + list(exclude_cols), errors='ignore')
-                    cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+                    drop_cols = [target] + list(exclude_cols)
+                    if datetime_col_saved:
+                        drop_cols.append(datetime_col_saved)
+                    X = df.drop(columns=drop_cols, errors='ignore')
+                    cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
                     if cat_cols:
-                        X = pd.get_dummies(X, columns=cat_cols, drop_first=True)
+                        X = _encode_categoricals_safe(
+                            X,
+                            cat_cols,
+                            encoding_meta=model_data.get('categorical_encoding'),
+                            feature_columns=feature_columns,
+                        )
                     
-                    # Align columns
-                    for col in feature_columns:
-                        if col not in X.columns:
-                            X[col] = 0
-                    X = X[feature_columns]
+                    # Align columns cleanly without DataFrame fragmentation
+                    X = X.reindex(columns=feature_columns, fill_value=0)
                     
                     # Predict
                     predictions = model.predict(X)
@@ -11271,12 +12254,13 @@ Supported file formats:
                     # Store prediction stats
                     if task_type == 'regression':
                         pred_stats = {
-                            "mean": float(predictions.mean()),
-                            "std": float(predictions.std()),
-                            "min": float(predictions.min()),
-                            "max": float(predictions.max()),
+                            "mean": _json_safe_scalar(predictions.mean()),
+                            "std": _json_safe_scalar(predictions.std()),
+                            "min": _json_safe_scalar(predictions.min()),
+                            "max": _json_safe_scalar(predictions.max()),
                         }
-                        print(f"      Mean: {pred_stats['mean']:.4f}, Std: {pred_stats['std']:.4f}")
+                        if pred_stats['mean'] is not None and pred_stats['std'] is not None:
+                            print(f"      Mean: {pred_stats['mean']:.4f}, Std: {pred_stats['std']:.4f}")
                     else:
                         from collections import Counter
                         dist = dict(Counter(predictions))
@@ -11288,399 +12272,445 @@ Supported file formats:
                         "count": len(predictions),
                         "statistics": pred_stats,
                     }
-                else:
-                    print(f"  [X] Model not found for '{target}': {actual_model_path}")
-            
-            # Generate combined multi-target HTML report
-            print("\n" + "=" * 80)
-            print("  GENERATING COMBINED MULTI-TARGET HTML REPORT")
-            print("=" * 80)
-            
-            combined_json_path = f"reports/multi_target_{base_name}_combined.json"
-            combined_html_path = f"reports/multi_target_{base_name}_combined_report.html"
-            
-            # Save combined JSON
-            with open(combined_json_path, 'w') as f:
-                json.dump(all_target_results, f, indent=2, default=str)
-            print(f"  [OK] Combined JSON: {os.path.abspath(combined_json_path)}")
-            
-            # Generate combined HTML
-            html_content = _generate_multi_target_html_report(all_target_results, base_name)
-            with open(combined_html_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            print(f"  [OK] Combined HTML: {os.path.abspath(combined_html_path)}")
-            
-            print("\n" + "=" * 80)
-            print("  MULTI-TARGET AUTONOMOUS + PREDICTIONS COMPLETE!")
-            print("=" * 80)
-            print(f"\n  Summary:")
-            print(f"    Targets processed: {len(predict_targets)}")
-            for target in predict_targets:
-                if target in all_target_results["predictions"]:
-                    stats = all_target_results["predictions"][target]
-                    print(f"    - {target}: {stats['count']} predictions")
-            print(f"\n  Reports:")
-            print(f"    JSON: {os.path.abspath(combined_json_path)}")
-            print(f"    HTML: {os.path.abspath(combined_html_path)}")
-            print("=" * 80 + "\n")
-            return
-        
-        # Single target case
-        # Run autonomous mode first to train and save the model
-        # Use --predict target as the training target if --target not explicitly provided
-        training_target = args.target if args.target else args.predict
-        
-        # Validate target column exists before proceeding
-        import pandas as pd
-        try:
-            df_check = pd.read_csv(args.file)
-            if training_target not in df_check.columns:
-                print(f"\n  [X] ERROR: Target column '{training_target}' not found in dataset!")
-                print(f"      Available columns: {list(df_check.columns)}")
-                print(f"\n      Please use one of the available columns with --predict or --target")
+                _emit_progress(pred_phase, total_mt_phases, "Multi-Target Predictions", "done")
+                
+                # Generate combined multi-target HTML report
+                _render_phase_banner(total_mt_phases, total_mt_phases, "Combined Report Generation")
+                _emit_progress(total_mt_phases, total_mt_phases, "Combined Report Generation", "running")
+                print("\n" + "=" * 80)
+                print("  GENERATING COMBINED MULTI-TARGET HTML REPORT")
+                print("=" * 80)
+                
+                combined_json_path = f"reports/multi_target_{base_name}_combined.json"
+                combined_html_path = f"reports/multi_target_{base_name}_combined_report.html"
+                
+                # Save combined JSON
+                with open(combined_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(_sanitize_json_payload(all_target_results), f, indent=2, allow_nan=False)
+                print(f"  [OK] Combined JSON: {os.path.abspath(combined_json_path)}")
+                
+                # Generate combined HTML
+                html_content = _generate_multi_target_html_report(all_target_results, base_name)
+                with open(combined_html_path, 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+                print(f"  [OK] Combined HTML: {os.path.abspath(combined_html_path)}")
+                
+                print("\n" + "=" * 80)
+                print("  MULTI-TARGET AUTONOMOUS + PREDICTIONS COMPLETE!")
+                print("=" * 80)
+                print(f"\n  Summary:")
+                print(f"    Targets processed: {len(predict_targets)}")
+                for target in predict_targets:
+                    if target in all_target_results["predictions"]:
+                        pred_info = all_target_results["predictions"][target]
+                        print(f"    - {target}: {pred_info['count']} predictions")
+                print(f"\n  Reports:")
+                print(f"    JSON: {os.path.abspath(combined_json_path)}")
+                print(f"    HTML: {os.path.abspath(combined_html_path)}")
+                print("=" * 80 + "\n")
+                _emit_progress(total_mt_phases, total_mt_phases, "Combined Report Generation", "done", detail=os.path.abspath(combined_html_path))
                 return
-        except Exception as e:
-            print(f"\n  [X] ERROR: Could not read file to validate target: {e}")
-            return
-        
-        print("\n" + "=" * 80)
-        print("  TRAINING MODEL FIRST (--autonomous), THEN MAKING PREDICTIONS (--predict)")
-        print("=" * 80)
-        print(f"  Training target: {training_target}")
-        print(f"  Prediction target: {args.predict}")
-        if training_target != args.predict:
-            print(f"  NOTE: Training on '{training_target}' but will predict '{args.predict}'")
-            print(f"        If you want to predict '{args.predict}', consider using --target {args.predict}")
-        run_autonomous_demo(
-            custom_file=args.file,
-            target=training_target,
-            datetime_col=args.datetime_col,
-            horizon=args.horizon,
-            task=args.task,
-            exclude=args.exclude.split(",") if args.exclude else None,
-            run_benchmark=args.benchmark,  # Use user's --benchmark flag
-            selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
-        )
-        # Now continue to prediction logic below
-        print("\n" + "=" * 80)
-        print("  MODEL TRAINING COMPLETE - NOW MAKING PREDICTIONS")
-        print("=" * 80)
-    
-    if args.predict:
-        if not args.file:
-            print("Error: --predict requires --file to specify the data file for predictions")
-            return
-        
-        print("\n" + "=" * 80)
-        print("  MAKING PREDICTIONS WITH BEST MODEL")
-        print("=" * 80)
-        
-        try:
-            import os
+            
+            # Single target case
+            if not args.file:
+                print("\n  [X] ERROR: --predict requires --file to specify the data file for predictions")
+                sys.exit(1)
+            
+            # Use --predict target as the training target if --target not explicitly provided (or if --target was a comma list)
+            training_target = args.target if (args.target and ',' not in args.target) else args.predict
+            
+            # Validate target column(s) exist before proceeding
             try:
-                import joblib
-            except ImportError:
-                import pickle as joblib
-            
-            import pandas as pd
-            
-            # Load the FULL dataset (all rows, no splitting)
-            df = pd.read_csv(args.file)
-            print(f"\n  [OK] Loaded FULL dataset: {args.file}")
-            print(f"      Shape: {df.shape[0]} rows x {df.shape[1]} columns")
-            print(f"      NOTE: Predictions will be made on ALL {df.shape[0]} rows (full dataset)")
-            
-            # Find the saved model - it was saved under training_target (see
-            # run_autonomous_demo's model_path above), which is args.target
-            # when given, not necessarily args.predict.
-            base_name = os.path.splitext(os.path.basename(args.file))[0]
-            target_model_path = f"reports/model_{base_name}_{training_target}.pkl"
-            generic_model_path = f"reports/model_{base_name}.pkl"
-            
-            if os.path.exists(target_model_path):
-                model_path = target_model_path
-            elif os.path.exists(generic_model_path):
-                model_path = generic_model_path
-            else:
-                print(f"\n  [X] Model not found. Checked:")
-                print(f"      - {target_model_path}")
-                print(f"      - {generic_model_path}")
-                print(f"      Please train a model first using --autonomous --file {args.file}")
-                return
-            
-            # Load the model
-            print(f"\n  Loading model from: {model_path}")
-            model_data = joblib.load(model_path)
-            model = model_data['model']
-            original_target = model_data['target']
-            task = model_data['task']
-            feature_columns = model_data['feature_columns']
-            datetime_col = model_data.get('datetime_col')
-            exclude = model_data.get('exclude') or []  # Handle None
-            
-            print(f"  Original training target: {original_target}")
-            print(f"  Task type: {task}")
-            print(f"  Prediction target column: {args.predict}")
-            
-            # Check if prediction target matches training target
-            if original_target != args.predict:
-                print(f"\n  [WARNING] Mismatch detected!")
-                print(f"      Model was trained to predict: '{original_target}'")
-                print(f"      You requested predictions for: '{args.predict}'")
-                print(f"      The model will predict '{original_target}' values.")
-                print(f"      If you want to predict '{args.predict}', retrain with: --target {args.predict}")
-                print(f"\n  [INFO] Proceeding to predict '{original_target}' (the trained target)...")
-                # Use the original target for predictions
-                actual_predict_target = original_target
-            else:
-                actual_predict_target = args.predict
-            
-            # Prepare features for FULL dataset (same preprocessing as training)
-            # Use ALL rows - no train/test split for predictions
-            # Drop the actual prediction target (not args.predict if they differ)
-            X = df.drop(columns=[actual_predict_target] if actual_predict_target in df.columns else [])
-            if datetime_col and datetime_col in X.columns:
-                X = X.drop(columns=[datetime_col])
-            if exclude:
-                X = X.drop(columns=[c for c in exclude if c in X.columns], errors='ignore')
-            
-            # Encode categorical columns (same as training)
-            cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
-            if cat_cols:
-                X_encoded = pd.get_dummies(X, columns=cat_cols, drop_first=True)
-            else:
-                X_encoded = X.copy()
-            
-            # Align columns with training data
-            # Add missing columns (fill with 0)
-            missing_cols = set(feature_columns) - set(X_encoded.columns)
-            for col in missing_cols:
-                X_encoded[col] = 0
-            
-            # Remove extra columns
-            X_encoded = X_encoded[feature_columns]
-            
-            print(f"\n  Making predictions on FULL dataset: {len(X_encoded)} samples (all rows)...")
-            
-            # Make predictions on FULL dataset
-            predictions = model.predict(X_encoded)
-            
-            # Create results dataframe with FULL dataset + predictions
-            results_df = df.copy()  # Keep all original data
-            # Use actual_predict_target for the column name, but show what was requested
-            if actual_predict_target != args.predict:
-                results_df[f'{original_target}_predicted'] = predictions
-                print(f"\n  [NOTE] Predictions saved as '{original_target}_predicted' (model's training target)")
-            else:
-                results_df[f'{args.predict}_predicted'] = predictions
-            
-            # Add probabilities for classification
-            if task == 'classification' and hasattr(model, 'predict_proba'):
-                proba = model.predict_proba(X_encoded)
-                if proba.shape[1] == 2:  # Binary classification
-                    results_df[f'{args.predict}_probability'] = proba[:, 1]
-                else:  # Multi-class
-                    for i in range(proba.shape[1]):
-                        results_df[f'{args.predict}_prob_class_{i}'] = proba[:, i]
-            
-            # Save predictions for FULL dataset
-            # Use actual prediction target in filename
-            output_path = f"reports/predictions_{base_name}_{actual_predict_target}_full_dataset.csv"
-            results_df.to_csv(output_path, index=False)
-            
-            print(f"\n  [OK] Predictions saved to: {output_path}")
-            print(f"      Total predictions: {len(predictions)} (FULL dataset - all {df.shape[0]} rows)")
-            
-            # Show summary statistics for FULL dataset
-            if task == 'regression':
-                print(f"\n  Prediction Statistics (Full Dataset):")
-                print(f"      Mean: {predictions.mean():.4f}")
-                print(f"      Std:  {predictions.std():.4f}")
-                print(f"      Min:  {predictions.min():.4f}")
-                print(f"      Max:  {predictions.max():.4f}")
-                print(f"      Range: [{predictions.min():.4f}, {predictions.max():.4f}]")
-            else:
-                from collections import Counter
-                pred_counts = Counter(predictions)
-                print(f"\n  Prediction Distribution (Full Dataset):")
-                for pred, count in pred_counts.most_common():
-                    print(f"      Class {pred}: {count} ({count/len(predictions)*100:.1f}%)")
+                df_check = load_user_file(args.file)
+                _validate_dataframe_nonempty(df_check, args.file)
+                if training_target not in df_check.columns:
+                    print(f"\n  [X] ERROR: Target column '{training_target}' not found in dataset!")
+                    print(f"      Available columns: {list(df_check.columns)}")
+                    print(f"\n      Please use one of the available columns with --predict or --target")
+                    sys.exit(1)
+                if args.predict not in df_check.columns:
+                    print(f"\n  [X] ERROR: Prediction column '{args.predict}' not found in dataset!")
+                    print(f"      Available columns: {list(df_check.columns)}")
+                    print(f"\n      Please use one of the available columns with --predict")
+                    sys.exit(1)
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"\n  [X] ERROR: Could not read file to validate target: {e}")
+                sys.exit(1)
             
             print("\n" + "=" * 80)
-            print(f"  PREDICTIONS COMPLETE ON FULL DATASET ({len(predictions)} rows)!")
-            print("=" * 80 + "\n")
+            print("  TRAINING MODEL FIRST (--autonomous), THEN MAKING PREDICTIONS (--predict)")
+            print("=" * 80)
+            print(f"  Training target: {training_target}")
+            print(f"  Prediction target: {args.predict}")
+            if training_target != args.predict:
+                print(f"  NOTE: Training on '{training_target}' but will predict '{args.predict}'")
+                print(f"        If you want to predict '{args.predict}', consider using --target {args.predict}")
+            train_res = run_autonomous_demo(
+                custom_file=args.file,
+                target=training_target,
+                datetime_col=args.datetime_col,
+                horizon=args.horizon,
+                task=args.task,
+                exclude=args.exclude.split(",") if args.exclude else None,
+                run_benchmark=effective_run_benchmark,
+                selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
+                skip_timeseries=effective_skip_ts,
+                auto_exclude=effective_auto_exclude,
+                phase_offset=0,
+                total_phases=10,
+            )
+            if train_res is None:
+                print("\n  [X] ERROR: Training pipeline failed before predictions.")
+                sys.exit(1)
+            # Now continue to prediction logic below
+            print("\n" + "=" * 80)
+            print("  MODEL TRAINING COMPLETE - NOW MAKING PREDICTIONS")
+            print("=" * 80)
+        
+        if args.predict:
+            if not args.file:
+                print("Error: --predict requires --file to specify the data file for predictions")
+                sys.exit(1)
             
-            # Update the combined report with prediction results if it exists
-            json_report_path = f"reports/autonomous_{base_name}_combined.json"
-            if os.path.exists(json_report_path):
+            _render_phase_banner(10, 10, "Predictions & Report Update")
+            _emit_progress(10, 10, "Predictions & Report Update", "running")
+            print("\n" + "=" * 80)
+            print("  MAKING PREDICTIONS WITH BEST MODEL")
+            print("=" * 80)
+            
+            try:
                 try:
-                    # Load existing combined report
-                    with open(json_report_path, 'r', encoding='utf-8') as f:
-                        combined_report = json.load(f)
-                    
-                    # Add prediction results to combined report
+                    import joblib
+                except ImportError:
+                    import pickle as joblib
+                
+                # Load the FULL dataset (all rows, no splitting)
+                df = load_user_file(args.file)
+                _validate_dataframe_nonempty(df, args.file)
+                print(f"\n  [OK] Loaded FULL dataset: {args.file}")
+                print(f"      Shape: {df.shape[0]} rows x {df.shape[1]} columns")
+                print(f"      NOTE: Predictions will be made on ALL {df.shape[0]} rows (full dataset)")
+                
+                # Find the saved model - it was saved under training_target (see
+                # run_autonomous_demo's model_path above), which is args.target
+                # when given, not necessarily args.predict.
+                base_name = os.path.splitext(os.path.basename(args.file))[0]
+                target_model_path = f"reports/model_{base_name}_{training_target}.pkl"
+                generic_model_path = f"reports/model_{base_name}.pkl"
+                
+                if os.path.exists(target_model_path):
+                    model_path = target_model_path
+                elif os.path.exists(generic_model_path):
+                    model_path = generic_model_path
+                else:
+                    print(f"\n  [X] Model not found. Checked:")
+                    print(f"      - {target_model_path}")
+                    print(f"      - {generic_model_path}")
+                    print(f"      Please train a model first using --autonomous --file {args.file}")
+                    _emit_progress(10, 10, "Predictions & Report Update", "error", detail="Model not found")
+                    sys.exit(1)
+                
+                # Load the model
+                print(f"\n  Loading model from: {model_path}")
+                model_data = joblib.load(model_path)
+                model = model_data['model']
+                original_target = model_data['target']
+                task = model_data['task']
+                feature_columns = model_data['feature_columns']
+                datetime_col = model_data.get('datetime_col')
+                exclude = model_data.get('exclude') or []  # Handle None
+                
+                print(f"  Original training target: {original_target}")
+                print(f"  Task type: {task}")
+                print(f"  Prediction target column: {args.predict}")
+                
+                # Check if prediction target matches training target
+                if original_target != args.predict:
+                    print(f"\n  [WARNING] Mismatch detected!")
+                    print(f"      Model was trained to predict: '{original_target}'")
+                    print(f"      You requested predictions for: '{args.predict}'")
+                    print(f"      The model will predict '{original_target}' values.")
+                    print(f"      If you want to predict '{args.predict}', retrain with: --target {args.predict}")
+                    print(f"\n  [INFO] Proceeding to predict '{original_target}' (the trained target)...")
+                    # Use the original target for predictions
+                    actual_predict_target = original_target
+                else:
+                    actual_predict_target = args.predict
+                
+                # Prepare features for FULL dataset (same preprocessing as training)
+                # Use ALL rows - no train/test split for predictions
+                X = df.drop(columns=[actual_predict_target] if actual_predict_target in df.columns else [])
+                if datetime_col and datetime_col in X.columns:
+                    X = X.drop(columns=[datetime_col])
+                if exclude:
+                    X = X.drop(columns=[c for c in exclude if c in X.columns], errors='ignore')
+                
+                # Encode categorical columns consistently with training
+                cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+                if cat_cols:
+                    X_encoded = _encode_categoricals_safe(
+                        X,
+                        cat_cols,
+                        encoding_meta=model_data.get('categorical_encoding'),
+                        feature_columns=feature_columns,
+                    )
+                else:
+                    X_encoded = X.copy()
+                
+                # Align columns with training data without fragmentation
+                X_encoded = X_encoded.reindex(columns=feature_columns, fill_value=0)
+                
+                print(f"\n  Making predictions on FULL dataset: {len(X_encoded)} samples (all rows)...")
+                
+                # Make predictions on FULL dataset
+                predictions = model.predict(X_encoded)
+                
+                # Create results dataframe with FULL dataset + predictions
+                results_df = df.copy()  # Keep all original data
+                pred_col_prefix = original_target if actual_predict_target != args.predict else args.predict
+                results_df[f'{pred_col_prefix}_predicted'] = predictions
+                if actual_predict_target != args.predict:
+                    print(f"\n  [NOTE] Predictions saved as '{original_target}_predicted' (model's training target)")
+                
+                # Add probabilities for classification
+                if task == 'classification' and hasattr(model, 'predict_proba'):
+                    proba = model.predict_proba(X_encoded)
+                    if proba.shape[1] == 2:  # Binary classification
+                        results_df[f'{pred_col_prefix}_probability'] = proba[:, 1]
+                    else:  # Multi-class
+                        for i in range(proba.shape[1]):
+                            results_df[f'{pred_col_prefix}_prob_class_{i}'] = proba[:, i]
+                
+                # Save predictions for FULL dataset
+                os.makedirs("reports", exist_ok=True)
+                output_path = f"reports/predictions_{base_name}_{actual_predict_target}_full_dataset.csv"
+                results_df.to_csv(output_path, index=False)
+                
+                print(f"\n  [OK] Predictions saved to: {output_path}")
+                print(f"      Total predictions: {len(predictions)} (FULL dataset - all {df.shape[0]} rows)")
+                
+                # Show summary statistics for FULL dataset
+                if task == 'regression':
+                    print(f"\n  Prediction Statistics (Full Dataset):")
+                    print(f"      Mean: {predictions.mean():.4f}")
+                    print(f"      Std:  {predictions.std():.4f}")
+                    print(f"      Min:  {predictions.min():.4f}")
+                    print(f"      Max:  {predictions.max():.4f}")
+                    print(f"      Range: [{predictions.min():.4f}, {predictions.max():.4f}]")
+                else:
                     from collections import Counter
-                    pred_stats = {}
-                    if task == 'regression':
-                        pred_stats = {
-                            "mean": float(predictions.mean()),
-                            "std": float(predictions.std()),
-                            "min": float(predictions.min()),
-                            "max": float(predictions.max()),
-                        }
-                    else:
-                        pred_counts = Counter(predictions)
-                        pred_stats = {
-                            "distribution": {str(k): int(v) for k, v in pred_counts.items()},
-                            "total_classes": len(pred_counts),
-                        }
-                    
-                    # Store sample of actual predicted values (first 20 and last 5)
-                    sample_predictions = []
-                    n_samples = min(20, len(predictions))
-                    for idx in range(n_samples):
-                        sample_predictions.append({
-                            "row": idx,
-                            "predicted": float(predictions[idx]) if isinstance(predictions[idx], (int, float, np.floating, np.integer)) else str(predictions[idx]),
-                            "actual": float(results_df[actual_predict_target].iloc[idx]) if actual_predict_target in results_df.columns and idx < len(results_df) else None,
-                        })
-                    
-                    # Add last few predictions if dataset is larger
-                    if len(predictions) > 25:
-                        for idx in range(len(predictions) - 5, len(predictions)):
+                    pred_counts = Counter(predictions)
+                    print(f"\n  Prediction Distribution (Full Dataset):")
+                    for pred, count in pred_counts.most_common():
+                        print(f"      Class {pred}: {count} ({count/len(predictions)*100:.1f}%)")
+                
+                print("\n" + "=" * 80)
+                print(f"  PREDICTIONS COMPLETE ON FULL DATASET ({len(predictions)} rows)!")
+                print("=" * 80 + "\n")
+                
+                # Update the combined report with prediction results (target-specific path first)
+                target_json_path = f"reports/autonomous_{base_name}_{training_target}_combined.json"
+                generic_json_path = f"reports/autonomous_{base_name}_combined.json"
+                if os.path.exists(target_json_path):
+                    json_report_path = target_json_path
+                    html_report_path = f"reports/autonomous_{base_name}_{training_target}_report.html"
+                else:
+                    json_report_path = generic_json_path
+                    html_report_path = f"reports/autonomous_{base_name}_report.html"
+                
+                if os.path.exists(json_report_path):
+                    try:
+                        with open(json_report_path, 'r', encoding='utf-8') as f:
+                            combined_report = json.load(f)
+                        
+                        from collections import Counter
+                        pred_stats = {}
+                        if task == 'regression':
+                            pred_stats = {
+                                "mean": _json_safe_scalar(predictions.mean()),
+                                "std": _json_safe_scalar(predictions.std()),
+                                "min": _json_safe_scalar(predictions.min()),
+                                "max": _json_safe_scalar(predictions.max()),
+                            }
+                        else:
+                            pred_counts = Counter(predictions)
+                            pred_stats = {
+                                "distribution": {str(k): int(v) for k, v in pred_counts.items()},
+                                "total_classes": len(pred_counts),
+                            }
+                        
+                        sample_predictions = []
+                        n_samples = min(20, len(predictions))
+                        has_actual_col = actual_predict_target in results_df.columns
+                        for idx in range(n_samples):
+                            actual_val = (
+                                _json_safe_scalar(results_df[actual_predict_target].iloc[idx])
+                                if has_actual_col and idx < len(results_df)
+                                else None
+                            )
                             sample_predictions.append({
                                 "row": idx,
-                                "predicted": float(predictions[idx]) if isinstance(predictions[idx], (int, float, np.floating, np.integer)) else str(predictions[idx]),
-                                "actual": float(results_df[actual_predict_target].iloc[idx]) if actual_predict_target in results_df.columns and idx < len(results_df) else None,
+                                "predicted": _json_safe_scalar(predictions[idx]),
+                                "actual": actual_val,
                             })
-                    
-                    combined_report["predictions"] = {
-                        "target_column": actual_predict_target,
-                        "requested_target": args.predict,
-                        "original_training_target": original_target,
-                        "total_predictions": len(predictions),
-                        "output_file": os.path.abspath(output_path),  # Use absolute path
-                        "task": task,
-                        "statistics": pred_stats,
-                        "sample_values": sample_predictions,
-                    }
-                    
-                    # Save updated combined report
-                    save_combined_report(combined_report, json_report_path)
-                    
-                    # Regenerate HTML report with predictions included
-                    html_report_path = f"reports/autonomous_{base_name}_report.html"
-                    generate_html_report_from_combined(combined_report, html_report_path)
-                    
-                    # Print absolute paths
-                    json_abs_path = os.path.abspath(json_report_path)
-                    html_abs_path = os.path.abspath(html_report_path)
-                    
-                    print(f"\n  [OK] Combined report updated with predictions: {json_abs_path}")
-                    print(f"  [OK] HTML report updated: {html_abs_path}")
-                except Exception as e:
-                    print(f"\n  [--] Could not update combined report: {e}")
-            
-        except Exception as e:
-            print(f"\n  [X] Prediction failed: {e}")
-            import traceback
-            traceback.print_exc()
+                        
+                        if len(predictions) > 25:
+                            for idx in range(len(predictions) - 5, len(predictions)):
+                                actual_val = (
+                                    _json_safe_scalar(results_df[actual_predict_target].iloc[idx])
+                                    if has_actual_col and idx < len(results_df)
+                                    else None
+                                )
+                                sample_predictions.append({
+                                    "row": idx,
+                                    "predicted": _json_safe_scalar(predictions[idx]),
+                                    "actual": actual_val,
+                                })
+                        
+                        combined_report["predictions"] = {
+                            "target_column": actual_predict_target,
+                            "requested_target": args.predict,
+                            "original_training_target": original_target,
+                            "total_predictions": len(predictions),
+                            "output_file": os.path.abspath(output_path),
+                            "task": task,
+                            "statistics": pred_stats,
+                            "sample_values": sample_predictions,
+                        }
+                        combined_report["html_report_path"] = os.path.abspath(html_report_path)
+                        combined_report["json_report_path"] = os.path.abspath(json_report_path)
+                        
+                        save_combined_report(combined_report, json_report_path)
+                        generate_html_report_from_combined(combined_report, html_report_path)
+                        
+                        json_abs_path = os.path.abspath(json_report_path)
+                        html_abs_path = os.path.abspath(html_report_path)
+                        
+                        print(f"\n  [OK] Combined report updated with predictions: {json_abs_path}")
+                        print(f"  [OK] HTML report updated: {html_abs_path}")
+                    except Exception as e:
+                        print(f"\n  [--] Could not update combined report: {e}")
+                
+                _emit_progress(10, 10, "Predictions & Report Update", "done", detail=os.path.abspath(output_path))
+                
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"\n  [X] Prediction failed: {e}")
+                import traceback
+                traceback.print_exc()
+                _emit_progress(10, 10, "Predictions & Report Update", "error", detail=str(e))
+                sys.exit(1)
+        
+        if args.predict:
             return
-    
-    # If we ran --predict (which now implies training), don't run any other demos
-    if args.predict:
-        return
 
-    # Explicit single-purpose mode flags take priority over --autonomous.
-    # --autonomous defaults to True with no way to turn it off (there is no
-    # --no-autonomous), so it used to win this dispatch unconditionally --
-    # v3/policy/decision/timeseries/all/the no-file --benchmark path could
-    # never run for any input. Checking them first, before the
-    # --autonomous fallback, makes each one do what its own help text has
-    # always claimed, without changing the default (still autonomous)
-    # behavior for anyone who isn't explicitly requesting one of these.
-    if args.v3:
-        # Run v3 innovations demo only
-        demo_v3_innovations()
-    elif args.policy:
-        # Run Policy Learning demo
-        demo_policy_learning()
-    elif args.decision:
-        # Run Decision Intelligence demo
-        run_decision_intelligence_demo(
-            file_path=args.file,
-            target=args.target,
-            treatment=args.treatment,
-            budget=args.budget,
-        )
-    elif args.timeseries:
-        # Run Time Series demo
-        run_timeseries_demo(
-            file_path=args.file,
-            target=args.target,
-            datetime_col=args.datetime_col,
-            horizon=args.horizon,
-        )
-    elif args.benchmark:
-        # If --file is provided, run FULL autonomous pipeline with benchmarks
-        # This ensures ONE combined report with EDA, AutoML, Time Series, and Benchmarks
-        if args.file:
-            print("\n" + "=" * 80)
-            print("  BENCHMARK MODE WITH CUSTOM FILE")
-            print("  Running FULL pipeline: EDA → Risk → AutoML → Time Series → Benchmarks")
-            print("  Output: ONE combined report with all results")
-            print("=" * 80 + "\n")
+        if args.v3:
+            _render_phase_banner(1, 1, "ACDSO v3 Innovations")
+            _emit_progress(1, 1, "ACDSO v3 Innovations", "running")
+            demo_v3_innovations()
+            _emit_progress(1, 1, "ACDSO v3 Innovations", "done")
+        elif args.policy:
+            _render_phase_banner(1, 1, "Policy Learning")
+            _emit_progress(1, 1, "Policy Learning", "running")
+            demo_policy_learning()
+            _emit_progress(1, 1, "Policy Learning", "done")
+        elif args.decision:
+            ok = run_decision_intelligence_demo(
+                file_path=args.file,
+                target=args.target,
+                treatment=args.treatment,
+                budget=args.budget,
+            )
+            if not ok:
+                sys.exit(1)
+        elif args.timeseries:
+            ok = run_timeseries_demo(
+                file_path=args.file,
+                target=args.target,
+                datetime_col=args.datetime_col,
+                horizon=args.horizon,
+            )
+            if not ok:
+                sys.exit(1)
+        elif args.benchmark:
+            if args.file:
+                print("\n" + "=" * 80)
+                print("  BENCHMARK MODE WITH CUSTOM FILE")
+                print("  Running FULL pipeline: EDA → Risk → AutoML → Time Series → Benchmarks")
+                print("  Output: ONE combined report with all results")
+                print("=" * 80 + "\n")
 
-            # Use _run_autonomous_custom_file which handles single file with all phases
-            _run_autonomous_custom_file(
+                res = _run_autonomous_custom_file(
+                    custom_file=args.file,
+                    target=args.target,
+                    datetime_col=args.datetime_col,
+                    horizon=args.horizon,
+                    task=args.task,
+                    exclude=args.exclude.split(",") if args.exclude else None,
+                    run_benchmark=effective_run_benchmark,
+                    skip_timeseries=effective_skip_ts,
+                    has_llm=bool(os.environ.get('OPENAI_API_KEY')),
+                    start_time=time.time(),
+                    selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
+                    auto_exclude=effective_auto_exclude,
+                )
+                if res is None:
+                    sys.exit(1)
+            else:
+                res = run_benchmark_only(
+                    time_budget=args.time_budget,
+                    datasets=args.datasets,
+                    output=args.output,
+                    custom_file=None,
+                    target=args.target,
+                    task=args.task,
+                    exclude=args.exclude.split(",") if args.exclude else None,
+                    auto_exclude=effective_auto_exclude,
+                )
+                if res is None:
+                    sys.exit(1)
+        elif args.all:
+            run_all_demos()
+        elif args.autonomous:
+            res = run_autonomous_demo(
                 custom_file=args.file,
                 target=args.target,
+                datetime_col=args.datetime_col,
+                horizon=args.horizon,
                 task=args.task,
                 exclude=args.exclude.split(",") if args.exclude else None,
-                run_benchmark=True,  # Enable benchmarks
-                has_llm=bool(os.environ.get('OPENAI_API_KEY')),
-                start_time=time.time(),
+                run_benchmark=effective_run_benchmark,
                 selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
+                skip_timeseries=effective_skip_ts,
+                auto_exclude=effective_auto_exclude,
             )
-        else:
-            # Run benchmark comparison on built-in datasets only
-            run_benchmark_only(
-                time_budget=args.time_budget,
-                datasets=args.datasets,
-                output=args.output,
-                custom_file=None,
+            if res is None:
+                sys.exit(1)
+        elif args.file:
+            res = demo_user_file(
+                args.file,
                 target=args.target,
                 task=args.task,
-                exclude=args.exclude.split(",") if args.exclude else None,
+                auto_exclude=effective_auto_exclude,
+                manual_exclude=args.exclude.split(",") if args.exclude else None,
             )
-    elif args.all:
-        # Explicitly requested: ignore any uploaded file, run bundled demos.
-        run_all_demos()
-    elif args.autonomous:
-        # AUTONOMOUS MODE [DEFAULT]: Run EVERYTHING with optional custom file
-        # Always run benchmarks in autonomous mode
-        run_autonomous_demo(
-            custom_file=args.file,
-            target=args.target,
-            datetime_col=args.datetime_col,
-            horizon=args.horizon,
-            task=args.task,
-            exclude=args.exclude.split(",") if args.exclude else None,
-            run_benchmark=True,  # Always run benchmarks in autonomous mode
-            selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
-        )
-    elif args.file:
-        # Run demo on user file (without benchmark)
-        demo_user_file(
-            args.file, 
-            target=args.target, 
-            task=args.task,
-            auto_exclude=not args.no_auto_exclude,
-            manual_exclude=args.exclude.split(",") if args.exclude else None
-        )
-    else:
-        # Run all built-in demos
-        run_all_demos()
+            if res is None:
+                sys.exit(1)
+        else:
+            run_all_demos()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\n  [X] Interrupted by user.")
+        sys.exit(130)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: {exc}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

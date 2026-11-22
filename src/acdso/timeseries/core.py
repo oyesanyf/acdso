@@ -25,7 +25,10 @@ Usage:
 
 from __future__ import annotations
 
+import pickle
+import sys
 import time
+import tracemalloc
 import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -46,6 +49,7 @@ from .transformers import (
     DateTimeFeatureTransformer,
     TimeSeriesFeatureUnion,
     create_ts_feature_pipeline,
+    _coerce_datetime_series,
 )
 from .metrics import (
     mae,
@@ -67,6 +71,64 @@ from .candidates import (
     SeasonalNaiveForecaster,
     get_default_candidates,
 )
+
+
+def _is_numeric_series(s: pd.Series) -> bool:
+    """Return True for numeric/boolean pandas Series, excluding datetime/timedelta/categorical/string."""
+    return bool(
+        pd.api.types.is_numeric_dtype(s)
+        and not pd.api.types.is_datetime64_any_dtype(s)
+        and not pd.api.types.is_timedelta64_dtype(s)
+    )
+
+
+def _deep_sizeof(obj: Any, seen: Optional[set] = None) -> int:
+    """Recursively estimate in-memory byte footprint of an object."""
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    total = sys.getsizeof(obj)
+    if isinstance(obj, np.ndarray):
+        total += int(obj.nbytes)
+        return total
+    if isinstance(obj, (pd.DataFrame, pd.Series)):
+        try:
+            total += int(obj.memory_usage(deep=False).sum())
+        except Exception:
+            pass
+        return total
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            total += _deep_sizeof(k, seen) + _deep_sizeof(v, seen)
+        return total
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        for item in obj:
+            total += _deep_sizeof(item, seen)
+        return total
+    if hasattr(obj, "__dict__"):
+        total += _deep_sizeof(obj.__dict__, seen)
+    slots = getattr(type(obj), "__slots__", None)
+    if slots:
+        for slot in (slots if isinstance(slots, (tuple, list)) else (slots,)):
+            if hasattr(obj, slot):
+                total += _deep_sizeof(getattr(obj, slot), seen)
+    return total
+
+
+def _estimate_model_memory_bytes(model: Any) -> int:
+    """Estimate fitted forecasting model memory footprint in bytes."""
+    if model is None:
+        return 0
+    base = sys.getsizeof(model)
+    try:
+        serialized_size = len(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL))
+        return max(base, serialized_size)
+    except Exception:
+        return max(base, _deep_sizeof(model))
 
 
 @dataclass
@@ -232,11 +294,19 @@ class AutoTS:
         Whether to include baseline models.
     include_statistical : bool, default=False
         Whether to include statistical models (requires statsmodels).
+    include_timesfm : bool, default=False
+        Whether to include Google's TimesFM pretrained foundation model
+        (requires ``pip install timesfm[torch]``). Off by default: heavy
+        optional dependency, and only added as a candidate when the
+        training series is long enough to matter (see
+        ``TimesFMForecaster.min_context_length`` in candidates.py) -- on
+        this project's typical short aggregated series it would be
+        skipped even with this flag on.
     verbose : bool, default=True
         Whether to print progress.
     random_state : int, default=42
         Random seed.
-    
+
     Example
     -------
     >>> ts = AutoTS(
@@ -249,7 +319,7 @@ class AutoTS:
     >>> print(result.summary())
     >>> forecast = result.predict(df_future)
     """
-    
+
     def __init__(
         self,
         datetime_col: str,
@@ -262,6 +332,7 @@ class AutoTS:
         time_budget: Optional[int] = None,
         include_baselines: bool = True,
         include_statistical: bool = False,
+        include_timesfm: bool = False,
         verbose: bool = True,
         random_state: int = 42,
     ):
@@ -275,6 +346,7 @@ class AutoTS:
         self.time_budget = time_budget
         self.include_baselines = include_baselines
         self.include_statistical = include_statistical
+        self.include_timesfm = include_timesfm
         self.verbose = verbose
         self.random_state = random_state
         
@@ -317,7 +389,7 @@ class AutoTS:
             print("=" * 60)
         
         # Step 1: Validate and prepare data
-        df = self._prepare_data(df)
+        df = self._prepare_data(df, feature_cols=feature_cols)
         
         # Step 2: Risk analysis
         if self.verbose:
@@ -363,7 +435,13 @@ class AutoTS:
         # Step 5: Select best
         if self.verbose:
             print("\n[4/4] Selecting best pipeline...")
-        
+
+        fitted_pipelines = [p for p in fitted_pipelines if np.isfinite(p.cv_score)]
+        if not fitted_pipelines:
+            raise RuntimeError(
+                "No time series candidate pipelines succeeded within the configured constraints/time budget."
+            )
+
         fitted_pipelines.sort(key=lambda p: p.cv_score)
         best_pipeline = fitted_pipelines[0]
         
@@ -409,7 +487,11 @@ class AutoTS:
         
         return self._result
     
-    def _prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _prepare_data(
+        self,
+        df: pd.DataFrame,
+        feature_cols: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
         """Validate and prepare the data."""
         df = df.copy()
         
@@ -419,20 +501,39 @@ class AutoTS:
         if self.target_col not in df.columns:
             raise ValueError(f"Target column '{self.target_col}' not found")
         
-        # Convert to datetime
-        df[self.datetime_col] = pd.to_datetime(df[self.datetime_col])
+        # Convert to datetime (handling tz-aware / mixed-offset / DST ISO-8601 strings)
+        df[self.datetime_col] = _coerce_datetime_series(df[self.datetime_col])
         
         # Sort by time
         df = df.sort_values(self.datetime_col).reset_index(drop=True)
         
-        # Drop non-numeric columns except datetime and target to avoid dtype issues
-        # Keep only: datetime_col, target_col, and numeric columns
+        # Drop non-numeric columns except datetime and target to avoid dtype issues.
+        # When feature_cols is provided, retain only those explicit exogenous numeric columns.
         cols_to_keep = [self.datetime_col, self.target_col]
+        allowed_exog = set(feature_cols) if feature_cols is not None else None
         for col in df.columns:
             if col not in cols_to_keep:
-                if np.issubdtype(df[col].dtype, np.number):
+                if allowed_exog is not None and col not in allowed_exog:
+                    continue
+                if _is_numeric_series(df[col]):
                     cols_to_keep.append(col)
         df = df[cols_to_keep]
+
+        # Coerce target and retained numeric/extension columns (Int64, Float64, boolean, etc.)
+        # cleanly to float64, normalizing pd.NA and +/-inf to np.nan.
+        for col in cols_to_keep:
+            if col == self.datetime_col:
+                continue
+            coerced = (
+                pd.to_numeric(df[col], errors="coerce")
+                .astype(np.float64)
+                .replace([np.inf, -np.inf], np.nan)
+            )
+            if col != self.target_col:
+                coerced = coerced.ffill().bfill().fillna(0.0)
+            df[col] = coerced
+
+        df = df.dropna(subset=[self.target_col]).reset_index(drop=True)
         
         # Check for sufficient data
         min_samples = max(30, self.horizon * 3)
@@ -456,8 +557,10 @@ class AutoTS:
             seasonality=self.seasonality or 7,
             include_baselines=self.include_baselines,
             include_statistical=self.include_statistical,
+            include_timesfm=self.include_timesfm,
+            n_samples=len(df),
         )
-        
+
         return generator.generate()
     
     def _evaluate_candidates(
@@ -520,71 +623,85 @@ class AutoTS:
         scores = []
         fit_times = []
         predict_times = []
-        
+
         # Handle baseline models differently (they work on y directly)
         is_baseline = candidate.family == 'baseline'
-        
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            
-            # Use X_no_target for CV split indices
-            for train_idx, test_idx in cv.split(X_no_target.values):
-                if is_baseline:
-                    # Baseline models use y directly
-                    y_train, y_test = y[train_idx], y[test_idx]
-                    X_train_dummy = np.zeros((len(train_idx), 1))
-                    X_test_dummy = np.zeros((len(test_idx), 1))
-                    
-                    model = clone(candidate.pipeline)
-                    
-                    t0 = time.time()
-                    model.fit(X_train_dummy, y_train)
-                    fit_times.append(time.time() - t0)
-                    
-                    t0 = time.time()
-                    y_pred = model.predict(X_test_dummy)
-                    predict_times.append((time.time() - t0) / len(test_idx))
-                    
-                else:
-                    # ML models use full data (with target for lag features)
-                    X_train = X_full.iloc[train_idx].copy()
-                    X_test = X_full.iloc[test_idx].copy()
-                    y_train, y_test = y[train_idx], y[test_idx]
-                    
-                    model = clone(candidate.pipeline)
-                    
-                    t0 = time.time()
-                    # Fit the pipeline - it will create lag features from target column
-                    if hasattr(model, 'fit'):
+        model = None
+
+        was_tracing = tracemalloc.is_tracing()
+        current_before = 0
+        if not was_tracing:
+            tracemalloc.start()
+        else:
+            current_before, _ = tracemalloc.get_traced_memory()
+
+        peak_bytes = 0
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+
+                # Use X_no_target for CV split indices
+                for train_idx, test_idx in cv.split(X_no_target.values):
+                    if is_baseline:
+                        # Baseline models use y directly
+                        y_train, y_test = y[train_idx], y[test_idx]
+                        X_train_dummy = np.zeros((len(train_idx), 1))
+                        X_test_dummy = np.zeros((len(test_idx), 1))
+
+                        model = clone(candidate.pipeline)
+
+                        t0 = time.time()
+                        model.fit(X_train_dummy, y_train)
+                        fit_times.append(time.time() - t0)
+
+                        t0 = time.time()
+                        y_pred = model.predict(X_test_dummy)
+                        predict_times.append((time.time() - t0) / len(test_idx))
+
+                    else:
+                        # ML models use full data (with target for lag features)
+                        X_train = X_full.iloc[train_idx].copy()
+                        X_test = X_full.iloc[test_idx].copy()
+                        y_train, y_test = y[train_idx], y[test_idx]
+
+                        model = clone(candidate.pipeline)
+
+                        t0 = time.time()
+                        if hasattr(model, 'fit'):
+                            try:
+                                model.fit(X_train, y_train)
+                            except Exception:
+                                X_train_fallback = X_train.select_dtypes(include=[np.number])
+                                X_test = X_test.select_dtypes(include=[np.number])
+                                model.fit(X_train_fallback, y_train)
+                        fit_times.append(time.time() - t0)
+
+                        t0 = time.time()
                         try:
-                            model.fit(X_train, y_train)
-                        except Exception as fit_err:
-                            # If pipeline fails, try without datetime column
-                            X_train_fallback = X_train.select_dtypes(include=[np.number])
-                            X_test = X_test.select_dtypes(include=[np.number])
-                            model.fit(X_train_fallback, y_train)
-                    fit_times.append(time.time() - t0)
-                    
-                    t0 = time.time()
-                    try:
-                        y_pred = model.predict(X_test)
-                    except Exception:
-                        X_test_num = X_test.select_dtypes(include=[np.number])
-                        y_pred = model.predict(X_test_num)
-                    predict_times.append((time.time() - t0) / len(test_idx))
-                
-                score = scorer(y_test, y_pred)
-                scores.append(score)
-        
+                            y_pred = model.predict(X_test)
+                        except Exception:
+                            X_test_num = X_test.select_dtypes(include=[np.number])
+                            y_pred = model.predict(X_test_num)
+                        predict_times.append((time.time() - t0) / len(test_idx))
+
+                    score = scorer(y_test, y_pred)
+                    scores.append(score)
+        finally:
+            if not was_tracing:
+                _, peak_bytes = tracemalloc.get_traced_memory()
+                tracemalloc.stop()
+            else:
+                current_after, _ = tracemalloc.get_traced_memory()
+                peak_bytes = max(0, current_after - current_before)
+
         # Compute average metrics
         cv_score = float(np.mean(scores))
         fit_time = float(np.mean(fit_times))
         predict_time = float(np.mean(predict_times)) * 1000  # ms
-        
-        # Estimate memory (rough)
-        import sys
-        memory_mb = sys.getsizeof(model) / (1024 * 1024)
-        
+
+        model_bytes = _estimate_model_memory_bytes(model) if model is not None else 0
+        memory_mb = float(max(model_bytes, peak_bytes) / (1024 * 1024))
+
         return ForecastingPipeline(
             name=candidate.name,
             model=model,

@@ -16,9 +16,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Union, Tuple, Dict, Any
+import warnings
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+
+
+def _coerce_datetime_series(series: pd.Series) -> pd.Series:
+    """Coerce datetime-like Series (including tz-aware or mixed-offset ISO strings) to tz-naive UTC datetime64."""
+    if isinstance(series.dtype, pd.DatetimeTZDtype):
+        return series.dt.tz_convert("UTC").dt.tz_localize(None)
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", (UserWarning, FutureWarning))
+            parsed = pd.to_datetime(series)
+    except (ValueError, TypeError):
+        try:
+            parsed = pd.to_datetime(series, format="mixed", utc=True)
+        except TypeError:
+            parsed = pd.to_datetime(series, utc=True)
+    if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+        return parsed.dt.tz_convert("UTC").dt.tz_localize(None)
+    if not pd.api.types.is_datetime64_any_dtype(parsed):
+        try:
+            parsed = pd.to_datetime(series, format="mixed", utc=True)
+        except TypeError:
+            parsed = pd.to_datetime(series, utc=True)
+        if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+            return parsed.dt.tz_convert("UTC").dt.tz_localize(None)
+    return parsed
 
 
 class ColumnDropper(BaseEstimator, TransformerMixin):
@@ -372,7 +400,7 @@ class DateTimeFeatureTransformer(BaseEstimator, TransformerMixin):
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Extract datetime features."""
         result = X.copy()
-        dt = pd.to_datetime(result[self.datetime_col])
+        dt = _coerce_datetime_series(result[self.datetime_col])
         
         for feat in self._features:
             if feat == 'is_weekend':
@@ -381,7 +409,13 @@ class DateTimeFeatureTransformer(BaseEstimator, TransformerMixin):
                          'is_quarter_end', 'is_year_start', 'is_year_end']:
                 result[f'dt_{feat}'] = getattr(dt.dt, feat).astype(int)
             elif feat == 'weekofyear':
-                result[f'dt_{feat}'] = dt.dt.isocalendar().week.astype(int)
+                week = dt.dt.isocalendar().week
+                if dt.isna().any():
+                    result[f'dt_{feat}'] = pd.to_numeric(week, errors="coerce").to_numpy(
+                        dtype=np.float64, na_value=np.nan
+                    )
+                else:
+                    result[f'dt_{feat}'] = week.astype(int)
             else:
                 result[f'dt_{feat}'] = getattr(dt.dt, feat)
             

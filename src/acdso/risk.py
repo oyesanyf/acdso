@@ -12,6 +12,7 @@ Advanced risk diagnostics for production-relevant analysis including:
 
 from __future__ import annotations
 
+import time
 import warnings
 from dataclasses import dataclass, asdict, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -22,7 +23,7 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score
-from sklearn.linear_model import LogisticRegression, Ridge, LinearRegression
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.utils import check_random_state
 
 from acdso.utils import (
@@ -32,6 +33,7 @@ from acdso.utils import (
     build_preprocessor,
     detect_datetime_column,
     class_imbalance,
+    sanitize_features,
 )
 
 
@@ -195,6 +197,218 @@ def _temporal_leakage_gap(
         return None
 
 
+def _univariate_predictive_power_detailed(
+    df: pd.DataFrame,
+    y: Any,
+    task: str,
+    scorer: str,
+    cv: int,
+    random_state: int,
+    deadline: Optional[float] = None,
+) -> Tuple[List[Tuple[str, float]], float]:
+    """
+    Detect potential leakage via fast vectorized pre-screening + top-K CV.
+
+    Returns
+    -------
+    Tuple[List[Tuple[str, float]], float]
+        Sorted list of (feature_name, cv_score) pairs and max score.
+    """
+    from sklearn.feature_selection import f_classif
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+
+    n = int(df.shape[0])
+    if n < 4 or df.shape[1] == 0:
+        return [], 0.0
+
+    rng = check_random_state(random_state)
+    max_rows = min(n, 3000)
+    if n > max_rows:
+        idx = rng.choice(n, size=max_rows, replace=False)
+        df_s = df.iloc[idx].reset_index(drop=True)
+        y_s = np.asarray(y)[idx]
+    else:
+        df_s = df
+        y_s = np.asarray(y)
+
+    y_ser = pd.Series(y_s)
+    valid_mask = y_ser.notna().to_numpy()
+    if not np.all(valid_mask):
+        df_s = df_s.iloc[valid_mask].reset_index(drop=True)
+        y_ser = y_ser.iloc[valid_mask].reset_index(drop=True)
+    if len(y_ser) < 4:
+        return [], 0.0
+
+    if task == "classification":
+        y_arr = y_ser.astype(object).to_numpy() if not pd.api.types.is_numeric_dtype(y_ser) else y_ser.to_numpy()
+        uniq_y, counts_y = np.unique(y_arr, return_counts=True)
+        if len(uniq_y) < 2:
+            return [], 0.0
+        min_class_count = int(counts_y.min())
+    else:
+        y_float = pd.to_numeric(y_ser, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        finite_y = np.isfinite(y_float)
+        if int(finite_y.sum()) < 4:
+            return [], 0.0
+        if not np.all(finite_y):
+            df_s = df_s.iloc[finite_y].reset_index(drop=True)
+            y_float = y_float[finite_y]
+        if float(np.std(y_float)) < 1e-12:
+            return [], 0.0
+        y_arr = y_float
+        min_class_count = len(y_arr)
+
+    # Normalize duplicate column names for safe positional indexing
+    orig_col_names = [str(c) for c in df_s.columns]
+    if df_s.columns.has_duplicates:
+        internal_cols = [f"__acdso_c_{i}" for i in range(df_s.shape[1])]
+        internal_to_orig = dict(zip(internal_cols, orig_col_names))
+        df_scan = df_s.copy()
+        df_scan.columns = internal_cols
+    else:
+        internal_to_orig = {str(c): str(c) for c in df_s.columns}
+        df_scan = df_s
+
+    df_scan = sanitize_features(df_scan)
+    num_cols, cat_cols = split_columns(df_scan)
+
+    # Pre-screen candidates: (internal_col, orig_name, prescreen_score, is_numeric)
+    candidates: List[Tuple[Any, str, float, bool]] = []
+
+    if num_cols:
+        X_num = df_scan[num_cols].astype(np.float64, copy=False).to_numpy(dtype=np.float64, copy=True)
+        X_num[~np.isfinite(X_num)] = np.nan
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            medians = np.nanmedian(X_num, axis=0)
+        medians = np.where(np.isfinite(medians), medians, 0.0)
+        nan_r, nan_c = np.where(np.isnan(X_num))
+        if nan_r.size > 0:
+            X_num[nan_r, nan_c] = medians[nan_c]
+
+        stds = np.std(X_num, axis=0)
+        valid_idx = np.flatnonzero(stds > 1e-12)
+        if valid_idx.size > 0:
+            Xv = X_num[:, valid_idx]
+            if task == "classification":
+                y_enc = LabelEncoder().fit_transform(y_arr)
+                n_cls = max(2, len(np.unique(y_enc)))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    f_vals, _ = f_classif(Xv, y_enc)
+                f_vals = np.nan_to_num(f_vals, nan=0.0, posinf=1e6, neginf=0.0)
+                df_between = float(max(1, n_cls - 1))
+                df_within = float(max(1, len(y_enc) - n_cls))
+                eta2 = (f_vals * df_between) / np.maximum(f_vals * df_between + df_within, 1.0)
+                prescores = np.clip(eta2, 0.0, 1.0)
+            else:
+                Xc = Xv - Xv.mean(axis=0)
+                yc = y_arr - np.mean(y_arr)
+                x_norms = np.linalg.norm(Xc, axis=0)
+                y_norm = float(np.linalg.norm(yc))
+                r = (Xc.T @ yc) / np.maximum(x_norms * y_norm, 1e-12)
+                prescores = np.clip(r * r, 0.0, 1.0)
+
+            for idx_pos, sc in zip(valid_idx.tolist(), prescores.tolist()):
+                cname = num_cols[idx_pos]
+                orig_name = internal_to_orig.get(str(cname), str(cname))
+                candidates.append((cname, orig_name, float(sc), True))
+
+    if cat_cols:
+        if task == "regression":
+            y_mean = float(np.mean(y_arr))
+            ss_tot = float(np.sum((y_arr - y_mean) ** 2))
+        for c in cat_cols:
+            s = df_scan[c]
+            n_non_null = int(s.notna().sum())
+            if n_non_null < 2:
+                continue
+            try:
+                nunique = int(s.nunique(dropna=True))
+            except Exception:
+                continue
+            # Skip constant or ID-like non-numeric columns (high-cardinality strings/UUIDs)
+            if nunique <= 1 or nunique > max(20, int(0.9 * n_non_null)):
+                continue
+            try:
+                s_clean = s.astype(object).fillna("__MISSING__")
+                orig_name = internal_to_orig.get(str(c), str(c))
+                if task == "classification":
+                    ct = pd.crosstab(s_clean.to_numpy(), y_arr)
+                    purity = float(ct.max(axis=1).sum() / max(1, len(y_arr)))
+                    candidates.append((c, orig_name, purity, False))
+                else:
+                    codes, uniques = pd.factorize(s_clean, sort=False)
+                    if len(uniques) <= 1 or ss_tot <= 1e-12:
+                        continue
+                    counts = np.bincount(codes, minlength=len(uniques))
+                    sums = np.bincount(codes, weights=y_arr, minlength=len(uniques))
+                    means = np.divide(sums, counts, out=np.zeros_like(sums, dtype=float), where=counts > 0)
+                    ss_between = float(np.sum(counts * (means - y_mean) ** 2))
+                    eta2 = float(np.clip(ss_between / ss_tot, 0.0, 1.0))
+                    candidates.append((c, orig_name, eta2, False))
+            except Exception:
+                continue
+
+    if not candidates:
+        return [], 0.0
+
+    candidates.sort(key=lambda item: item[2], reverse=True)
+    top_k = candidates[: min(10, len(candidates))]
+
+    if task == "classification":
+        if min_class_count < 2:
+            fallback = [(orig_name, float(sc)) for _, orig_name, sc, _ in top_k]
+            return fallback, float(fallback[0][1])
+        cv_eval = max(2, min(cv, 3, min_class_count))
+        splitter = StratifiedKFold(n_splits=cv_eval, shuffle=True, random_state=random_state)
+        eval_scorer = "f1_weighted" if str(scorer).startswith("neg_") else scorer
+        eval_scorer = _auto_adjust_scorer_for_risk(eval_scorer, y_arr, task)
+        base_model = LogisticRegression(max_iter=500, random_state=random_state)
+    else:
+        cv_eval = max(2, min(cv, 3, len(y_arr) // 2))
+        splitter = KFold(n_splits=cv_eval, shuffle=True, random_state=random_state)
+        eval_scorer = "r2"
+        base_model = Ridge(random_state=random_state)
+
+    scored: List[Tuple[str, float]] = []
+
+    for orig_col, orig_name, _, is_num in top_k:
+        if deadline is not None and time.perf_counter() > deadline:
+            break
+        try:
+            if is_num:
+                x_col = df_scan[[orig_col]].astype(np.float64, copy=False).to_numpy(dtype=np.float64, copy=True)
+                x_col[~np.isfinite(x_col)] = np.nan
+                pipe = Pipeline([
+                    ("imp", SimpleImputer(strategy="median")),
+                    ("sc", StandardScaler()),
+                    ("model", clone(base_model)),
+                ])
+            else:
+                x_col = df_scan[orig_col].astype(object).fillna("__MISSING__").to_numpy().reshape(-1, 1)
+                pipe = Pipeline([
+                    ("ohe", OneHotEncoder(handle_unknown="ignore")),
+                    ("model", clone(base_model)),
+                ])
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning)
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                cv_scores = cross_val_score(pipe, x_col, y_arr, scoring=eval_scorer, cv=splitter)
+            scored.append((orig_name, float(np.mean(cv_scores))))
+        except Exception:
+            continue
+
+    if not scored:
+        fallback = [(orig_name, float(sc)) for _, orig_name, sc, _ in top_k]
+        return fallback, float(fallback[0][1])
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return scored, float(scored[0][1])
+
+
 def _univariate_predictive_power(
     df: pd.DataFrame,
     y: Any,
@@ -229,62 +443,10 @@ def _univariate_predictive_power(
     Tuple[List[str], float]
         Tuple of (top_features, max_score).
     """
-    rng = check_random_state(random_state)
-
-    n = df.shape[0]
-    max_rows = min(n, 3000)
-    if n > max_rows:
-        idx = rng.choice(n, size=max_rows, replace=False)
-        df_s = df.iloc[idx].reset_index(drop=True)
-        y_s = np.asarray(y)[idx]
-    else:
-        df_s = df
-        y_s = np.asarray(y)
-
-    scores = []
-    feature_names = []
-
-    cols = list(df_s.columns)
-    if len(cols) > 80:
-        cols = cols[:80]
-
-    if task == "classification":
-        splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
-        base_model = LogisticRegression(max_iter=1000)
-    else:
-        splitter = KFold(n_splits=cv, shuffle=True, random_state=random_state)
-        base_model = Ridge()
-
-    for c in cols:
-        x = df_s[[c]]
-        try:
-            nunique = x[c].nunique(dropna=True)
-            # Skip ID-like columns (nearly all unique values)
-            if nunique > 0.9 * len(x):
-                continue
-        except Exception:
-            pass
-
-        num_cols, cat_cols = split_columns(x)
-        pre = build_preprocessor(num_cols, cat_cols)
-        pipe = Pipeline([("pre", pre), ("model", clone(base_model))])
-
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning)
-                warnings.filterwarnings("ignore", category=RuntimeWarning)
-                s = float(np.mean(cross_val_score(pipe, x, y_s, scoring=scorer, cv=splitter)))
-            scores.append(s)
-            feature_names.append(str(c))
-        except Exception:
-            continue
-
-    if not scores:
-        return [], 0.0
-
-    order = np.argsort(scores)[::-1]
-    top = [feature_names[i] for i in order[:5]]
-    return top, float(scores[order[0]])
+    scored, max_score = _univariate_predictive_power_detailed(
+        df, y, task=task, scorer=scorer, cv=cv, random_state=random_state, deadline=None
+    )
+    return [f for f, _ in scored[:5]], max_score
 
 
 def _vif_numeric(
@@ -294,50 +456,50 @@ def _vif_numeric(
     """
     Compute Variance Inflation Factor for numeric features.
 
-    VIF measures multicollinearity; values >= 10 indicate high collinearity.
-
-    Parameters
-    ----------
-    df_num : pd.DataFrame
-        DataFrame with only numeric columns.
-    max_features : int, default=40
-        Maximum number of features to analyze (for performance).
-
-    Returns
-    -------
-    Tuple[float, List[str]]
-        Tuple of (max_vif, high_vif_features).
+    Uses a ridge-damped correlation matrix inversion (Cholesky with eigh fallback)
+    for vectorized O(d^3) computation while detecting exact collinear duplicates.
     """
-    if df_num.shape[1] < 2:
+    if df_num.shape[1] < 2 or df_num.shape[0] < 2:
         return 1.0, []
 
-    cols = list(df_num.columns)
-    if len(cols) > max_features:
-        cols = cols[:max_features]
+    cols = list(df_num.columns)[:max_features]
+    X_arr = df_num[cols].astype(np.float64, copy=False).to_numpy(dtype=np.float64, copy=True)
+    X_arr[~np.isfinite(X_arr)] = np.nan
 
-    X = df_num[cols].copy()
-    X = X.replace([np.inf, -np.inf], np.nan)
-    X = X.fillna(X.median(numeric_only=True))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        medians = np.nanmedian(X_arr, axis=0)
+    medians = np.where(np.isfinite(medians), medians, 0.0)
+    nan_r, nan_c = np.where(np.isnan(X_arr))
+    if nan_r.size > 0:
+        X_arr[nan_r, nan_c] = medians[nan_c]
 
-    vifs = []
-    for c in cols:
-        y = X[c].values
-        X_others = X.drop(columns=[c]).values
-        if X_others.shape[1] == 0:
-            vifs.append(1.0)
-            continue
-        try:
-            lr = LinearRegression()
-            lr.fit(X_others, y)
-            r2 = lr.score(X_others, y)
-            r2 = float(np.clip(r2, 0.0, 0.999999))
-            vifs.append(float(1.0 / (1.0 - r2)))
-        except Exception:
-            vifs.append(1.0)
+    stds = np.std(X_arr, axis=0)
+    keep = np.flatnonzero(stds > 1e-12)
+    if keep.size < 2:
+        return 1.0, []
 
-    vifs = np.asarray(vifs)
-    vif_max = float(np.max(vifs)) if vifs.size else 1.0
-    high = [cols[i] for i in range(len(cols)) if vifs[i] >= 10.0]
+    X_nc = X_arr[:, keep]
+    Xc = (X_nc - X_nc.mean(axis=0)) / stds[keep]
+    n_rows, d = Xc.shape
+    corr = (Xc.T @ Xc) / float(n_rows)
+    corr = 0.5 * (corr + corr.T)
+    np.fill_diagonal(corr, 1.0)
+
+    reg = 1e-6
+    try:
+        corr_reg = corr + reg * np.eye(d)
+        L = np.linalg.cholesky(corr_reg)
+        inv_L = np.linalg.solve(L, np.eye(d))
+        vifs_nc = np.sum(inv_L * inv_L, axis=0)
+    except np.linalg.LinAlgError:
+        eigvals, eigvecs = np.linalg.eigh(corr)
+        inv_eig = 1.0 / np.maximum(eigvals, reg)
+        vifs_nc = (eigvecs * eigvecs) @ inv_eig
+
+    vifs_nc = np.clip(vifs_nc, 1.0, 1e6)
+    vif_max = float(np.max(vifs_nc)) if vifs_nc.size else 1.0
+    high = [str(cols[i]) for i, v in zip(keep.tolist(), vifs_nc.tolist()) if v >= 10.0]
     return vif_max, high
 
 
@@ -350,115 +512,119 @@ def _detect_linearity(
 ) -> Tuple[bool, float]:
     """
     Detect whether the dataset exhibits strong linear relationships.
-    
-    Compares linear model performance to a baseline to determine if
-    linear models are likely to perform well.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input features.
-    y : array-like
-        Target values.
-    task : str
-        Task type ("classification" or "regression").
-    cv : int, default=5
-        Number of cross-validation folds.
-    random_state : int, default=42
-        Random seed.
-
-    Returns
-    -------
-    Tuple[bool, float]
-        Tuple of (is_linear, linearity_score).
-        is_linear: True if linear models are likely optimal.
-        linearity_score: Score from 0.0 (non-linear) to 1.0 (highly linear).
+    Compares linear model performance to a compact non-linear baseline to
+    determine if linear models are likely to perform well.
     """
     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
     from sklearn.preprocessing import StandardScaler
     from sklearn.impute import SimpleImputer
-    
-    # Get numeric columns only
+
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if not num_cols:
         return False, 0.0
-    
-    X = df[num_cols].values.copy()
-    y_arr = np.asarray(y)
-    
-    # Sample for large datasets
+
+    X = df[num_cols].astype(np.float64, copy=False).to_numpy(dtype=np.float64, copy=True)
+    X[~np.isfinite(X)] = np.nan
+    y_ser = pd.Series(y)
+    valid_y = y_ser.notna().to_numpy()
+    if task != "classification":
+        y_num = pd.to_numeric(y_ser, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        valid_y = valid_y & np.isfinite(y_num)
+        if not np.all(valid_y):
+            X = X[valid_y]
+            y_arr = y_num[valid_y]
+        else:
+            y_arr = y_num
+    else:
+        if not np.all(valid_y):
+            X = X[valid_y]
+            y_ser = y_ser.iloc[valid_y]
+        y_arr = y_ser.astype(object).to_numpy() if not pd.api.types.is_numeric_dtype(y_ser) else y_ser.to_numpy()
+
     n = len(y_arr)
-    max_samples = min(n, 2000)
+    if n < 4:
+        return False, 0.0
+
+    max_samples = min(n, 3000)
     rng = np.random.RandomState(random_state)
     if n > max_samples:
         idx = rng.choice(n, size=max_samples, replace=False)
         X = X[idx]
         y_arr = y_arr[idx]
-    
-    # Handle missing values and scale
+
     try:
-        imputer = SimpleImputer(strategy='median')
-        X = imputer.fit_transform(X)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            imputer = SimpleImputer(strategy="median")
+            X = imputer.fit_transform(X)
+        if X.shape[1] == 0:
+            return False, 0.0
         scaler = StandardScaler()
         X = scaler.fit_transform(X)
     except Exception:
         return False, 0.0
-    
-    # Adjust cv for small datasets
+
     n_samples = len(y_arr)
-    cv_actual = min(cv, n_samples // 2)
+    cv_actual = min(cv, 3, n_samples // 2)
+    if task == "classification":
+        uniq, counts = np.unique(y_arr, return_counts=True)
+        if len(uniq) < 2 or int(counts.min()) < 2:
+            return False, 0.0
+        cv_actual = min(cv_actual, int(counts.min()))
     cv_actual = max(2, cv_actual)
-    
+
     try:
         if task == "classification":
             splitter = StratifiedKFold(n_splits=cv_actual, shuffle=True, random_state=random_state)
-            linear_model = LogisticRegression(max_iter=1000, random_state=random_state)
-            nonlinear_model = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=random_state, n_jobs=-1)
+            linear_model = LogisticRegression(max_iter=500, random_state=random_state)
+            nonlinear_model = RandomForestClassifier(
+                n_estimators=30, max_depth=10, random_state=random_state, n_jobs=1
+            )
             scorer = "accuracy"
         else:
             splitter = KFold(n_splits=cv_actual, shuffle=True, random_state=random_state)
             linear_model = Ridge(random_state=random_state)
-            nonlinear_model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=random_state, n_jobs=-1)
+            nonlinear_model = RandomForestRegressor(
+                n_estimators=30,
+                max_depth=10,
+                max_features=("sqrt" if X.shape[1] > 20 else 1.0),
+                random_state=random_state,
+                n_jobs=1,
+            )
             scorer = "r2"
-        
-        # Evaluate linear model
+
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
             linear_scores = cross_val_score(linear_model, X, y_arr, cv=splitter, scoring=scorer)
             linear_mean = float(np.mean(linear_scores))
-        
-        # Evaluate non-linear model
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore")
             nonlinear_scores = cross_val_score(nonlinear_model, X, y_arr, cv=splitter, scoring=scorer)
             nonlinear_mean = float(np.mean(nonlinear_scores))
-        
-        # Calculate linearity score
-        # If linear model performs similarly to or better than non-linear, data is likely linear
+
         if nonlinear_mean <= 0:
-            # Avoid division by zero or negative scores
-            linearity_score = 1.0 if linear_mean >= 0 else 0.0
+            ratio = 1.0 if linear_mean >= 0 else 0.0
         else:
-            # Ratio of linear to non-linear performance
             ratio = linear_mean / nonlinear_mean
-            linearity_score = float(np.clip(ratio, 0.0, 1.2))  # Allow slight over 1.0
-            
-        # Also consider absolute linear performance
-        # High R² or accuracy with linear model suggests linearity
+
         if task == "regression":
-            # For regression, R² > 0.7 with linear model indicates linearity
-            is_linear = linear_mean >= 0.7 or (ratio >= 0.95 and linear_mean >= 0.5)
+            min_lin = 0.5
+            is_linear = linear_mean >= 0.7 or (ratio >= 0.95 and linear_mean >= min_lin)
+            base_score = max(0.0, linear_mean)
         else:
-            # For classification, accuracy > 0.85 with linear model indicates linearity
-            is_linear = linear_mean >= 0.85 or (ratio >= 0.95 and linear_mean >= 0.7)
-        
-        # Also detect truly linear datasets where linear >> random forest
-        if ratio > 1.05:  # Linear model outperforms RF significantly
+            min_lin = 0.7
+            is_linear = linear_mean >= 0.85 or (ratio >= 0.95 and linear_mean >= min_lin)
+            base_score = float(np.clip(ratio, 0.0, 1.0)) * float(np.clip(linear_mean, 0.0, 1.0))
+
+        if ratio > 1.05 and linear_mean >= min_lin:
             is_linear = True
             linearity_score = min(1.0, ratio)
-        
+        elif is_linear:
+            linearity_score = float(np.clip(max(base_score, min(1.0, ratio)), 0.0, 1.0))
+        else:
+            linearity_score = float(np.clip(min(base_score, max(0.0, ratio)), 0.0, 1.0))
+
         return is_linear, float(np.clip(linearity_score, 0.0, 1.0))
-        
+
     except Exception:
         return False, 0.0
 
@@ -483,21 +649,21 @@ def _auto_adjust_scorer_for_risk(scorer: str, y: Any, task: str) -> str:
     """
     if task != "classification":
         return scorer
-    
-    y_arr = np.asarray(y)
-    unique_labels = np.unique(y_arr)
+
+    y_clean = pd.Series(y).dropna()
+    unique_labels = y_clean.unique()
     n_classes = len(unique_labels)
-    
+
     # Scorers that require pos_label=1 (binary-only)
     binary_only_scorers = ["f1", "precision", "recall", "roc_auc"]
-    
+
     if scorer in binary_only_scorers:
         # Multiclass or non-standard binary labels
-        if n_classes > 2 or (n_classes == 2 and set(unique_labels) != {0, 1}):
+        if n_classes > 2 or (n_classes == 2 and set(unique_labels.tolist()) != {0, 1}):
             if scorer == "roc_auc":
                 return "roc_auc_ovr_weighted"
             return f"{scorer}_weighted"
-    
+
     return scorer
 
 
@@ -509,6 +675,7 @@ def analyze_risk(
     cv: int = 5,
     random_state: int = 42,
     llm_advisor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    time_budget_s: Optional[float] = None,
 ) -> RiskReport:
     """
     Perform comprehensive risk analysis on a dataset.
@@ -531,47 +698,78 @@ def analyze_risk(
         Random seed for reproducibility.
     llm_advisor : Optional[Callable], default=None
         Optional LLM advisor function for semantic analysis.
+    time_budget_s : Optional[float], default=None
+        Optional time budget in seconds for risk diagnostics.
 
     Returns
     -------
     RiskReport
         Comprehensive risk report.
     """
+    deadline: Optional[float] = None
+    skip_heavy = False
+    if time_budget_s is not None:
+        if time_budget_s <= 0:
+            skip_heavy = True
+        else:
+            deadline = time.perf_counter() + float(time_budget_s)
+
     # Auto-adjust scorer for multiclass or non-standard binary labels
     scorer = _auto_adjust_scorer_for_risk(scorer, y, task)
-    
-    df = pd.DataFrame(X)
+
+    df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
     n_rows, n_cols = int(df.shape[0]), int(df.shape[1])
     num_cols, cat_cols = split_columns(df)
 
     missing_ratio = compute_missing_ratio(df)
     target_type = infer_target_type(y)
 
+    # Prepare sanitized, uniquely-named working DataFrame for internal diagnostics
+    orig_names = [str(c) for c in df.columns]
+    if df.columns.has_duplicates:
+        internal_cols = [f"__acdso_c_{i}" for i in range(df.shape[1])]
+        col_map = dict(zip(internal_cols, orig_names))
+        df_work = df.copy()
+        df_work.columns = internal_cols
+    else:
+        col_map = {str(c): str(c) for c in df.columns}
+        df_work = df
+    df_work = sanitize_features(df_work)
+    work_num_cols, _ = split_columns(df_work)
+
     notes: List[str] = []
 
     # Univariate predictive power (leakage proxy detection)
-    top_feats, max_pp = _univariate_predictive_power(
-        df, y,
-        task=task,
-        scorer=scorer,
-        cv=max(3, cv),
-        random_state=random_state,
-    )
+    max_pp = 0.0
     leak_feats: List[str] = []
-    if max_pp >= 0.98 and len(top_feats) > 0 and task == "classification":
-        leak_feats = top_feats
-        notes.append(f"Potential leakage/proxy: univariate predictive power max={max_pp:.3f}.")
+    if not skip_heavy and (deadline is None or time.perf_counter() <= deadline):
+        scored_feats, max_pp = _univariate_predictive_power_detailed(
+            df_work, y,
+            task=task,
+            scorer=scorer,
+            cv=max(3, cv),
+            random_state=random_state,
+            deadline=deadline,
+        )
+        leak_feats = [col_map.get(name, name) for name, sc in scored_feats if sc >= 0.95]
+        if leak_feats:
+            notes.append(
+                f"Potential leakage/proxy: univariate predictive power max={max_pp:.3f} "
+                f"(features={leak_feats})."
+            )
 
     # Temporal leakage detection
-    gap = _temporal_leakage_gap(
-        df, y,
-        scorer=scorer,
-        cv=max(3, cv),
-        task=task,
-        random_state=random_state,
-    )
-    if gap is not None and gap >= 0.05:
-        notes.append(f"Temporal leakage suspicion: shuffled-chronological score gap={gap:.3f}.")
+    gap: Optional[float] = None
+    if not skip_heavy and (deadline is None or time.perf_counter() <= deadline):
+        gap = _temporal_leakage_gap(
+            df_work, y,
+            scorer=scorer,
+            cv=min(max(3, cv), 3),
+            task=task,
+            random_state=random_state,
+        )
+        if gap is not None and gap >= 0.05:
+            notes.append(f"Temporal leakage suspicion: shuffled-chronological score gap={gap:.3f}.")
 
     # Class imbalance
     max_ratio, imb_sev = (None, 0.0)
@@ -581,19 +779,24 @@ def analyze_risk(
             notes.append(f"Severe imbalance: max class ratio={max_ratio:.3f}.")
 
     # Multicollinearity (VIF)
-    vif_max, vif_feats = _vif_numeric(df[num_cols] if num_cols else df.iloc[:, :0])
+    vif_max, vif_feats_raw = _vif_numeric(df_work[work_num_cols] if work_num_cols else df_work.iloc[:, :0])
+    vif_feats = [col_map.get(str(x), str(x)) for x in vif_feats_raw]
     if vif_max >= 10.0:
         notes.append(f"High multicollinearity: VIF max={vif_max:.1f}.")
 
     # Linearity detection
-    is_linear, linearity_score = _detect_linearity(
-        df, y,
-        task=task,
-        cv=max(3, cv),
-        random_state=random_state,
-    )
-    if is_linear:
-        notes.append(f"Linear relationship detected: linearity score={linearity_score:.3f}. Linear models recommended.")
+    is_linear, linearity_score = (False, 0.0)
+    if not skip_heavy and (deadline is None or time.perf_counter() <= deadline):
+        is_linear, linearity_score = _detect_linearity(
+            df_work, y,
+            task=task,
+            cv=min(max(3, cv), 3),
+            random_state=random_state,
+        )
+        if is_linear:
+            notes.append(
+                f"Linear relationship detected: linearity score={linearity_score:.3f}. Linear models recommended."
+            )
 
     # LLM advisor (if provided)
     if llm_advisor is not None:

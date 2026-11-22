@@ -21,6 +21,7 @@ the GUI's own code.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import sys
 import threading
 import webbrowser
@@ -37,9 +38,7 @@ if SRC.is_dir() and str(SRC) not in sys.path:
 def _check_dependencies() -> None:
     missing = []
     for module, pip_name in (("flask", "flask"), ("pandas", "pandas")):
-        try:
-            __import__(module)
-        except ImportError:
+        if importlib.util.find_spec(module) is None:
             missing.append(pip_name)
     if missing:
         print("Missing dependencies for the web GUI: " + ", ".join(missing))
