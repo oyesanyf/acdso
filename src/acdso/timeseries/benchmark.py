@@ -385,11 +385,13 @@ class TimeSeriesBenchmark:
                 warnings.simplefilter("ignore")
                 return runner(train_df, test_df, y_train, y_test, dataset_name)
         except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).error("System %s failed: %s", system, e)
             return TSBenchmarkResult(
                 system=system,
                 dataset=dataset_name,
                 status='error',
-                error_message=str(e),
+                error_message=f"Benchmark run failed for system '{system}'",
             )
     
     def _run_acdso(

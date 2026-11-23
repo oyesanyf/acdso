@@ -1,6 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <style>html { display: none; }</style>
+    <script>
+      if (self === top) {
+        document.documentElement.style.display = "block";
+      } else {
+        top.location = self.location;
+      }
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ACDSO 3.0 Report - Autonomous_Custom_File</title>

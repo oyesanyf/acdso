@@ -294,36 +294,35 @@ def example_stub_advisor():
     return clf
 
 
-def example_litellm_provider():
+def example_openai_compatible_provider():
     """
-    Example: Using LiteLLM for 100+ model providers.
+    Example: Using OpenAI-compatible endpoints for multiple providers.
 
-    LiteLLM provides a unified interface to many LLM providers:
-    - OpenAI, Anthropic, Cohere, Replicate, HuggingFace, etc.
+    The OpenAI-compatible provider works with any service that exposes
+    an OpenAI-compatible chat completions API:
+    - OpenAI, vLLM, LM Studio, Ollama (via /v1), etc.
 
     Requires:
-    - pip install litellm
+    - pip install openai
     """
     print("\n" + "=" * 60)
-    print("LiteLLM Multi-Provider Example")
+    print("OpenAI-Compatible Multi-Provider Example")
     print("=" * 60)
 
-    from acdso import LiteLLMProvider, LLMAdvisor
+    from acdso import OpenAICompatibleProvider, LLMAdvisor
 
-    # Check if LiteLLM is available
-    provider = LiteLLMProvider(model="gpt-4o-mini")
+    # Check if openai is available
+    provider = OpenAICompatibleProvider(model="gpt-4o-mini")
     if not provider.is_available():
-        print("LiteLLM not installed. Run: pip install litellm")
+        print("openai not installed. Run: pip install openai")
         print("Skipping this example.\n")
         return None
 
-    print("LiteLLM supports many providers with same interface:")
+    print("OpenAICompatibleProvider supports many endpoints:")
     print("  - OpenAI: model='gpt-4o'")
-    print("  - Anthropic: model='claude-3-sonnet-20240229'")
-    print("  - Cohere: model='cohere/command-r'")
-    print("  - Ollama: model='ollama/llama3'")
-    print("  - Replicate: model='replicate/...'")
-    print("  - HuggingFace: model='huggingface/...'")
+    print("  - Ollama: model='llama3', base_url='http://localhost:11434/v1'")
+    print("  - vLLM: model='mistral', base_url='http://localhost:8000/v1'")
+    print("  - LM Studio: model='local-model', base_url='http://localhost:1234/v1'")
 
     return provider
 
@@ -336,7 +335,7 @@ if __name__ == "__main__":
 
     # Try examples that require external services
     example_ollama_advisor()
-    example_litellm_provider()
+    example_openai_compatible_provider()
     example_anthropic_advisor()
     example_openai_advisor()
 

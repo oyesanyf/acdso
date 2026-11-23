@@ -46,7 +46,7 @@ flaml>=2.0.0
 tpot>=1.0.0
 
 # H2O AutoML - Enterprise-grade
-h2o>=3.40.0
+h2o>=3.46.0.1
 
 # AutoGluon - AWS's AutoML (specific version for stability)
 autogluon.tabular[fastai]==1.4.1b20251209
@@ -125,14 +125,13 @@ gymnasium>=0.29.0
 ydata-profiling>=4.0.0
 sweetviz>=2.1.0
 # dataprep>=0.4.0  # Can have dependency conflicts
-# dtale>=2.0.0  # For interactive analysis
+# dtale>=3.22.0  # For interactive analysis
 
 # ===================================
 # LLM Providers (Optional)
 # ===================================
 openai>=1.0.0
 anthropic>=0.18.0
-litellm>=1.0.0
 
 # ===================================
 # Development Tools (Optional)

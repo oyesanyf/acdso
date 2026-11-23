@@ -481,44 +481,54 @@ class OllamaProvider(BaseLLMProvider):
         return response.json().get("response", "")
 
 
-class LiteLLMProvider(BaseLLMProvider):
+class OpenAICompatibleProvider(BaseLLMProvider):
     """
-    LiteLLM provider for unified access to 100+ LLM providers.
+    Provider for any OpenAI-compatible API endpoint.
+
+    Uses the ``openai`` SDK to connect to OpenAI, Azure OpenAI, vLLM,
+    LM Studio, Ollama (via OpenAI-compatible mode), and other services
+    that expose an OpenAI-compatible chat completions API.
 
     Parameters
     ----------
     model : str
-        Model identifier (e.g., "gpt-4", "claude-3-opus", "ollama/llama3").
+        Model identifier (e.g., "gpt-4", "llama3", "mistral").
     api_key : str, optional
-        API key (provider-specific).
-    api_base : str, optional
-        Custom API base URL.
+        API key for the endpoint. Defaults to ``OPENAI_API_KEY`` env var.
+    base_url : str, optional
+        Custom API base URL (e.g., "http://localhost:11434/v1" for Ollama).
 
     Examples
     --------
-    >>> # Use any model supported by LiteLLM
-    >>> provider = LiteLLMProvider(model="gpt-4")
-    >>> provider = LiteLLMProvider(model="claude-3-opus-20240229")
-    >>> provider = LiteLLMProvider(model="ollama/llama3")
+    >>> # OpenAI
+    >>> provider = OpenAICompatibleProvider(model="gpt-4")
+    >>> # Local Ollama via OpenAI-compatible endpoint
+    >>> provider = OpenAICompatibleProvider(
+    ...     model="llama3", base_url="http://localhost:11434/v1"
+    ... )
+    >>> # vLLM or LM Studio
+    >>> provider = OpenAICompatibleProvider(
+    ...     model="mistral", base_url="http://localhost:8000/v1"
+    ... )
     """
 
     def __init__(
         self,
         model: str,
         api_key: Optional[str] = None,
-        api_base: Optional[str] = None,
+        base_url: Optional[str] = None,
     ):
         self.model = model
         self.api_key = api_key
-        self.api_base = api_base
+        self.base_url = base_url
 
     @property
     def name(self) -> str:
-        return f"LiteLLM/{self.model}"
+        return f"OpenAICompatible/{self.model}"
 
     def is_available(self) -> bool:
         try:
-            import litellm
+            import openai  # noqa: F401
             return True
         except ImportError:
             return False
@@ -529,9 +539,19 @@ class LiteLLMProvider(BaseLLMProvider):
         user_prompt: str,
         config: LLMConfig,
     ) -> str:
-        import litellm
+        from openai import OpenAI
 
-        response = litellm.completion(
+        client_kwargs = {}
+        if self.api_key:
+            client_kwargs["api_key"] = self.api_key
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        if config.timeout_s:
+            client_kwargs["timeout"] = config.timeout_s
+
+        client = OpenAI(**client_kwargs)
+
+        response = client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -539,9 +559,6 @@ class LiteLLMProvider(BaseLLMProvider):
             ],
             max_tokens=config.max_tokens,
             temperature=config.temperature,
-            api_key=self.api_key,
-            api_base=self.api_base,
-            timeout=config.timeout_s,
         )
 
         return response.choices[0].message.content or ""
@@ -985,7 +1002,7 @@ def create_advisor(
     Parameters
     ----------
     provider : str, default="openai"
-        Provider name: "openai", "anthropic", "azure", "ollama", "litellm".
+        Provider name: "openai", "anthropic", "azure", "ollama", "openai_compatible".
     model : str, optional
         Model name (provider-specific).
     api_key : str, optional
@@ -1028,8 +1045,8 @@ def create_advisor(
             model=model or "llama3.2",
             **kwargs,
         )
-    elif provider_lower == "litellm":
-        llm_provider = LiteLLMProvider(
+    elif provider_lower == "openai_compatible":
+        llm_provider = OpenAICompatibleProvider(
             model=model or "gpt-4o-mini",
             api_key=api_key,
             **kwargs,
