@@ -1123,10 +1123,19 @@ def test_t5_webui_report_summary_and_frontend_multi_target_and_xss(
     )
 
     html = client.get("/").get_data(as_text=True)
-    m = re.search(r"<script>(.*)</script>", html, re.DOTALL)
+    m = re.search(r"<script>(.*?)</script>", html, re.DOTALL)
     assert m is not None
+    charts_js = client.get("/static/charts.js").get_data(as_text=True)
+    wb_js = client.get("/static/workbench.js").get_data(as_text=True)
+    combined_js = "\n".join(
+        [
+            m.group(1),
+            charts_js,
+            wb_js.replace("initWorkbench();", ""),
+        ]
+    )
     js_path = tmp_path / "workbench.js"
-    js_path.write_text(m.group(1).replace("initWorkbench();", ""), encoding="utf-8")
+    js_path.write_text(combined_js, encoding="utf-8")
 
     driver_js = tmp_path / "driver.js"
     driver_js.write_text(
@@ -1154,9 +1163,12 @@ function getEl(id) { if (!elements.has(id)) elements.set(id, makeEl(id)); return
 const sandbox = {
   assert, console, setTimeout, clearTimeout, setInterval: () => 1, clearInterval: () => {},
   confirm: () => true, Event: function(t){ this.type = t; },
+  $: getEl,
   document: { getElementById: getEl, querySelectorAll: () => [], createTextNode: (t) => ({ textContent: t }) },
   fetch: async () => ({ status: 200, ok: true, text: async () => '{}' }),
 };
+sandbox.window = sandbox;
+sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(jsCode + `
 (() => {

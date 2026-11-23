@@ -37,9 +37,14 @@ import numpy as np
 import pandas as pd
 
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    RandomForestRegressor,
+    StackingClassifier,
+    StackingRegressor,
+)
 from sklearn.feature_selection import SelectKBest, f_classif, f_regression
-from sklearn.linear_model import LogisticRegression, Ridge, ElasticNet, Lasso
+from sklearn.linear_model import LogisticRegression, Ridge, RidgeCV, ElasticNet, Lasso
 from sklearn.metrics import get_scorer
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
@@ -82,6 +87,78 @@ def _safe_numpy(X: Any) -> np.ndarray:
         return np.asarray(X)
     except Exception:
         return np.array(X)
+
+
+def _extract_meta_features_for_task(
+    task: str,
+    model_step: Any,
+    X_mat: Any,
+    global_classes: Optional[np.ndarray],
+) -> Optional[np.ndarray]:
+    """Extract leakage-free 2D meta-features from a fitted base estimator."""
+    try:
+        if task == "regression":
+            pred = np.asarray(model_step.predict(X_mat), dtype=float).reshape(-1, 1)
+            return np.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+        if global_classes is None or len(global_classes) < 2:
+            return None
+        n_classes = len(global_classes)
+        if hasattr(model_step, "predict_proba"):
+            proba = np.asarray(model_step.predict_proba(X_mat), dtype=float)
+            if proba.ndim == 1:
+                proba = proba.reshape(-1, 1)
+            est_classes = getattr(model_step, "classes_", None)
+            if est_classes is not None:
+                cls_map = {c: idx for idx, c in enumerate(global_classes)}
+                aligned = np.zeros((proba.shape[0], n_classes), dtype=float)
+                for j, c in enumerate(est_classes):
+                    if c in cls_map and j < proba.shape[1]:
+                        aligned[:, cls_map[c]] = proba[:, j]
+                out = aligned[:, 1:2] if n_classes == 2 else aligned
+            else:
+                out = proba[:, 1:2] if (n_classes == 2 and proba.shape[1] >= 2) else proba
+            return np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
+        if hasattr(model_step, "decision_function"):
+            dec = np.asarray(model_step.decision_function(X_mat), dtype=float)
+            if dec.ndim == 1:
+                dec = dec.reshape(-1, 1)
+            if n_classes > 2 and dec.shape[1] != n_classes:
+                return None
+            return np.nan_to_num(dec, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        return None
+    return None
+
+
+class _Fold0StackAdapter:
+    """Top-level picklable Fold-0 stacking adapter for latency, stress tests, and serialization."""
+
+    def __init__(
+        self,
+        base_models: List[Any],
+        meta_model: Any,
+        task: str,
+        global_classes: Optional[np.ndarray],
+    ) -> None:
+        self.base_models = base_models
+        self.meta_model = meta_model
+        self.task = task
+        self.global_classes = global_classes
+        self.classes_ = getattr(meta_model, "classes_", global_classes)
+
+    def _meta_X(self, X_proc: Any) -> np.ndarray:
+        cols = [
+            _extract_meta_features_for_task(self.task, m, X_proc, self.global_classes)
+            for m in self.base_models
+        ]
+        mat = np.hstack(cols)
+        return np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def predict(self, X_proc: Any) -> np.ndarray:
+        return self.meta_model.predict(self._meta_X(X_proc))
+
+    def predict_proba(self, X_proc: Any) -> np.ndarray:
+        return self.meta_model.predict_proba(self._meta_X(X_proc))
 
 
 def _apply_missingness_noise(X: Any, missing_frac: float, rng: np.random.RandomState) -> Any:
@@ -423,6 +500,7 @@ class _ACDSOEngineV3:
         verbose: int,
         selection_mode: str = "knee_point",
         n_jobs: Optional[int] = None,
+        enable_stacking: bool = True,
     ):
         self.task = task
         self.scorer = scorer  # Will be adjusted in fit() based on y
@@ -434,6 +512,7 @@ class _ACDSOEngineV3:
         self.preference = preference
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
         self.n_jobs = n_jobs
+        self.enable_stacking = bool(enable_stacking)
 
         self.max_train_time_s = max_train_time_s
         self.max_peak_mem_mb = max_peak_mem_mb
@@ -1207,17 +1286,22 @@ class _ACDSOEngineV3:
 
         entries: List[_FoldCacheEntry] = [e for e in fold_cache if e is not None]
         scorer_fn = get_scorer(self.scorer)
+        capture_oof = bool(is_full and self.enable_stacking and n_rows >= 60)
+        global_classes = np.unique(ys_arr) if (capture_oof and self.task == "classification") else None
 
         n_cands = len(survivors)
         fold_scores: List[List[Optional[float]]] = [[None] * n_folds for _ in range(n_cands)]
         fold_times: List[List[float]] = [[0.0] * n_folds for _ in range(n_cands)]
         fold_mems: List[List[float]] = [[0.0] * n_folds for _ in range(n_cands)]
+        fold_oof: List[List[Optional[np.ndarray]]] = [[None] * n_folds for _ in range(n_cands)]
         fold0_models: List[Any] = [None] * n_cands
         cand_errors: Dict[int, Exception] = {}
 
-        def _eval_pair(cand_idx: int, fold_idx: int) -> Tuple[int, int, Optional[float], float, float, Any, Optional[Exception]]:
+        def _eval_pair(
+            cand_idx: int, fold_idx: int
+        ) -> Tuple[int, int, Optional[float], float, float, Any, Optional[np.ndarray], Optional[Exception]]:
             if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
-                return cand_idx, fold_idx, None, 0.0, 0.0, None, None
+                return cand_idx, fold_idx, None, 0.0, 0.0, None, None, None
             entry = entries[fold_idx]
             try:
                 model_step = clone(survivors[cand_idx][1].named_steps["model"])
@@ -1228,9 +1312,12 @@ class _ACDSOEngineV3:
                 total_bytes = entry.data_mem_bytes + _estimate_model_nbytes(model_step)
                 mem_mb = float(max(0.01, total_bytes / (1024 * 1024)))
                 keep_model = model_step if fold_idx == 0 else None
-                return cand_idx, fold_idx, score, elapsed, mem_mb, keep_model, None
+                oof_arr = None
+                if capture_oof:
+                    oof_arr = self._extract_meta_features(model_step, entry.X_val_proc, global_classes)
+                return cand_idx, fold_idx, score, elapsed, mem_mb, keep_model, oof_arr, None
             except Exception as exc:
-                return cand_idx, fold_idx, None, 0.0, 0.0, None, exc
+                return cand_idx, fold_idx, None, 0.0, 0.0, None, None, exc
 
         n_tasks = n_cands * n_folds
         eval_workers = self._resolve_max_workers(n_tasks, n_rows=n_rows)
@@ -1244,7 +1331,7 @@ class _ACDSOEngineV3:
                         budget_exhausted = True
                         break
                     for fi in range(n_folds):
-                        c_i, f_i, sc, el, mb, mod0, exc = _eval_pair(ci, fi)
+                        c_i, f_i, sc, el, mb, mod0, oof_arr, exc = _eval_pair(ci, fi)
                         if exc is not None:
                             cand_errors[c_i] = exc
                             break
@@ -1254,6 +1341,7 @@ class _ACDSOEngineV3:
                         fold_scores[c_i][f_i] = sc
                         fold_times[c_i][f_i] = el
                         fold_mems[c_i][f_i] = mb
+                        fold_oof[c_i][f_i] = oof_arr
                         if f_i == 0 and mod0 is not None:
                             fold0_models[c_i] = mod0
                     if budget_exhausted:
@@ -1266,7 +1354,7 @@ class _ACDSOEngineV3:
                         for fi in range(n_folds)
                     ]
                     for fut in as_completed(futures):
-                        c_i, f_i, sc, el, mb, mod0, exc = fut.result()
+                        c_i, f_i, sc, el, mb, mod0, oof_arr, exc = fut.result()
                         if exc is not None:
                             if c_i not in cand_errors:
                                 cand_errors[c_i] = exc
@@ -1276,6 +1364,7 @@ class _ACDSOEngineV3:
                             fold_scores[c_i][f_i] = sc
                             fold_times[c_i][f_i] = el
                             fold_mems[c_i][f_i] = mb
+                            fold_oof[c_i][f_i] = oof_arr
                             if f_i == 0 and mod0 is not None:
                                 fold0_models[c_i] = mod0
                         if self.time_budget_s is not None and (time.time() - t0) >= self.time_budget_s:
@@ -1424,7 +1513,528 @@ class _ACDSOEngineV3:
                 f"risk={res.risk_penalty:.2f}, robustness_drop={res.meta.get('stress_worst_drop', 0.0):.4f}"
             )
 
+        if capture_oof and stage_results:
+            oof_by_name: Dict[str, np.ndarray] = {}
+            fold0_by_name: Dict[str, Any] = {}
+            for ci, (name, _) in enumerate(survivors):
+                if ci in cand_errors or fold0_models[ci] is None:
+                    continue
+                parts = fold_oof[ci]
+                if any(p is None for p in parts):
+                    continue
+                widths = {p.shape[1] for p in parts if p is not None and p.ndim == 2}
+                if len(widths) != 1:
+                    continue
+                d = next(iter(widths))
+                oof_mat = np.zeros((n_rows, d), dtype=float)
+                ok_fill = True
+                for fi, p in enumerate(parts):
+                    assert p is not None
+                    if p.shape[0] != len(entries[fi].val_idx):
+                        ok_fill = False
+                        break
+                    oof_mat[entries[fi].val_idx] = p
+                if ok_fill:
+                    oof_by_name[name] = oof_mat
+                    fold0_by_name[name] = fold0_models[ci]
+            self._last_full_oof_cache = {
+                "entries": entries,
+                "ys_arr": ys_arr,
+                "Xm_proc": Xm_proc,
+                "Xj_proc": Xj_proc,
+                "y_noisy": y_noisy,
+                "global_classes": global_classes,
+                "oof_by_name": oof_by_name,
+                "fold0_by_name": fold0_by_name,
+            }
+
         return stage_results, stage_failures, budget_exhausted
+
+    def _extract_meta_features(
+        self,
+        model_step: Any,
+        X_mat: Any,
+        global_classes: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        """Extract leakage-free 2D meta-features from a fitted base estimator."""
+        return _extract_meta_features_for_task(self.task, model_step, X_mat, global_classes)
+
+    @staticmethod
+    def _model_family(name: str, estimator: Any) -> str:
+        """Map a candidate model to a coarse family for diverse stacking selection."""
+        cls = type(estimator).__name__.lower()
+        lname = (name or "").lower()
+        if any(k in cls or k in lname for k in ("logistic", "ridge", "lasso", "elastic", "linear", "huber", "sgd")):
+            return "linear"
+        if "extratrees" in cls:
+            return "extratrees"
+        if "randomforest" in cls:
+            return "randomforest"
+        if "histgradient" in cls or "gradientboosting" in cls:
+            return "gboost"
+        if "lgbm" in cls or "lightgbm" in lname:
+            return "lightgbm"
+        if "xgb" in cls:
+            return "xgboost"
+        if "catboost" in cls:
+            return "catboost"
+        if "mlp" in cls:
+            return "mlp"
+        if "svc" in cls or "svr" in cls:
+            return "svm"
+        if "kneighbors" in cls or "knn" in lname:
+            return "knn"
+        return cls
+
+    def _build_stacking_candidate(
+        self,
+        results: List[CandidateResult],
+        raw_templates: Dict[str, Pipeline],
+        X: Any,
+        y: Any,
+        stage0_results: Optional[List[CandidateResult]] = None,
+    ) -> Optional[Tuple[str, Pipeline]]:
+        """Synthesize a Pareto-aware multi-family StackingEnsemble from top diverse survivors."""
+        if not self.enable_stacking or len(results) < 2:
+            return None
+        y_arr = np.asarray(y)
+        n_samples = len(y_arr)
+        if n_samples < 60:
+            return None
+
+        # Determine safe inner CV folds for stacking meta-features (2-fold keeps final refit fast)
+        stack_cv = min(2, max(2, int(self.cv)))
+        if self.task == "classification":
+            _, counts = np.unique(y_arr, return_counts=True)
+            if len(counts) < 2 or int(counts.min()) < 2:
+                return None
+            stack_cv = min(stack_cv, int(counts.min()))
+            if stack_cv < 2:
+                return None
+
+        ranked = sorted(
+            (r for r in results if math.isfinite(float(r.metric))),
+            key=lambda r: float(r.metric - 0.5 * float(r.meta.get("stress_worst_drop", 0.0))),
+            reverse=True,
+        )
+        if len(ranked) < 2:
+            return None
+
+        # Build candidate priority list: full-stage survivors first, then Stage 0 survivors for family diversity
+        combined_pool: List[CandidateResult] = list(ranked)
+        seen_names = {r.name for r in combined_pool}
+        if stage0_results:
+            s0_ranked = sorted(
+                (r for r in stage0_results if math.isfinite(float(r.metric)) and r.name not in seen_names),
+                key=lambda r: float(r.metric),
+                reverse=True,
+            )
+            combined_pool.extend(s0_ranked)
+
+        base_estimators: List[Tuple[str, Any]] = []
+        seen_families: set[str] = set()
+        anchor_pipe: Optional[Pipeline] = None
+
+        for r in combined_pool:
+            tpl = raw_templates.get(r.name)
+            if not isinstance(tpl, Pipeline) or "model" not in tpl.named_steps:
+                continue
+            model_step = tpl.named_steps["model"]
+            fam = self._model_family(r.name, model_step)
+            if fam in seen_families:
+                continue
+            est = clone(model_step)
+            if hasattr(est, "n_jobs"):
+                try:
+                    est.set_params(n_jobs=1)
+                except Exception:
+                    pass
+            est_key = f"{fam}_{len(base_estimators)}"
+            base_estimators.append((est_key, est))
+            seen_families.add(fam)
+            if anchor_pipe is None:
+                anchor_pipe = tpl
+            if len(base_estimators) >= 3:
+                break
+
+        # Last-resort diversity from generated templates if all Stage 0/full survivors share 1 family
+        if len(base_estimators) < 2 and anchor_pipe is not None:
+            for tname, tpl in raw_templates.items():
+                if not isinstance(tpl, Pipeline) or "model" not in tpl.named_steps:
+                    continue
+                model_step = tpl.named_steps["model"]
+                fam = self._model_family(tname, model_step)
+                if fam in seen_families:
+                    continue
+                est = clone(model_step)
+                if hasattr(est, "n_jobs"):
+                    try:
+                        est.set_params(n_jobs=1)
+                    except Exception:
+                        pass
+                base_estimators.append((f"{fam}_{len(base_estimators)}", est))
+                seen_families.add(fam)
+                if len(base_estimators) >= 2:
+                    break
+
+        if len(base_estimators) < 2 or anchor_pipe is None:
+            return None
+
+        if self.task == "classification":
+            meta_model = LogisticRegression(max_iter=1000, random_state=self.random_state)
+            stacker: Any = StackingClassifier(
+                estimators=base_estimators,
+                final_estimator=meta_model,
+                cv=stack_cv,
+                n_jobs=1,
+                passthrough=False,
+            )
+        else:
+            meta_model = RidgeCV(alphas=np.logspace(-3, 2, 12))
+            stacker = StackingRegressor(
+                estimators=base_estimators,
+                final_estimator=meta_model,
+                cv=stack_cv,
+                n_jobs=1,
+                passthrough=False,
+            )
+
+        steps: List[Tuple[str, Any]] = []
+        if "pre" in anchor_pipe.named_steps:
+            steps.append(("pre", clone(anchor_pipe.named_steps["pre"])))
+        else:
+            steps.append(("pre", self._build_preprocessor(X)))
+        if "select" in anchor_pipe.named_steps:
+            steps.append(("select", clone(anchor_pipe.named_steps["select"])))
+        steps.append(("model", stacker))
+        return ("StackingEnsemble", Pipeline(steps=steps))
+
+    def _evaluate_oof_stacking(
+        self,
+        results: List[CandidateResult],
+        raw_templates: Dict[str, Pipeline],
+        X: Any,
+        y: Any,
+        t0: float,
+        stage0_results: Optional[List[CandidateResult]] = None,
+    ) -> Optional[Tuple[str, Pipeline, CandidateResult]]:
+        """Evaluate a multi-family StackingEnsemble using cached Stage-1 OOF predictions.
+
+        Reuses the exact K-fold Stage-1 out-of-fold predictions so CV evaluation
+        takes milliseconds instead of running nested KxM inner base-model fits,
+        while still constructing a genuine sklearn StackingClassifier/StackingRegressor
+        for full-data refit if selected on the Pareto front.
+        """
+        cache = getattr(self, "_last_full_oof_cache", None)
+        if not self.enable_stacking or not cache or len(results) < 2:
+            return None
+
+        entries: List[_FoldCacheEntry] = cache["entries"]
+        ys_arr: np.ndarray = cache["ys_arr"]
+        n_rows = len(ys_arr)
+        if n_rows < 60 or len(entries) < 2:
+            return None
+
+        global_classes = cache["global_classes"]
+        if self.task == "classification":
+            if global_classes is None or len(global_classes) < 2:
+                return None
+            _, counts = np.unique(ys_arr, return_counts=True)
+            if int(counts.min()) < 2:
+                return None
+
+        remaining = (
+            float(self.time_budget_s) - (time.time() - t0)
+            if self.time_budget_s is not None
+            else float("inf")
+        )
+        if remaining < 2.0:
+            return None
+
+        oof_by_name: Dict[str, np.ndarray] = cache["oof_by_name"]
+        fold0_by_name: Dict[str, Any] = cache["fold0_by_name"]
+
+        ranked = sorted(
+            (r for r in results if math.isfinite(float(r.metric)) and r.name in oof_by_name and r.name in fold0_by_name),
+            key=lambda r: float(r.metric - 0.5 * float(r.meta.get("stress_worst_drop", 0.0))),
+            reverse=True,
+        )
+        if not ranked:
+            return None
+
+        chosen: List[Dict[str, Any]] = []
+        seen_families: set[str] = set()
+        anchor_pipe: Optional[Pipeline] = None
+
+        for r in ranked:
+            tpl = raw_templates.get(r.name)
+            if not isinstance(tpl, Pipeline) or "model" not in tpl.named_steps:
+                continue
+            model_step = tpl.named_steps["model"]
+            fam = self._model_family(r.name, model_step)
+            if fam in seen_families:
+                continue
+            chosen.append(
+                {
+                    "name": r.name,
+                    "family": fam,
+                    "model_step": model_step,
+                    "oof": oof_by_name[r.name],
+                    "fold0_model": fold0_by_name[r.name],
+                    "train_time_s": float(r.train_time_s),
+                    "peak_mem_mb": float(r.peak_mem_mb),
+                }
+            )
+            seen_families.add(fam)
+            if anchor_pipe is None:
+                anchor_pipe = tpl
+            if len(chosen) >= 3:
+                break
+
+        # If all Stage-1 survivors came from 1 family, evaluate ONE fast complementary
+        # family across the ALREADY-preprocessed fold entries (zero preprocessing overhead).
+        if len(chosen) == 1 and anchor_pipe is not None and remaining >= 4.0:
+            fallback_candidates: List[Tuple[str, Pipeline, float]] = []
+            if stage0_results:
+                for r0 in sorted(
+                    (r for r in stage0_results if math.isfinite(float(r.metric))),
+                    key=lambda r: float(r.metric),
+                    reverse=True,
+                ):
+                    tpl = raw_templates.get(r0.name)
+                    if isinstance(tpl, Pipeline) and "model" in tpl.named_steps:
+                        fallback_candidates.append((r0.name, tpl, float(r0.train_time_s)))
+            for tname, tpl in raw_templates.items():
+                if isinstance(tpl, Pipeline) and "model" in tpl.named_steps:
+                    fallback_candidates.append((tname, tpl, 0.5))
+
+            for cand_name, tpl, s0_time in fallback_candidates:
+                model_step = tpl.named_steps["model"]
+                fam = self._model_family(cand_name, model_step)
+                if fam in seen_families:
+                    continue
+                # Guard: skip expensive complementary models when budget is tight
+                if self.time_budget_s is not None and (s0_time * len(entries) * 2.5) > (0.35 * remaining):
+                    continue
+                try:
+                    parts: List[np.ndarray] = []
+                    f0_mod = None
+                    t_base = 0.0
+                    mem_base = 0.01
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=UserWarning)
+                        warnings.filterwarnings("ignore", category=RuntimeWarning)
+                        for fi, entry in enumerate(entries):
+                            if self.time_budget_s is not None and (time.time() - t0) >= (self.time_budget_s - 1.5):
+                                parts = []
+                                break
+                            est_f = clone(model_step)
+                            if hasattr(est_f, "n_jobs"):
+                                try:
+                                    est_f.set_params(n_jobs=1)
+                                except Exception:
+                                    pass
+                            ts = time.perf_counter()
+                            est_f.fit(entry.X_tr_proc, entry.y_tr)
+                            t_base += float(time.perf_counter() - ts)
+                            oof_p = self._extract_meta_features(est_f, entry.X_val_proc, global_classes)
+                            if oof_p is None:
+                                parts = []
+                                break
+                            parts.append(oof_p)
+                            if fi == 0:
+                                f0_mod = est_f
+                            mem_base = max(mem_base, (entry.data_mem_bytes + _estimate_model_nbytes(est_f)) / (1024 * 1024))
+                    if len(parts) == len(entries) and f0_mod is not None:
+                        widths = {p.shape[1] for p in parts if p.ndim == 2}
+                        if len(widths) == 1:
+                            d = next(iter(widths))
+                            oof_mat = np.zeros((n_rows, d), dtype=float)
+                            for fi, p in enumerate(parts):
+                                oof_mat[entries[fi].val_idx] = p
+                            chosen.append(
+                                {
+                                    "name": cand_name,
+                                    "family": fam,
+                                    "model_step": model_step,
+                                    "oof": oof_mat,
+                                    "fold0_model": f0_mod,
+                                    "train_time_s": float(t_base),
+                                    "peak_mem_mb": float(mem_base),
+                                }
+                            )
+                            seen_families.add(fam)
+                            break
+                except Exception:
+                    continue
+
+        if len(chosen) < 2 or anchor_pipe is None:
+            return None
+
+        # Check that even if StackingEnsemble wins, its single cv=2 final refit will fit inside budget
+        base_time_sum = float(sum(b["train_time_s"] for b in chosen))
+        est_final_refit_s = (3.0 / max(1, len(entries))) * base_time_sum
+        remaining_now = (
+            float(self.time_budget_s) - (time.time() - t0)
+            if self.time_budget_s is not None
+            else float("inf")
+        )
+        if self.time_budget_s is not None and est_final_refit_s > max(2.5, 0.55 * remaining_now):
+            # Keep only the 2 fastest diverse families if 3 exceeded final refit budget
+            if len(chosen) > 2:
+                chosen = sorted(chosen, key=lambda b: b["train_time_s"])[:2]
+                base_time_sum = float(sum(b["train_time_s"] for b in chosen))
+                est_final_refit_s = (3.0 / max(1, len(entries))) * base_time_sum
+            if est_final_refit_s > max(2.5, 0.55 * remaining_now):
+                return None
+
+        Z_oof = np.hstack([b["oof"] for b in chosen])
+        Z_oof = np.nan_to_num(Z_oof, nan=0.0, posinf=0.0, neginf=0.0)
+        scorer_fn = get_scorer(self.scorer)
+
+        if self.task == "classification":
+            meta_tpl: Any = LogisticRegression(max_iter=1000, random_state=self.random_state)
+        else:
+            meta_tpl = RidgeCV(alphas=np.logspace(-3, 2, 12))
+
+        meta_scores: List[float] = []
+        fold0_meta = None
+        t_meta_start = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            for fi, entry in enumerate(entries):
+                meta_f = clone(meta_tpl)
+                meta_f.fit(Z_oof[entry.train_idx], ys_arr[entry.train_idx])
+                sc = float(scorer_fn(meta_f, Z_oof[entry.val_idx], entry.y_val))
+                meta_scores.append(sc)
+                if fi == 0:
+                    fold0_meta = meta_f
+        meta_cv_time = float(time.perf_counter() - t_meta_start)
+
+        if fold0_meta is None or not all(math.isfinite(s) for s in meta_scores):
+            return None
+
+        scores_arr = np.asarray(meta_scores, dtype=float)
+        metric = float(np.mean(scores_arr))
+        cv_std = float(np.std(scores_arr))
+        train_time_s = float(base_time_sum + meta_cv_time)
+        peak_mem_mb = float(max(0.01, sum(b["peak_mem_mb"] for b in chosen)))
+        assert self.risk_report_ is not None
+        risk_pen = compute_risk_penalty(
+            self.risk_report_,
+            cv_score_std=cv_std,
+            preference=self.preference,
+        )
+
+        # Lightweight top-level picklable Fold-0 inference adapter for genuine latency & stress evaluation
+        base_f0_models = [b["fold0_model"] for b in chosen]
+        adapter = _Fold0StackAdapter(
+            base_models=base_f0_models,
+            meta_model=fold0_meta,
+            task=self.task,
+            global_classes=global_classes,
+        )
+        e0 = entries[0]
+        steps_f0: List[Tuple[str, Any]] = [("pre", e0.pre_f)]
+        if e0.sel_f is not None:
+            steps_f0.append(("select", e0.sel_f))
+        steps_f0.append(("model", adapter))
+        fold0_pipe = Pipeline(steps=steps_f0)
+
+        latency = measure_latency_ms_per_row(fold0_pipe, e0.X_val_raw)
+        baseline_f0 = float(scores_arr[0])
+        stress_results: List[StressTestResult] = []
+        Xm_proc = cache["Xm_proc"]
+        Xj_proc = cache["Xj_proc"]
+        y_noisy = cache["y_noisy"]
+        if Xm_proc is not None:
+            try:
+                m_score = float(scorer_fn(adapter, Xm_proc, e0.y_val))
+                stress_results.append(StressTestResult("missingness_2pct", m_score, baseline_f0 - m_score))
+            except Exception:
+                pass
+        if Xj_proc is not None:
+            try:
+                j_score = float(scorer_fn(adapter, Xj_proc, e0.y_val))
+                stress_results.append(StressTestResult("feature_jitter_2pct", j_score, baseline_f0 - j_score))
+            except Exception:
+                pass
+        if self.task == "classification" and y_noisy is not None:
+            try:
+                ln_score = float(scorer_fn(adapter, e0.X_val_proc, y_noisy))
+                stress_results.append(StressTestResult("label_noise_2pct", ln_score, baseline_f0 - ln_score))
+            except Exception:
+                pass
+        worst_drop = float(max(0.0, max(t.delta for t in stress_results))) if stress_results else 0.0
+
+        objectives = (
+            metric,
+            math.log1p(train_time_s),
+            math.log1p(peak_mem_mb),
+            math.log1p(latency),
+            risk_pen,
+            worst_drop,
+        )
+        stack_res = CandidateResult(
+            name="StackingEnsemble",
+            pipeline=fold0_pipe,
+            metric=metric,
+            train_time_s=train_time_s,
+            peak_mem_mb=peak_mem_mb,
+            latency_ms_per_row=latency,
+            risk_penalty=risk_pen,
+            objectives=objectives,
+            meta={
+                "cv_scores": scores_arr.tolist(),
+                "cv_score_std": cv_std,
+                "stress_baseline_metric": baseline_f0,
+                "stress_tests": [asdict(r) for r in stress_results],
+                "stress_worst_drop": worst_drop,
+                "base_estimators": [b["name"] for b in chosen],
+            },
+        )
+        if not self._passes_constraints(stack_res):
+            return None
+
+        # Construct the genuine deployable sklearn StackingClassifier/StackingRegressor template
+        base_estimators: List[Tuple[str, Any]] = []
+        for idx, b in enumerate(chosen):
+            est = clone(b["model_step"])
+            if hasattr(est, "n_jobs"):
+                try:
+                    est.set_params(n_jobs=1)
+                except Exception:
+                    pass
+            base_estimators.append((f"{b['family']}_{idx}", est))
+
+        stack_cv = 2
+        if self.task == "classification":
+            stacker: Any = StackingClassifier(
+                estimators=base_estimators,
+                final_estimator=clone(meta_tpl),
+                cv=stack_cv,
+                n_jobs=1,
+                passthrough=False,
+            )
+        else:
+            stacker = StackingRegressor(
+                estimators=base_estimators,
+                final_estimator=clone(meta_tpl),
+                cv=stack_cv,
+                n_jobs=1,
+                passthrough=False,
+            )
+
+        tpl_steps: List[Tuple[str, Any]] = []
+        if "pre" in anchor_pipe.named_steps:
+            tpl_steps.append(("pre", clone(anchor_pipe.named_steps["pre"])))
+        else:
+            tpl_steps.append(("pre", self._build_preprocessor(X)))
+        if "select" in anchor_pipe.named_steps:
+            tpl_steps.append(("select", clone(anchor_pipe.named_steps["select"])))
+        tpl_steps.append(("model", stacker))
+        return ("StackingEnsemble", Pipeline(steps=tpl_steps), stack_res)
 
     def _passes_constraints(self, res: CandidateResult) -> bool:
         """Check if a candidate passes all constraint guardrails."""
@@ -1653,6 +2263,29 @@ class _ACDSOEngineV3:
                     passing_s0 = [r for r in stage0_results if self._passes_constraints(r)]
                     if passing_s0:
                         results = passing_s0
+
+        # Step 3.25: Fast OOF-evaluated Pareto-aware multi-family StackingEnsemble
+        try:
+            if self.enable_stacking and len(results) >= 2:
+                stack_eval = self._evaluate_oof_stacking(
+                    results, raw_templates, X, y, t0, stage0_results=stage0_results
+                )
+                if stack_eval is not None:
+                    stack_name, stack_pipe, stack_res = stack_eval
+                    raw_templates[stack_name] = clone(stack_pipe)
+                    results.append(stack_res)
+                    self._log(
+                        f"Added {stack_name} to Pareto pool (metric={stack_res.metric:.4f}, "
+                        f"time={stack_res.train_time_s:.2f}s, bases={stack_res.meta.get('base_estimators')})"
+                    )
+        except Exception as stack_exc:
+            failures.append({
+                "name": "StackingEnsemble",
+                "reason": f"error:{type(stack_exc).__name__}",
+                "detail": str(stack_exc),
+            })
+        finally:
+            self._last_full_oof_cache = None
 
         if not results:
             # Fallback: Create a simple baseline model that always works
@@ -1928,6 +2561,7 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         verbose: int = 0,
         selection_mode: str = "knee_point",
         n_jobs: Optional[int] = None,
+        enable_stacking: bool = True,
     ) -> None:
         self.scorer = scorer
         self.cv = cv
@@ -1943,6 +2577,7 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         self.verbose = verbose
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
         self.n_jobs = n_jobs
+        self.enable_stacking = enable_stacking
 
         # Fitted attributes
         self.best_estimator_: Optional[Pipeline] = None
@@ -1989,6 +2624,7 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
             verbose=self.verbose,
             selection_mode=self.selection_mode,
             n_jobs=self.n_jobs,
+            enable_stacking=self.enable_stacking,
         ).fit(X, y)
 
         assert self._engine.best_result_ is not None
@@ -2163,6 +2799,7 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         verbose: int = 0,
         selection_mode: str = "knee_point",
         n_jobs: Optional[int] = None,
+        enable_stacking: bool = True,
     ) -> None:
         self.scorer = scorer
         self.cv = cv
@@ -2178,6 +2815,7 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         self.verbose = verbose
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
         self.n_jobs = n_jobs
+        self.enable_stacking = enable_stacking
 
         # Fitted attributes
         self.best_estimator_: Optional[Pipeline] = None
@@ -2218,6 +2856,7 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
             verbose=self.verbose,
             selection_mode=self.selection_mode,
             n_jobs=self.n_jobs,
+            enable_stacking=self.enable_stacking,
         ).fit(X, y)
 
         assert self._engine.best_result_ is not None

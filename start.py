@@ -64,9 +64,9 @@ def _serve(app, host: str, port: int, debug: bool) -> None:
         app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
         return
 
-    # threads>1: a run in progress must not block log polling or a second
-    # tab's requests.
-    serve(app, host=host, port=port, threads=8)
+    # threads>1: a run in progress + open SSE streams must not block API
+    # requests or a second tab.
+    serve(app, host=host, port=port, threads=16)
 
 
 def main(argv: list[str] | None = None) -> int:

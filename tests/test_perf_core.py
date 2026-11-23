@@ -566,3 +566,45 @@ class TestTimeseriesMemoryMetric:
         finally:
             if not was_already_tracing and tracemalloc.is_tracing():
                 tracemalloc.stop()
+
+
+class TestStackingEnsemble:
+    """Pareto-aware multi-family StackingEnsemble candidate evaluation."""
+
+    def test_stacking_classifier_evaluates_and_respects_flag(self):
+        from sklearn.datasets import make_classification
+
+        X, y = make_classification(
+            n_samples=180, n_features=10, n_informative=6, random_state=42
+        )
+        df = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+
+        clf_on = ACDSOClassifier(cv=3, max_candidates=6, random_state=42, enable_stacking=True)
+        clf_on.fit(df, y)
+        names_on = [c["name"] for c in clf_on.audit_trail_["candidates_evaluated"]]
+        assert "StackingEnsemble" in names_on, f"Expected StackingEnsemble in {names_on}"
+        import pickle
+        restored = pickle.loads(pickle.dumps(clf_on))
+        preds = restored.predict(df.iloc[:10])
+        assert len(preds) == 10
+
+        clf_off = ACDSOClassifier(cv=3, max_candidates=6, random_state=42, enable_stacking=False)
+        clf_off.fit(df, y)
+        names_off = [c["name"] for c in clf_off.audit_trail_["candidates_evaluated"]]
+        assert "StackingEnsemble" not in names_off
+
+    def test_stacking_regressor_evaluates_and_predicts(self):
+        from sklearn.datasets import make_regression
+
+        X, y = make_regression(
+            n_samples=160, n_features=8, n_informative=5, noise=5.0, random_state=42
+        )
+        df = pd.DataFrame(X, columns=[f"x{i}" for i in range(X.shape[1])])
+
+        reg = ACDSORegressor(cv=3, max_candidates=6, random_state=42, enable_stacking=True)
+        reg.fit(df, y)
+        names = [c["name"] for c in reg.audit_trail_["candidates_evaluated"]]
+        assert "StackingEnsemble" in names, f"Expected StackingEnsemble in {names}"
+        import pickle
+        restored_reg = pickle.loads(pickle.dumps(reg))
+        assert restored_reg.score(df, y) > 0.7

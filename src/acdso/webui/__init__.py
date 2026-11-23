@@ -10,7 +10,28 @@ Start it with ``python start.py`` from the repository root.
 
 from __future__ import annotations
 
-__all__ = ["create_app"]
+__all__ = ["create_app", "run"]
+
+
+def run(argv: list[str] | None = None) -> int:
+    """Launch the ACDSO Web GUI (entry point for ``acdso-web``)."""
+    from pathlib import Path
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[3]
+    start_py = repo_root / "start.py"
+    if start_py.is_file():
+        spec = importlib.util.spec_from_file_location("acdso_start", str(start_py))
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return int(mod.main(argv))
+
+    from waitress import serve
+
+    app = create_app()
+    serve(app, host="127.0.0.1", port=5000, threads=16)
+    return 0
 
 
 def __getattr__(name: str):

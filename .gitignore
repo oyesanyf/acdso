@@ -124,7 +124,13 @@ Thumbs.db
 audit_trail.json
 *.log
 
-# Web GUI (start.py)
+# Web GUI (start.py) & generated runtime artifacts
 uploads/
 reports/webui_logs/
+reports/*.pkl
+reports/*.html
+reports/*.json
+reports/*.csv
+catboost_*/
+
 

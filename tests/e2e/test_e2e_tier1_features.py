@@ -478,7 +478,13 @@ def test_f3_t1_webui_fast_startup_and_root_html(isolated_webui_client) -> None:
     html = resp.get_data(as_text=True)
     assert "{{" not in html and "{%" not in html, "Unrendered Jinja template syntax in GET /"
     assert "FLAG_META" in html
-    assert "/api/upload" in html and "/api/run" in html and "/api/reports" in html
+    assert "/static/workbench.css" in html
+    assert "/static/charts.js" in html
+    assert "/static/workbench.js" in html
+    wb_js_resp = client.get("/static/workbench.js")
+    assert wb_js_resp.status_code == 200
+    wb_js = wb_js_resp.get_data(as_text=True)
+    assert "/api/upload" in wb_js and "/api/run" in wb_js and "/api/reports" in wb_js
     parser = _TagCounterParser()
     parser.feed(html)
     assert parser.has_title

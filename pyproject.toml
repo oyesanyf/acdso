@@ -150,8 +150,9 @@ decision-full = [  # All decision intelligence tools including RL
     "gymnasium>=0.29.0",
 ]
 
-# Web GUI (start.py)
+# Web GUI (start.py) & Terminal UI (acdso-tui)
 webui = ["flask>=3.0.0", "waitress>=2.1.0"]
+tui = ["textual>=0.80.0", "rich>=13.0.0"]
 
 # Development
 dev = [
@@ -180,6 +181,10 @@ all = [
     "pytest-cov>=4.0.0",
 ]
 
+[project.scripts]
+acdso-tui = "acdso.tui:main"
+acdso-web = "acdso.webui:run"
+
 [project.urls]
 Homepage = "https://github.com/ds-tui/acdso"
 Documentation = "https://github.com/ds-tui/acdso#readme"
@@ -195,7 +200,7 @@ where = ["src"]
 include = ["acdso", "acdso.*"]
 
 [tool.setuptools.package-data]
-"acdso.webui" = ["templates/*.html"]
+"acdso.webui" = ["templates/*.html", "static/*"]
 
 [tool.black]
 line-length = 120

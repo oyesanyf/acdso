@@ -34,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 from werkzeug.utils import secure_filename
 
 # src/acdso/webui/app.py -> src/acdso/webui -> src/acdso -> src -> <repo root>
@@ -629,16 +629,25 @@ class Job:
     started_at: float
     log_path: Path
     lines: list[str] = field(default_factory=list)
-    status: str = "running"  # running | finished | failed | cancelled
+    status: str = "running"  # queued | running | finished | failed | cancelled
     returncode: int | None = None
     dropped_lines: int = 0
     proc: subprocess.Popen | None = None
     progress: dict[str, Any] | None = None
+    queued_at: float | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _cond: threading.Condition = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._cond = threading.Condition(self._lock)
 
     @property
     def command(self) -> str:
         return " ".join(shlex.quote(a) for a in self.argv)
+
+    def notify(self) -> None:
+        with self._lock:
+            self._cond.notify_all()
 
     def append(self, line: str) -> None:
         with self._lock:
@@ -647,10 +656,12 @@ class Job:
                 overflow = len(self.lines) - MAX_LOG_LINES
                 del self.lines[:overflow]
                 self.dropped_lines += overflow
+            self._cond.notify_all()
 
     def set_progress(self, progress: dict[str, Any]) -> None:
         with self._lock:
             self.progress = dict(progress)
+            self._cond.notify_all()
 
     def get_progress(self) -> dict[str, Any] | None:
         with self._lock:
@@ -665,12 +676,13 @@ class Job:
 
 
 class JobManager:
-    """Runs one ACDSO job at a time, keeping its log in memory and on disk."""
+    """Runs one ACDSO job at a time with an opt-in FIFO queue and SSE notifications."""
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._active: str | None = None
+        self._queue: list[Job] = []
 
     @property
     def active_job(self) -> Job | None:
@@ -683,28 +695,103 @@ class JobManager:
 
     def recent(self, limit: int = 20) -> list[Job]:
         with self._lock:
-            jobs = sorted(self._jobs.values(), key=lambda j: j.started_at, reverse=True)
+            jobs = sorted(
+                self._jobs.values(),
+                key=lambda j: j.queued_at if j.queued_at is not None else j.started_at,
+                reverse=True,
+            )
         return jobs[:limit]
+
+    def list_queue(self) -> list[dict[str, Any]]:
+        with self._lock:
+            items = []
+            for pos, j in enumerate(self._queue, start=1):
+                items.append(
+                    {
+                        "job_id": j.id,
+                        "status": j.status,
+                        "queue_position": pos,
+                        "queued_at": j.queued_at,
+                        "command": j.command,
+                    }
+                )
+            return items
+
+    def queue_position(self, job_id: str) -> int:
+        with self._lock:
+            for pos, j in enumerate(self._queue, start=1):
+                if j.id == job_id:
+                    return pos
+            return 0
+
+    def cancel_queued(self, job_id: str) -> bool:
+        target: Job | None = None
+        with self._lock:
+            for idx, j in enumerate(self._queue):
+                if j.id == job_id:
+                    target = self._queue.pop(idx)
+                    break
+        if target is None:
+            return False
+        with target._lock:
+            target.status = "cancelled"
+            target.returncode = -1
+            target._cond.notify_all()
+        target.append("[webui] cancelled before execution (removed from queue)")
+        return True
 
     def start(self, argv: list[str]) -> Job:
         with self._lock:
             active = self._jobs.get(self._active) if self._active else None
             if active is not None and active.status == "running":
                 raise RuntimeError(
-                    "A run is already in progress. Stop it or wait for it to finish "
-                    "-- concurrent runs overwrite each other's reports."
+                    "A run is already in progress. Stop it, wait for it to finish, "
+                    "or pass queue=true to enqueue this run."
                 )
-            job_id = uuid.uuid4().hex[:12]
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            job = Job(
-                id=job_id,
-                argv=argv,
-                started_at=time.time(),
-                log_path=LOG_DIR / f"run_{job_id}.log",
-            )
-            self._jobs[job_id] = job
-            self._active = job_id
+            job = self._create_job_locked(argv, status="running")
+            self._active = job.id
 
+        self._launch_job(job)
+        return job
+
+    def enqueue(self, argv: list[str]) -> tuple[Job, int]:
+        """Start immediately if idle; otherwise append to FIFO queue and return (job, position)."""
+        with self._lock:
+            active = self._jobs.get(self._active) if self._active else None
+            if active is None or active.status != "running":
+                job = self._create_job_locked(argv, status="running")
+                self._active = job.id
+                should_launch = True
+                pos = 0
+            else:
+                job = self._create_job_locked(argv, status="queued")
+                self._queue.append(job)
+                should_launch = False
+                pos = len(self._queue)
+
+        if should_launch:
+            self._launch_job(job)
+            return job, 0
+
+        job.append(f"[webui] queued at position #{pos}; waiting for active run to finish...")
+        return job, pos
+
+    def _create_job_locked(self, argv: list[str], status: str) -> Job:
+        job_id = uuid.uuid4().hex[:12]
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        job = Job(
+            id=job_id,
+            argv=argv,
+            started_at=now,
+            log_path=LOG_DIR / f"run_{job_id}.log",
+            status=status,
+            queued_at=now if status == "queued" else None,
+        )
+        self._jobs[job_id] = job
+        return job
+
+    def _launch_job(self, job: Job) -> None:
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
@@ -714,13 +801,17 @@ class JobManager:
         with self._lock:
             with job._lock:
                 if job.status == "cancelled":
-                    if self._active == job_id:
+                    if self._active == job.id:
                         self._active = None
-                    return job
+                    job._cond.notify_all()
+                    return
+                job.status = "running"
+                job.started_at = time.time()
+                job._cond.notify_all()
 
         try:
             proc = subprocess.Popen(
-                argv,
+                job.argv,
                 cwd=str(REPO_ROOT),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -737,8 +828,10 @@ class JobManager:
                 with job._lock:
                     job.status = "failed"
                     job.returncode = -1
-                if self._active == job_id:
+                    job._cond.notify_all()
+                if self._active == job.id:
                     self._active = None
+            self._promote_next()
             raise
 
         cancelled_early = False
@@ -746,17 +839,43 @@ class JobManager:
             if job.status == "cancelled":
                 cancelled_early = True
             job.proc = proc
+            job._cond.notify_all()
 
         if cancelled_early:
             self._terminate_proc(proc)
             with self._lock:
-                if self._active == job_id:
+                if self._active == job.id:
                     self._active = None
-            return job
+            self._promote_next()
+            return
 
         job.append(f"$ {job.command}")
         threading.Thread(target=self._pump, args=(job,), daemon=True).start()
-        return job
+
+    def _promote_next(self) -> None:
+        next_job: Job | None = None
+        with self._lock:
+            active = self._jobs.get(self._active) if self._active else None
+            if active is not None and active.status == "running":
+                return
+            while self._queue:
+                cand = self._queue.pop(0)
+                with cand._lock:
+                    if cand.status == "queued":
+                        cand.status = "running"
+                        cand.started_at = time.time()
+                        cand._cond.notify_all()
+                        next_job = cand
+                        self._active = cand.id
+                        break
+            if next_job is None:
+                self._active = None
+
+        if next_job is not None:
+            try:
+                self._launch_job(next_job)
+            except Exception as exc:  # noqa: BLE001
+                next_job.append(f"[webui] failed to launch queued job: {exc}")
 
     @staticmethod
     def _terminate_proc(proc: subprocess.Popen[str]) -> None:
@@ -820,15 +939,26 @@ class JobManager:
                     elif job.status == "failed":
                         updated["status"] = "error"
                     job.progress = updated
+                job._cond.notify_all()
             _invalidate_reports_cache()
             job.append(
                 f"[webui] process exited with code {rc} "
                 f"after {time.time() - job.started_at:.1f}s"
             )
+            self._promote_next()
 
     def stop(self, job: Job) -> bool:
         with self._lock:
             with job._lock:
+                if job.status == "queued":
+                    try:
+                        self._queue.remove(job)
+                    except ValueError:
+                        pass
+                    job.status = "cancelled"
+                    job.returncode = -1
+                    job._cond.notify_all()
+                    return True
                 if job.status != "running":
                     return False
                 proc = job.proc
@@ -838,13 +968,19 @@ class JobManager:
                     updated["status"] = "error"
                     updated["detail"] = "Cancelled by user"
                     job.progress = updated
+                job._cond.notify_all()
                 if proc is None:
                     if self._active == job.id:
                         self._active = None
-                    return True
-                if proc.poll() is not None:
-                    return False
+                    promote = True
+                else:
+                    promote = False
+                    if proc.poll() is not None:
+                        return False
 
+        if promote:
+            self._promote_next()
+            return True
         self._terminate_proc(proc)
         return True
 
@@ -1240,6 +1376,14 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
         "html_report_path": cleaned.get("html_report_path"),
     }
 
+    feature_importance = (
+        cleaned.get("feature_importance")
+        or audit.get("feature_importance")
+        or (cleaned.get("additional_info") or {}).get("feature_importance")
+        if isinstance(cleaned.get("additional_info"), dict)
+        else (cleaned.get("feature_importance") or audit.get("feature_importance"))
+    )
+
     return _sanitize_json_value({
         "path": rel,
         "kind": kind,
@@ -1256,6 +1400,7 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
         "pruned_or_failed": pruned_or_failed,
         "risk_report": risk_report,
         "eda_report": eda_report,
+        "feature_importance": feature_importance,
         "predictions": cleaned.get("predictions"),
         "timeseries": cleaned.get("timeseries"),
         "benchmark_results": cleaned.get("benchmark_results"),
@@ -1332,7 +1477,7 @@ def _summarize_csv_report(rel: str, target: Path, limit: int) -> dict[str, Any]:
 
 
 def create_app() -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder="static", static_url_path="/static")
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
     app.json.sort_keys = False
 
@@ -1799,13 +1944,27 @@ def create_app() -> Flask:
         except (ValueError, TypeError) as exc:
             return jsonify(error=f"Invalid option: {exc}"), 400
 
+        want_queue = bool(payload.get("queue"))
+        if want_queue:
+            job, qpos = manager.enqueue(argv)
+            _invalidate_reports_cache()
+            return (
+                jsonify(
+                    job_id=job.id,
+                    command=job.command,
+                    status=job.status,
+                    queue_position=qpos,
+                ),
+                202 if qpos > 0 else 200,
+            )
+
         try:
             job = manager.start(argv)
         except RuntimeError as exc:
-            return jsonify(error=str(exc)), 409
+            return jsonify(error=str(exc), queueable=True), 409
 
         _invalidate_reports_cache()
-        return jsonify(job_id=job.id, command=job.command)
+        return jsonify(job_id=job.id, command=job.command, status=job.status, queue_position=0)
 
     @app.get("/api/job/<job_id>")
     def job_status(job_id: str):
@@ -1831,9 +1990,205 @@ def create_app() -> Flask:
             lines=lines,
             cursor=next_cursor,
             progress=progress,
+            queue_position=manager.queue_position(job.id),
             log_file=log_file,
             artifacts=artifacts_since(job.started_at),
         )
+
+    @app.get("/api/job/<job_id>/stream")
+    def job_stream(job_id: str):
+        """Server-Sent Events stream for real-time job logs, progress, and completion."""
+        job = manager.get(job_id)
+        if job is None:
+            return jsonify(error="Unknown job"), 404
+
+        init_cursor = max(0, request.args.get("cursor", type=int, default=0))
+        max_seconds = request.args.get("max_seconds", type=float, default=3600.0)
+        max_seconds = max(1.0, min(float(max_seconds), 86400.0))
+
+        def _sse(event: str, payload: dict[str, Any]) -> str:
+            return f"event: {event}\ndata: {json.dumps(_sanitize_json_value(payload), ensure_ascii=False)}\n\n"
+
+        @stream_with_context
+        def _generate():
+            cursor = init_cursor
+            last_prog_key: str | None = None
+            last_status: str | None = None
+            started = time.monotonic()
+
+            try:
+                log_file = str(job.log_path.relative_to(REPO_ROOT))
+            except ValueError:
+                log_file = str(job.log_path)
+
+            while True:
+                lines, next_cursor = job.slice_from(cursor)
+                with job._lock:
+                    status = job.status
+                    returncode = job.returncode
+                    progress = dict(job.progress) if job.progress is not None else None
+                    started_at = job.started_at
+
+                if lines:
+                    cursor = next_cursor
+                    yield _sse("log", {"lines": lines, "cursor": cursor})
+
+                prog_key = json.dumps(progress, sort_keys=True) if progress is not None else None
+                if prog_key != last_prog_key and progress is not None:
+                    last_prog_key = prog_key
+                    yield _sse("progress", {"progress": progress, "status": status})
+
+                if status != last_status:
+                    last_status = status
+                    yield _sse(
+                        "status",
+                        {
+                            "job_id": job.id,
+                            "status": status,
+                            "returncode": returncode,
+                            "command": job.command,
+                            "elapsed": round(time.time() - started_at, 1),
+                            "queue_position": manager.queue_position(job.id),
+                            "log_file": log_file,
+                        },
+                    )
+
+                if status in ("finished", "failed", "cancelled"):
+                    # Flush any final lines appended right at exit
+                    tail_lines, tail_cursor = job.slice_from(cursor)
+                    if tail_lines:
+                        cursor = tail_cursor
+                        yield _sse("log", {"lines": tail_lines, "cursor": cursor})
+                    yield _sse(
+                        "done",
+                        {
+                            "job_id": job.id,
+                            "status": status,
+                            "returncode": returncode,
+                            "elapsed": round(time.time() - started_at, 1),
+                            "cursor": cursor,
+                            "progress": progress,
+                            "log_file": log_file,
+                            "artifacts": artifacts_since(started_at),
+                        },
+                    )
+                    break
+
+                if time.monotonic() - started >= max_seconds:
+                    yield _sse("timeout", {"cursor": cursor, "status": status})
+                    break
+
+                with job._lock:
+                    has_new = (job.dropped_lines + len(job.lines)) > cursor
+                    if not has_new and job.status in ("queued", "running"):
+                        job._cond.wait(timeout=1.5)
+                if (job.dropped_lines + len(job.lines)) == cursor:
+                    yield ": keepalive\n\n"
+
+        # Omit hop-by-hop headers (e.g. Connection) per PEP 3333 so Waitress/WSGI servers stream cleanly
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        return Response(_generate(), mimetype="text/event-stream", headers=headers)
+
+    @app.get("/api/queue")
+    def queue_list():
+        active = manager.active_job
+        active_info = None
+        if active is not None and active.status == "running":
+            with active._lock:
+                active_info = {
+                    "job_id": active.id,
+                    "status": active.status,
+                    "command": active.command,
+                    "elapsed": round(time.time() - active.started_at, 1),
+                    "progress": dict(active.progress) if active.progress is not None else None,
+                }
+        return jsonify(active_job=active_info, queue=manager.list_queue())
+
+    @app.delete("/api/queue/<job_id>")
+    def queue_cancel(job_id: str):
+        removed = manager.cancel_queued(job_id)
+        if not removed:
+            return jsonify(error="Job is not currently queued"), 404
+        return jsonify(cancelled=True, job_id=job_id, queue=manager.list_queue())
+
+    @app.post("/api/compare-reports")
+    def compare_reports():
+        """Compare 2-4 JSON experiment reports side-by-side with baseline deltas."""
+        payload, err_resp = _json_dict_payload()
+        if err_resp is not None:
+            return err_resp
+        assert payload is not None
+
+        raw_paths = payload.get("paths")
+        if not isinstance(raw_paths, list) or not (2 <= len(raw_paths) <= 4):
+            return jsonify(error="Provide between 2 and 4 JSON report paths to compare."), 400
+
+        summaries: list[dict[str, Any]] = []
+        for raw_p in raw_paths:
+            if not isinstance(raw_p, str) or not raw_p.strip():
+                return jsonify(error="Each report path must be a non-empty string."), 400
+            rel = raw_p.strip()
+            target, err = _resolve_report_target(rel)
+            if err is not None:
+                return jsonify(error=err[0]), err[1]
+            assert target is not None
+            if target.suffix.lower() != ".json":
+                return jsonify(error=f"Compare supports JSON reports only (got {rel})"), 400
+            try:
+                data = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+            except Exception as exc:  # noqa: BLE001
+                return jsonify(error=f"Malformed JSON report '{rel}': {exc}"), 400
+            if not isinstance(data, dict):
+                return jsonify(error=f"Unsupported JSON report '{rel}'"), 400
+            summaries.append(_summarize_json_report(rel, data))
+
+        def _extract_kpis(s: dict[str, Any]) -> dict[str, Any]:
+            sel = s.get("selected_model") or {}
+            metrics = sel.get("metrics") or {}
+            meta = s.get("meta") or {}
+            rr = s.get("risk_report") or {}
+            ds = s.get("dataset_info") or {}
+            score = metrics.get("metric") if metrics.get("metric") is not None else sel.get("metric")
+            train_t = metrics.get("train_time_s")
+            mem = metrics.get("peak_mem_mb")
+            risk = metrics.get("risk_penalty")
+            lat = metrics.get("latency_ms_per_row")
+            return {
+                "path": s.get("path"),
+                "target": meta.get("target"),
+                "task": meta.get("task") or rr.get("task"),
+                "selected_model": sel.get("name") or sel.get("model_name") or "None",
+                "metric": score,
+                "train_time_s": train_t,
+                "peak_mem_mb": mem,
+                "latency_ms_per_row": lat,
+                "risk_penalty": risk,
+                "test_performance": s.get("test_performance"),
+                "rows": ds.get("rows"),
+                "columns": ds.get("columns"),
+                "candidates_count": len(s.get("candidates_evaluated") or []),
+                "pareto_count": len(s.get("pareto_front") or []),
+            }
+
+        items = [_extract_kpis(s) for s in summaries]
+        base = items[0]
+        for idx, item in enumerate(items):
+            if idx == 0:
+                item["deltas"] = {"metric": 0.0, "train_time_s": 0.0, "peak_mem_mb": 0.0, "risk_penalty": 0.0}
+                continue
+            deltas: dict[str, float | None] = {}
+            for key in ("metric", "train_time_s", "peak_mem_mb", "risk_penalty"):
+                a, b = base.get(key), item.get(key)
+                if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                    deltas[key] = round(float(b) - float(a), 6)
+                else:
+                    deltas[key] = None
+            item["deltas"] = deltas
+
+        return jsonify(_sanitize_json_value({"baseline": base["path"], "reports": items}))
 
     @app.post("/api/job/<job_id>/stop")
     @app.post("/api/stop/<job_id>")
@@ -1953,6 +2308,7 @@ def create_app() -> Flask:
             runner=str(RUNNER),
             runner_present=RUNNER.is_file(),
             active_job=active.id if active and active.status == "running" else None,
+            queue_length=len(manager.list_queue()),
         )
 
     return app

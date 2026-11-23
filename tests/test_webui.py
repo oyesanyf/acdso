@@ -119,7 +119,22 @@ class TestWebUIStartupAndAssets:
         resp = client.get("/")
         assert resp.status_code == 200
         html = resp.get_data(as_text=True)
+        css_resp = client.get("/static/workbench.css")
+        assert css_resp.status_code == 200
+        css = css_resp.get_data(as_text=True)
+        charts_resp = client.get("/static/charts.js")
+        assert charts_resp.status_code == 200
+        charts_js = charts_resp.get_data(as_text=True)
+        wb_resp = client.get("/static/workbench.js")
+        assert wb_resp.status_code == 200
+        wb_js = wb_resp.get_data(as_text=True)
+
+        bundle = "\n".join((html, css, charts_js, wb_js))
         for token in (
+            'meta name="color-scheme"',
+            "/static/workbench.css",
+            "/static/charts.js",
+            "/static/workbench.js",
             "recentUploads",
             "targetPickerList",
             "goalPredictBtn",
@@ -128,33 +143,45 @@ class TestWebUIStartupAndAssets:
             "advancedFlags",
             "pipelineStepper",
             "reportInspector",
+            "queueIfBusy",
+            "compareRunsBtn",
             ".msg.warn",
             "safeFetchJson",
             "syncDecisionOptsVisibility",
             'data-match="data loading"',
-            "if (data.command) $('cmd').textContent = data.command;",
             "state.columnsBlocked = false;",
+            "EventSource",
+            "renderParetoPlotHtml",
+            "enhanceSortableTable",
         ):
-            assert token in html, f"Missing workbench token {token!r}"
-        assert "#c33" not in html.lower()
-        assert "\ufffd" not in html
+            assert token in bundle, f"Missing workbench token {token!r}"
+        assert "#c33" not in bundle.lower()
+        assert "\ufffd" not in bundle
 
     def test_index_script_passes_node_syntax_check(self, client, tmp_path):
         if not NODE_EXE.is_file():
             pytest.skip("Node.js not installed at expected path")
         html = client.get("/").get_data(as_text=True)
-        match = re.search(r"<script>(.*)</script>", html, re.DOTALL)
-        assert match is not None, "Could not find <script> block in index.html"
-        js_file = tmp_path / "workbench.js"
-        js_file.write_text(match.group(1), encoding="utf-8")
-        proc = subprocess.run(
-            [str(NODE_EXE), "--check", str(js_file)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            check=False,
-        )
-        assert proc.returncode == 0, proc.stderr or proc.stdout
+        match = re.search(r"<script>(.*?)</script>", html, re.DOTALL)
+        assert match is not None, "Could not find bootstrap <script> block in index.html"
+        charts_js = client.get("/static/charts.js").get_data(as_text=True)
+        wb_js = client.get("/static/workbench.js").get_data(as_text=True)
+
+        for name, content in (
+            ("bootstrap.js", match.group(1)),
+            ("charts.js", charts_js),
+            ("workbench.js", wb_js),
+        ):
+            js_file = tmp_path / name
+            js_file.write_text(content, encoding="utf-8")
+            proc = subprocess.run(
+                [str(NODE_EXE), "--check", str(js_file)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            assert proc.returncode == 0, f"{name}: {proc.stderr or proc.stdout}"
 
 
 class TestWebUIUploadsAndPersistence:
@@ -775,3 +802,188 @@ class TestWebUIHardeningRegressions:
         ts_plan = build_plan("predict Price", ts_df)
         assert ts_plan["predict"] == ["Price"]
         assert ts_plan["datetime_col"] == ["Date"]
+
+
+class TestWebUISSEQueueAndCompare:
+    """Verify SSE streaming, opt-in FIFO job queue, compare-reports API, and charts.js."""
+
+    def test_sse_stream_emits_log_progress_status_and_done(self, client, monkeypatch, tmp_path):
+        import acdso.webui.app as webui_app
+
+        stub = tmp_path / "sse_stub.py"
+        stub.write_text(
+            "import json, sys, time\n"
+            "print('[ACDSO_PROGRESS] ' + json.dumps({'phase': 1, 'total': 2, 'name': 'Data Loading', 'status': 'running', 'detail': ''}), flush=True)\n"
+            "print('hello sse line', flush=True)\n"
+            "time.sleep(0.1)\n"
+            "print('[ACDSO_PROGRESS] ' + json.dumps({'phase': 2, 'total': 2, 'name': 'Report', 'status': 'done', 'detail': 'ok'}), flush=True)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(webui_app, "RUNNER", stub)
+        up = _upload_sample(client, "tips_0cccb3b1499e.csv")
+        r = client.post("/api/run", json={"upload_id": up["upload_id"], "predict": ["tip"]})
+        assert r.status_code == 200
+        jid = r.get_json()["job_id"]
+
+        stream_resp = client.get(f"/api/job/{jid}/stream?cursor=0&max_seconds=15")
+        assert stream_resp.status_code == 200
+        assert stream_resp.mimetype == "text/event-stream"
+        # PEP 3333: WSGI apps must never emit hop-by-hop headers (Waitress enforces this strictly)
+        hop_by_hop = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"}
+        emitted_hdrs = {k.lower() for k in stream_resp.headers.keys()}
+        assert emitted_hdrs.isdisjoint(hop_by_hop), f"Hop-by-hop headers emitted: {emitted_hdrs & hop_by_hop}"
+        body = stream_resp.get_data(as_text=True)
+        assert "event: log" in body
+        assert "hello sse line" in body
+        assert "event: progress" in body
+        assert "event: done" in body
+
+    def test_fifo_queue_auto_promotes_and_supports_cancel(self, client, monkeypatch, tmp_path):
+        import acdso.webui.app as webui_app
+
+        stub = tmp_path / "queue_stub.py"
+        stub.write_text(
+            "import sys, time\n"
+            "print('job args:', sys.argv[1:], flush=True)\n"
+            "time.sleep(0.6)\n"
+            "print('job done', flush=True)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(webui_app, "RUNNER", stub)
+        up = _upload_sample(client, "tips_0cccb3b1499e.csv")
+        uid = up["upload_id"]
+
+        # Job 1 starts immediately
+        r1 = client.post("/api/run", json={"upload_id": uid, "predict": ["tip"]})
+        assert r1.status_code == 200
+        j1 = r1.get_json()["job_id"]
+
+        # Default (queue=False) still rejects with 409 + queueable=True
+        r_conflict = client.post("/api/run", json={"upload_id": uid, "predict": ["tip"]})
+        assert r_conflict.status_code == 409
+        assert r_conflict.get_json().get("queueable") is True
+
+        # Enqueue Job 2 & Job 3
+        r2 = client.post("/api/run", json={"upload_id": uid, "predict": ["tip"], "queue": True})
+        assert r2.status_code == 202
+        j2 = r2.get_json()["job_id"]
+        assert r2.get_json()["queue_position"] == 1
+
+        r3 = client.post("/api/run", json={"upload_id": uid, "predict": ["smoker"], "queue": True})
+        assert r3.status_code == 202
+        j3 = r3.get_json()["job_id"]
+        assert r3.get_json()["queue_position"] == 2
+
+        q_list = client.get("/api/queue").get_json()
+        assert len(q_list["queue"]) == 2
+
+        # Cancel Job 3 while still queued
+        r_del = client.delete(f"/api/queue/{j3}")
+        assert r_del.status_code == 200
+        assert client.get(f"/api/job/{j3}").get_json()["status"] == "cancelled"
+
+        # Wait for Job 1 and auto-promoted Job 2 to both finish cleanly
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            s1 = client.get(f"/api/job/{j1}").get_json()["status"]
+            s2 = client.get(f"/api/job/{j2}").get_json()["status"]
+            if s1 == "finished" and s2 == "finished":
+                break
+            time.sleep(0.15)
+        assert client.get(f"/api/job/{j1}").get_json()["status"] == "finished"
+        assert client.get(f"/api/job/{j2}").get_json()["status"] == "finished"
+
+    def test_compare_reports_deltas_and_traversal_guard(self, client, isolated_webui_dirs):
+        rep_dir = isolated_webui_dirs["reports"]
+        r1_path = rep_dir / "exp_base_combined.json"
+        r2_path = rep_dir / "exp_challenger_combined.json"
+        r1_path.write_text(
+            json.dumps({
+                "target": "tip",
+                "task": "regression",
+                "selected_model": {"name": "Ridge", "metrics": {"metric": 0.40, "train_time_s": 0.5, "peak_mem_mb": 2.0, "risk_penalty": 0.2}},
+                "dataset_info": {"rows": 244, "columns": 7},
+                "candidates_evaluated": [{"name": "Ridge", "metric": 0.40}],
+                "pareto_front": [{"name": "Ridge"}],
+            }),
+            encoding="utf-8",
+        )
+        r2_path.write_text(
+            json.dumps({
+                "target": "tip",
+                "task": "regression",
+                "selected_model": {"name": "StackingEnsemble", "metrics": {"metric": 0.46, "train_time_s": 0.9, "peak_mem_mb": 3.5, "risk_penalty": 0.15}},
+                "dataset_info": {"rows": 244, "columns": 7},
+                "candidates_evaluated": [{"name": "Ridge", "metric": 0.40}, {"name": "StackingEnsemble", "metric": 0.46}],
+                "pareto_front": [{"name": "Ridge"}, {"name": "StackingEnsemble"}],
+            }),
+            encoding="utf-8",
+        )
+
+        # Path traversal rejected with 403
+        bad = client.post("/api/compare-reports", json={"paths": ["exp_base_combined.json", "../run_acdso.py"]})
+        assert bad.status_code == 403
+
+        # Valid comparison computes exact deltas
+        ok = client.post("/api/compare-reports", json={"paths": ["exp_base_combined.json", "exp_challenger_combined.json"]})
+        assert ok.status_code == 200
+        body = ok.get_json()
+        assert len(body["reports"]) == 2
+        assert abs(body["reports"][1]["deltas"]["metric"] - 0.06) < 1e-6
+        assert abs(body["reports"][1]["deltas"]["risk_penalty"] - (-0.05)) < 1e-6
+
+    def test_charts_js_visualizations_and_xss_safety_in_node(self, client, tmp_path):
+        if not NODE_EXE.is_file():
+            pytest.skip("Node.js not installed")
+        charts_js = client.get("/static/charts.js").get_data(as_text=True)
+        driver = tmp_path / "charts_test.js"
+        driver.write_text(
+            charts_js
+            + "\n"
+            + r"""
+const assert = require('assert');
+const C = globalThis.ACDSOCharts;
+const paretoHtml = C.renderParetoPlotHtml(
+  [
+    { name: 'Ridge<script>', metric: 0.42, train_time_s: 0.1, peak_mem_mb: 1.2, risk_penalty: 0.15 },
+    { name: 'StackingEnsemble', metric: 0.48, train_time_s: 0.8, peak_mem_mb: 4.5, risk_penalty: 0.12 },
+  ],
+  [{ name: 'Ridge<script>' }, { name: 'StackingEnsemble' }],
+  'StackingEnsemble',
+  'train_time_s'
+);
+assert(paretoHtml.includes('<svg'), 'Pareto SVG missing');
+assert(!paretoHtml.includes('<script>'), 'XSS leaked into Pareto SVG');
+
+const fiHtml = C.renderFeatureImportanceHtml([
+  { feature_name: 'total_bill', importance_mean: 0.72 },
+  { feature_name: 'size', importance_mean: 0.19 },
+]);
+assert(fiHtml.includes('total_bill') && fiHtml.includes('<svg'), 'Feature importance SVG missing');
+
+const diagHtml = C.renderPredictionDiagnosticsHtml(
+  { sample_values: [{ row: 0, actual: 2.0, predicted: 2.2 }, { row: 1, actual: 5.0, predicted: 4.8 }] },
+  'regression'
+);
+assert(diagHtml.includes('Actual vs. Predicted') && diagHtml.includes('<svg'), 'Diagnostics SVG missing');
+
+const cmpHtml = C.renderRunComparisonHtml({
+  reports: [
+    { path: 'a.json', target: 'tip', selected_model: 'Ridge', metric: 0.4, train_time_s: 0.1, peak_mem_mb: 1.0, risk_penalty: 0.2, deltas: { metric: 0 } },
+    { path: 'b.json', target: 'tip', selected_model: 'Stacking', metric: 0.45, train_time_s: 0.5, peak_mem_mb: 2.0, risk_penalty: 0.15, deltas: { metric: 0.05, train_time_s: 0.4, peak_mem_mb: 1.0, risk_penalty: -0.05 } },
+  ],
+});
+assert(cmpHtml.includes('+0.0500') && cmpHtml.includes('Stacking'), 'Compare table missing deltas');
+console.log('CHARTS_OK');
+""",
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [str(NODE_EXE), str(driver)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+        assert "CHARTS_OK" in proc.stdout

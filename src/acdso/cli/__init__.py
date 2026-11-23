@@ -1,0 +1,73 @@
+"""Modular CLI utilities extracted from run_acdso.py for clean reuse and fast imports."""
+
+from __future__ import annotations
+
+from acdso.cli.console import (
+    DualOutput,
+    _configure_console,
+    _emit_progress,
+    _is_tty,
+    _render_phase_banner,
+    _use_ansi,
+    capture_and_display_console,
+    capture_console_output,
+    print_dict,
+    print_header,
+    print_subheader,
+    print_table,
+)
+from acdso.cli.io import (
+    _detect_datetime_column,
+    _encode_categoricals_safe,
+    _is_datetime_series,
+    _read_csv_with_fallback,
+    _read_xlsx_stdlib,
+    _sanitize_target_rows,
+    _validate_dataframe_nonempty,
+    load_user_file,
+)
+from acdso.cli.reporting import (
+    _esc,
+    _file_link_cell,
+    _file_uri,
+    _generate_multi_target_html_report,
+    _json_safe_scalar,
+    _sanitize_embedded_html,
+    _sanitize_json_payload,
+    generate_combined_report,
+    generate_html_report_from_combined,
+    save_combined_report,
+)
+
+__all__ = [
+    "DualOutput",
+    "_configure_console",
+    "_detect_datetime_column",
+    "_emit_progress",
+    "_encode_categoricals_safe",
+    "_esc",
+    "_file_link_cell",
+    "_file_uri",
+    "_generate_multi_target_html_report",
+    "_is_datetime_series",
+    "_is_tty",
+    "_json_safe_scalar",
+    "_read_csv_with_fallback",
+    "_read_xlsx_stdlib",
+    "_render_phase_banner",
+    "_sanitize_embedded_html",
+    "_sanitize_json_payload",
+    "_sanitize_target_rows",
+    "_use_ansi",
+    "_validate_dataframe_nonempty",
+    "capture_and_display_console",
+    "capture_console_output",
+    "generate_combined_report",
+    "generate_html_report_from_combined",
+    "load_user_file",
+    "print_dict",
+    "print_header",
+    "print_subheader",
+    "print_table",
+    "save_combined_report",
+]
