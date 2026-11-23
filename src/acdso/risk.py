@@ -160,7 +160,10 @@ def _temporal_leakage_gap(
 
     try:
         if not pd.api.types.is_datetime64_any_dtype(df[tcol]):
-            parsed = pd.to_datetime(df[tcol], errors="coerce")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                warnings.simplefilter("ignore", FutureWarning)
+                parsed = pd.to_datetime(df[tcol], errors="coerce")
         else:
             parsed = df[tcol]
         if parsed.isna().mean() > 0.5:

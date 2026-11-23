@@ -195,13 +195,16 @@ def _rule_based_plan(prompt: str, frame: pd.DataFrame, columns: list[str]) -> di
             "top-ranked predictable column."
         )
 
-    datetime_col = [
+    dt_candidates = [
         c
         for c in columns
         if c not in predict
         and not pd.api.types.is_numeric_dtype(frame[c])
-        and (_DATE_NAME_RE.search(c) or _is_datetime_like(frame[c]))
-    ][:1]
+        and _is_datetime_like(frame[c])
+    ]
+    # Prefer columns whose name also signals date/time among genuinely datetime-like columns.
+    dt_candidates.sort(key=lambda c: (0 if _DATE_NAME_RE.search(c) else 1))
+    datetime_col = dt_candidates[:1]
 
     return {
         "predict": predict,

@@ -528,6 +528,7 @@ const FLAG_META = {{ flag_meta | safe }};
 
 const state = {
   uploadId: null,
+  uploadFileName: null,
   columns: [],
   dtypes: {},
   columnStats: [],
@@ -536,6 +537,7 @@ const state = {
   jobId: null,
   cursor: 0,
   poll: null,
+  pollInFlight: false,
   pollFailures: 0,
   columnsBlocked: false,
   logLines: [],
@@ -605,6 +607,7 @@ fileInput.addEventListener('change', () => {
 
 function applyLoadedUpload(data) {
   state.uploadId = data.upload_id;
+  state.uploadFileName = data.stored_as || data.filename || null;
   state.columns = data.columns || [];
   state.dtypes = data.dtypes || {};
   state.columnStats = data.column_stats || [];
@@ -613,6 +616,8 @@ function applyLoadedUpload(data) {
 
   clearTimeout(columnCheckTimer);
   clearTimeout(horizonCheckTimer);
+  if ($('targetSearch')) $('targetSearch').value = '';
+  if ($('excludeSearch')) $('excludeSearch').value = '';
   $('colCheck').innerHTML = '';
   $('horizonSuggestion').innerHTML = '';
   $('horizonSuggestion').style.display = 'none';
@@ -692,11 +697,19 @@ async function loadRecentUploads(selectedId) {
     sel.innerHTML = '<option value="">No uploaded datasets yet</option>';
     return;
   }
+  const nameCounts = new Map();
+  for (const u of list) {
+    const key = u.filename || '';
+    nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+  }
   sel.innerHTML = list.map((u) => {
     const info = u.rows != null
       ? Number(u.rows).toLocaleString() + ' rows, ' + (u.columns ? u.columns.length : '?') + ' cols'
       : fmtSize(u.size_bytes);
-    return '<option value="' + esc(u.upload_id) + '">' + esc(u.filename) + ' (' + esc(info) + ')</option>';
+    const dupTag = (nameCounts.get(u.filename || '') || 0) > 1 && u.upload_id
+      ? ' · #' + String(u.upload_id).slice(0, 6)
+      : '';
+    return '<option value="' + esc(u.upload_id) + '">' + esc(u.filename) + ' (' + esc(info) + esc(dupTag) + ')</option>';
   }).join('');
   if (selectedId) sel.value = selectedId;
   else if (state.uploadId) sel.value = state.uploadId;
@@ -1007,18 +1020,30 @@ function renderForecastChart(d) {
   const fcPts = fcSeries.map((p, i) => xAt(fcStart + i).toFixed(1) + ',' + yAt(p.value).toFixed(1)).join(' ');
   const splitX = xAt(fcStart).toFixed(1);
 
+  const dotStride = all.length > 60 ? Math.ceil(hist.length / 24) : 1;
   const circles = all.map((p, i) => {
     const isFc = i >= hist.length;
+    if (!isFc && dotStride > 1 && i !== 0 && i !== hist.length - 1 && i % dotStride !== 0) {
+      return '';
+    }
     const color = isFc ? '#4fd18b' : '#5b9dff';
-    return '<circle cx="' + xAt(i).toFixed(1) + '" cy="' + yAt(p.value).toFixed(1) + '" r="3.5" fill="' + color + '">' +
+    const r = isFc ? '3.5' : (all.length > 60 ? '2.2' : '3.5');
+    return '<circle cx="' + xAt(i).toFixed(1) + '" cy="' + yAt(p.value).toFixed(1) + '" r="' + r + '" fill="' + color + '">' +
       '<title>' + esc(p.period) + ': ' + esc(fmtValue(p.value, d.value_col)) + (isFc ? ' (forecast)' : ' (actual)') + '</title></circle>';
   }).join('');
 
   const midV = (minV + maxV) / 2;
-  const splitLabel = hist.length ? hist[hist.length - 1].period : '';
+  const splitNum = Number(splitX);
+  const splitClear = hist.length && (splitNum - padL >= 75) && ((W - padR) - splitNum >= 75);
+  const midIdx = Math.floor((all.length - 1) / 2);
+  const midLabelEl = splitClear
+    ? '<text x="' + splitX + '" y="' + (H - 8) + '" fill="#98a1b3" font-size="10" text-anchor="middle">' + esc(hist[hist.length - 1].period) + '</text>'
+    : (all.length > 2
+      ? '<text x="' + ((padL + (W - padR)) / 2).toFixed(1) + '" y="' + (H - 8) + '" fill="#98a1b3" font-size="10" text-anchor="middle">' + esc(all[midIdx].period) + '</text>'
+      : '');
   return '<div class="chart-wrap" style="margin:10px 0">' +
     '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="History and forecast chart">' +
-    '<rect x="' + splitX + '" y="' + padT + '" width="' + Math.max(0, W - padR - Number(splitX)).toFixed(1) + '" height="' + plotH + '" fill="rgba(79,209,139,0.08)" />' +
+    '<rect x="' + splitX + '" y="' + padT + '" width="' + Math.max(0, W - padR - splitNum).toFixed(1) + '" height="' + plotH + '" fill="rgba(79,209,139,0.08)" />' +
     '<line x1="' + padL + '" y1="' + padT + '" x2="' + (W - padR) + '" y2="' + padT + '" stroke="#2a2f3a" stroke-dasharray="3,3" />' +
     '<line x1="' + padL + '" y1="' + (padT + plotH / 2).toFixed(1) + '" x2="' + (W - padR) + '" y2="' + (padT + plotH / 2).toFixed(1) + '" stroke="#2a2f3a" stroke-dasharray="3,3" />' +
     '<line x1="' + padL + '" y1="' + (padT + plotH) + '" x2="' + (W - padR) + '" y2="' + (padT + plotH) + '" stroke="#2a2f3a" />' +
@@ -1026,7 +1051,7 @@ function renderForecastChart(d) {
     '<text x="' + (padL - 6) + '" y="' + (padT + plotH / 2 + 4).toFixed(1) + '" fill="#98a1b3" font-size="10" text-anchor="end">' + esc(fmtValue(midV, d.value_col)) + '</text>' +
     '<text x="' + (padL - 6) + '" y="' + (padT + plotH + 4) + '" fill="#98a1b3" font-size="10" text-anchor="end">' + esc(fmtValue(minV, d.value_col)) + '</text>' +
     '<text x="' + padL + '" y="' + (H - 8) + '" fill="#98a1b3" font-size="10">' + esc(all[0].period) + '</text>' +
-    (splitLabel ? '<text x="' + splitX + '" y="' + (H - 8) + '" fill="#98a1b3" font-size="10" text-anchor="middle">' + esc(splitLabel) + '</text>' : '') +
+    midLabelEl +
     '<text x="' + (W - padR) + '" y="' + (H - 8) + '" fill="#4fd18b" font-size="10" text-anchor="end">' + esc(all[all.length - 1].period) + '</text>' +
     (hist.length > 1 ? '<polyline fill="none" stroke="#5b9dff" stroke-width="2" points="' + histPts + '" />' : '') +
     (fcSeries.length > 1 ? '<polyline fill="none" stroke="#4fd18b" stroke-width="2" stroke-dasharray="5,4" points="' + fcPts + '" />' : '') +
@@ -1152,7 +1177,7 @@ function collectPayload() {
 function refreshCommand() {
   const p = collectPayload();
   const parts = ['python', 'run_acdso.py'];
-  if (state.uploadId) parts.push('--file', 'uploads/<your file>');
+  if (state.uploadId) parts.push('--file', 'uploads/' + (state.uploadFileName || '<your file>'));
   for (const meta of FLAG_META) {
     const v = p[meta.name];
     if (meta.kind === 'bool') { if (v) parts.push(meta.cli); continue; }
@@ -1509,6 +1534,7 @@ function startJobTracking(jobId, command) {
   if (state.poll) clearInterval(state.poll);
   state.jobId = jobId;
   state.cursor = 0;
+  state.pollInFlight = false;
   state.pollFailures = 0;
   state.autoInspectedJob = null;
   resetLogView('');
@@ -1537,8 +1563,17 @@ $('stopBtn').addEventListener('click', async () => {
 });
 
 async function poll() {
-  if (!state.jobId) return;
-  const r = await safeFetchJson('/api/job/' + encodeURIComponent(state.jobId) + '?cursor=' + state.cursor);
+  if (!state.jobId || state.pollInFlight) return;
+  const reqJobId = state.jobId;
+  const reqCursor = state.cursor;
+  state.pollInFlight = true;
+  let r;
+  try {
+    r = await safeFetchJson('/api/job/' + encodeURIComponent(reqJobId) + '?cursor=' + reqCursor);
+  } finally {
+    state.pollInFlight = false;
+  }
+  if (reqJobId !== state.jobId) return;
   if (!r.ok) {
     state.pollFailures += 1;
     if (r.status === 404 || state.pollFailures >= 5) {
@@ -1555,9 +1590,13 @@ async function poll() {
   state.pollFailures = 0;
   const data = r.data;
   if (data.command) $('cmd').textContent = data.command;
-  if (data.lines && data.lines.length) {
+  if (data.lines && data.lines.length && reqCursor === state.cursor) {
     appendLogChunk(data.lines);
-    state.cursor = data.cursor;
+    if (typeof data.cursor === 'number' && data.cursor > state.cursor) {
+      state.cursor = data.cursor;
+    } else {
+      state.cursor += data.lines.length;
+    }
   }
   $('elapsed').textContent = data.elapsed + 's elapsed';
   $('logfile').textContent = 'log: ' + data.log_file;
@@ -1721,7 +1760,14 @@ function renderInspector() {
         ? '<div class="scroll-x" style="max-height:220px; overflow-y:auto; margin-bottom:8px"><table><tr><th>Target</th><th>Selected Model</th><th>CV Score</th><th>Train (s)</th></tr>' +
           mtRows + '</table></div>'
         : '') +
-      (Object.keys(tp).length ? '<div class="hint"><strong>Test performance:</strong> ' + esc(JSON.stringify(tp)) + '</div>' : '') +
+      (Object.keys(tp).length
+        ? '<div class="row" style="gap:8px; margin:8px 0">' +
+          '<span class="hint" style="margin:0"><strong>Test performance:</strong></span>' +
+          Object.entries(tp).map(([k, v]) => {
+            const valStr = typeof v === 'number' && Number.isFinite(v) ? v.toFixed(4) : String(v);
+            return '<span class="pill">' + esc(k.toUpperCase()) + ': <strong>' + esc(valStr) + '</strong></span>';
+          }).join('') + '</div>'
+        : '') +
       (phases.length
         ? '<div class="scroll-x" style="max-height:220px; overflow-y:auto"><table><tr><th>Phase</th><th>Status</th><th>Time (s)</th></tr>' +
           phases.map((p) => '<tr><td>' + esc(p.name || '') + '</td><td>' + esc(p.status || '') + '</td><td>' + (p.time != null && Number.isFinite(Number(p.time)) ? fmtNum(p.time, 2) : '') + '</td></tr>').join('') +
@@ -1781,9 +1827,35 @@ function renderInspector() {
       (htmlPath ? '<a class="btn sm" href="/api/artifact?path=' + encodeURIComponent(htmlPath) + '&inline=1" target="_blank">Open full HTML report</a>' : '');
   } else if (tab === 'predictions') {
     const pred = d.predictions;
-    body.innerHTML = pred
-      ? '<div class="hint">' + esc(JSON.stringify(pred, null, 2)) + '</div>'
-      : '<div class="hint">Inspect a <code class="inline">predictions_*.csv</code> or <code class="inline">forecast_*.csv</code> file in Report History to preview predicted rows.</div>';
+    if (!pred) {
+      body.innerHTML = '<div class="hint">Inspect a <code class="inline">predictions_*.csv</code> or <code class="inline">forecast_*.csv</code> file in Report History to preview predicted rows.</div>';
+    } else if (typeof pred === 'object' && !Array.isArray(pred)) {
+      const stats = pred.statistics && typeof pred.statistics === 'object' ? pred.statistics : {};
+      const samples = Array.isArray(pred.sample_values) ? pred.sample_values : [];
+      const kpis = [
+        pred.total_predictions != null
+          ? '<div class="kpi-card"><div class="k-label">Predictions</div><div class="k-val">' + Number(pred.total_predictions).toLocaleString() + '</div></div>'
+          : '',
+        stats.mean != null ? '<div class="kpi-card"><div class="k-label">Mean</div><div class="k-val">' + fmtNum(stats.mean, 4) + '</div></div>' : '',
+        stats.std != null ? '<div class="kpi-card"><div class="k-label">Std Dev</div><div class="k-val">' + fmtNum(stats.std, 4) + '</div></div>' : '',
+        stats.min != null && stats.max != null
+          ? '<div class="kpi-card"><div class="k-label">Range</div><div class="k-val">' + fmtNum(stats.min, 3) + ' – ' + fmtNum(stats.max, 3) + '</div></div>'
+          : '',
+      ].filter(Boolean).join('');
+      const sampleCols = samples.length && typeof samples[0] === 'object' ? Object.keys(samples[0]) : [];
+      const sampleTable = sampleCols.length
+        ? '<div class="scroll-x" style="max-height:260px; overflow-y:auto"><table><tr>' +
+          sampleCols.map((c) => '<th>' + esc(c) + '</th>').join('') + '</tr>' +
+          samples.map((row) => '<tr>' + sampleCols.map((c) => {
+            const v = row[c];
+            const fmt = typeof v === 'number' && Number.isFinite(v) && c !== 'row' ? v.toFixed(4) : (v == null ? '' : String(v));
+            return '<td>' + esc(fmt) + '</td>';
+          }).join('') + '</tr>').join('') + '</table></div>'
+        : '<div class="hint">' + esc(JSON.stringify(pred, null, 2)) + '</div>';
+      body.innerHTML = (kpis ? '<div class="kpi-grid">' + kpis + '</div>' : '') + sampleTable;
+    } else {
+      body.innerHTML = '<div class="hint">' + esc(JSON.stringify(pred, null, 2)) + '</div>';
+    }
   }
 }
 

@@ -398,4 +398,28 @@ class TestVectorizedRiskDiagnostics:
         ]
         assert imputer_warnings == []
 
+    def test_analyze_risk_categorical_time_column_no_datetime_warning(self):
+        """Categorical columns named 'time' (e.g. Dinner/Lunch) do not emit pandas dateutil warnings."""
+        import warnings
+
+        rng = np.random.RandomState(42)
+        n = 60
+        X = pd.DataFrame({
+            "total_bill": rng.uniform(5.0, 50.0, size=n),
+            "time": rng.choice(["Dinner", "Lunch"], size=n),
+            "size": rng.randint(1, 6, size=n),
+        })
+        y = 0.15 * X["total_bill"] + rng.randn(n) * 0.5
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            report = analyze_risk(X, y, task="regression", random_state=42)
+
+        assert isinstance(report, RiskReport)
+        dt_warnings = [
+            w for w in caught
+            if issubclass(w.category, UserWarning) and "Could not infer format" in str(w.message)
+        ]
+        assert dt_warnings == []
+
 

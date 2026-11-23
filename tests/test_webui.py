@@ -748,3 +748,30 @@ class TestWebUIHardeningRegressions:
         with ThreadPoolExecutor(max_workers=6) as pool:
             list(pool.map(worker, range(12)))
         assert not errors, f"Concurrent upload/list errors: {errors}"
+
+    def test_nl_plan_rejects_categorical_time_column_as_datetime(self):
+        """A categorical column named 'time' (e.g. Lunch/Dinner) must not be tagged datetime_col."""
+        import pandas as pd
+
+        from acdso.webui.nl_plan import build_plan
+
+        tips_like = pd.DataFrame({
+            "total_bill": [16.99, 10.34, 21.01, 23.68, 24.59, 25.29],
+            "tip": [1.01, 1.66, 3.50, 3.31, 3.61, 4.71],
+            "sex": ["Female", "Male", "Male", "Male", "Female", "Male"],
+            "smoker": ["No", "No", "No", "No", "No", "No"],
+            "day": ["Sun", "Sun", "Sun", "Sun", "Sun", "Sun"],
+            "time": ["Dinner", "Lunch", "Dinner", "Lunch", "Dinner", "Dinner"],
+            "size": [2, 3, 3, 2, 4, 4],
+        })
+        plan = build_plan("predict tip", tips_like)
+        assert plan["predict"] == ["tip"]
+        assert plan["datetime_col"] == []
+
+        ts_df = pd.DataFrame({
+            "Date": ["2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01"],
+            "Price": [100.0, 105.0, 102.5, 110.0],
+        })
+        ts_plan = build_plan("predict Price", ts_df)
+        assert ts_plan["predict"] == ["Price"]
+        assert ts_plan["datetime_col"] == ["Date"]
