@@ -26,6 +26,14 @@ from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.utils import check_random_state
 
+from acdso.cv import (
+    build_cv_splitter,
+    iter_cv_splits,
+    resolve_cv_strategy_name,
+    sample_by_groups,
+    validate_groups,
+    validate_no_group_leakage,
+)
 from acdso.utils import (
     infer_target_type,
     split_columns,
@@ -114,10 +122,27 @@ class RiskReport:
     linearity_score: float = 0.0
 
     notes: List[str] = field(default_factory=list)
+    cv_strategy: str = "auto"
+    n_groups: Optional[int] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
+
+
+def _to_classification_target_array(y_ser: pd.Series) -> np.ndarray:
+    """Normalize a filtered classification target Series (incl. object-of-bool) to a NumPy array."""
+    if pd.api.types.is_numeric_dtype(y_ser) or pd.api.types.is_bool_dtype(y_ser):
+        return y_ser.to_numpy()
+    y_inf = y_ser.infer_objects()
+    if pd.api.types.is_numeric_dtype(y_inf) or pd.api.types.is_bool_dtype(y_inf):
+        return y_inf.to_numpy()
+    vals = y_ser.tolist()
+    if vals and all(isinstance(v, (bool, np.bool_)) for v in vals):
+        return np.asarray(vals, dtype=bool)
+    return y_ser.astype(object).to_numpy()
 
 
 def _temporal_leakage_gap(
@@ -127,6 +152,9 @@ def _temporal_leakage_gap(
     cv: int,
     task: str,
     random_state: int,
+    groups: Optional[Any] = None,
+    cv_strategy: str = "auto",
+    tcol_hint: Optional[str] = None,
 ) -> Optional[float]:
     """
     Detect temporal leakage by comparing chronological vs shuffled CV.
@@ -148,54 +176,160 @@ def _temporal_leakage_gap(
         Task type ("classification" or "regression").
     random_state : int
         Random seed for reproducibility.
+    groups : array-like, optional
+        Entity/group identifiers aligned with df/y.
+    cv_strategy : str, default="auto"
+        Cross-validation strategy name.
 
     Returns
     -------
     Optional[float]
         Score gap (shuffled - chronological), or None if not applicable.
     """
-    tcol = detect_datetime_column(df)
+    tcol = tcol_hint if (tcol_hint is not None and tcol_hint in df.columns) else detect_datetime_column(df)
     if tcol is None:
         return None
 
     try:
-        if not pd.api.types.is_datetime64_any_dtype(df[tcol]):
+        if pd.api.types.is_datetime64_any_dtype(df[tcol]):
+            parsed = df[tcol]
+            if parsed.isna().mean() > 0.5:
+                return None
+            order = np.argsort(parsed.values.astype("datetime64[ns]").astype(np.int64))
+        elif pd.api.types.is_numeric_dtype(df[tcol]):
+            vals = df[tcol].to_numpy(dtype=np.float64, copy=False)
+            if np.isnan(vals).mean() > 0.5:
+                return None
+            order = np.argsort(np.where(np.isfinite(vals), vals, np.inf))
+        else:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 warnings.simplefilter("ignore", FutureWarning)
                 parsed = pd.to_datetime(df[tcol], errors="coerce")
-        else:
-            parsed = df[tcol]
-        if parsed.isna().mean() > 0.5:
-            return None
+            if parsed.isna().mean() > 0.5:
+                return None
+            order = np.argsort(parsed.values.astype("datetime64[ns]").astype(np.int64))
     except Exception:
         return None
 
-    order = np.argsort(parsed.values.astype("datetime64[ns]").astype(np.int64))
     df_sorted = df.iloc[order].reset_index(drop=True)
     y_sorted = np.asarray(y)[order]
+    groups_sorted = np.asarray(groups)[order] if groups is not None else None
+
+    y_ser = pd.Series(y_sorted)
+    valid_mask = y_ser.notna().to_numpy()
+    if task != "classification":
+        y_num = pd.to_numeric(y_ser, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        valid_mask = valid_mask & np.isfinite(y_num)
+        if not np.all(valid_mask):
+            df_sorted = df_sorted.iloc[valid_mask].reset_index(drop=True)
+            y_sorted = y_num[valid_mask]
+            if groups_sorted is not None:
+                groups_sorted = groups_sorted[valid_mask]
+        else:
+            y_sorted = y_num
+    else:
+        if not np.all(valid_mask):
+            df_sorted = df_sorted.iloc[valid_mask].reset_index(drop=True)
+            y_ser = y_ser.iloc[valid_mask].reset_index(drop=True)
+            if groups_sorted is not None:
+                groups_sorted = groups_sorted[valid_mask]
+        y_sorted = _to_classification_target_array(y_ser)
+
+    if len(y_sorted) < max(4, int(cv) * 2):
+        return None
+    cls_counts: Optional[np.ndarray] = None
+    if task == "classification":
+        uniq_cls, cls_counts = np.unique(y_sorted, return_counts=True)
+        if len(uniq_cls) < 2 or (groups_sorted is None and int(cls_counts.min()) < 2):
+            return None
 
     num_cols, cat_cols = split_columns(df_sorted)
     pre = build_preprocessor(num_cols, cat_cols)
 
     if task == "classification":
         model = LogisticRegression(max_iter=1000)
-        splitter_shuf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
-        splitter_chr = KFold(n_splits=cv, shuffle=False)
     else:
         model = Ridge()
-        splitter_shuf = KFold(n_splits=cv, shuffle=True, random_state=random_state)
-        splitter_chr = KFold(n_splits=cv, shuffle=False)
 
     pipe = Pipeline([("pre", pre), ("model", model)])
 
     try:
+        if groups_sorted is not None:
+            n_uniq_g = int(len(np.unique(groups_sorted)))
+            if n_uniq_g < 2:
+                return None
+            cv_eff = max(2, min(int(cv), n_uniq_g))
+            shuf_strategy = "auto" if str(cv_strategy).strip().lower() == "temporal" else cv_strategy
+            splitter_shuf = build_cv_splitter(
+                cv=cv_eff,
+                y=y_sorted,
+                groups=groups_sorted,
+                task=task,
+                cv_strategy=shuf_strategy,
+                random_state=random_state,
+            )
+            shuf_splits = iter_cv_splits(
+                splitter_shuf,
+                df_sorted,
+                y_sorted,
+                groups_sorted,
+                validate_groups_leakage=True,
+            )
+
+            # Chronological block folds grouped by first-appearance entity order
+            codes, _ = pd.factorize(pd.Series(groups_sorted, dtype=object), sort=False)
+            blocks = np.array_split(np.arange(n_uniq_g), cv_eff)
+            chr_splits: List[Tuple[np.ndarray, np.ndarray]] = []
+            for blk in blocks:
+                if blk.size == 0:
+                    continue
+                val_mask = np.isin(codes, blk)
+                tr_idx = np.flatnonzero(~val_mask)
+                va_idx = np.flatnonzero(val_mask)
+                if tr_idx.size > 0 and va_idx.size > 0:
+                    chr_splits.append((tr_idx, va_idx))
+            if len(chr_splits) < 2:
+                return None
+            validate_no_group_leakage(chr_splits, groups_sorted)
+            cv_shuf: Any = shuf_splits
+            cv_chr: Any = chr_splits
+        else:
+            if task == "classification":
+                assert cls_counts is not None
+                cv_eff_ng = max(2, min(int(cv), int(cls_counts.min())))
+                cv_shuf = StratifiedKFold(n_splits=cv_eff_ng, shuffle=True, random_state=random_state)
+                cv_chr = KFold(n_splits=cv_eff_ng, shuffle=False)
+            else:
+                cv_eff_ng = max(2, min(int(cv), len(y_sorted)))
+                cv_shuf = KFold(n_splits=cv_eff_ng, shuffle=True, random_state=random_state)
+                cv_chr = KFold(n_splits=cv_eff_ng, shuffle=False)
+
+        eff_scorer = _auto_adjust_scorer_for_risk(scorer, y_sorted, task)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=RuntimeWarning)
-            s_shuf = float(np.mean(cross_val_score(pipe, df_sorted, y_sorted, scoring=scorer, cv=splitter_shuf)))
-            s_chr = float(np.mean(cross_val_score(pipe, df_sorted, y_sorted, scoring=scorer, cv=splitter_chr)))
-        return float(s_shuf - s_chr)
+            scores_shuf = np.asarray(
+                cross_val_score(pipe, df_sorted, y_sorted, scoring=eff_scorer, cv=cv_shuf),
+                dtype=float,
+            )
+            scores_chr = np.asarray(
+                cross_val_score(pipe, df_sorted, y_sorted, scoring=eff_scorer, cv=cv_chr),
+                dtype=float,
+            )
+        if (
+            scores_shuf.size == 0
+            or scores_chr.size == 0
+            or not np.all(np.isfinite(scores_shuf))
+            or not np.all(np.isfinite(scores_chr))
+        ):
+            return None
+        s_shuf = float(np.mean(scores_shuf))
+        s_chr = float(np.mean(scores_chr))
+        gap = float(s_shuf - s_chr)
+        if not np.isfinite(gap):
+            return None
+        return gap
     except Exception:
         return None
 
@@ -208,6 +342,8 @@ def _univariate_predictive_power_detailed(
     cv: int,
     random_state: int,
     deadline: Optional[float] = None,
+    groups: Optional[Any] = None,
+    cv_strategy: str = "auto",
 ) -> Tuple[List[Tuple[str, float]], float]:
     """
     Detect potential leakage via fast vectorized pre-screening + top-K CV.
@@ -225,12 +361,24 @@ def _univariate_predictive_power_detailed(
     if n < 4 or df.shape[1] == 0:
         return [], 0.0
 
+    groups_s: Optional[np.ndarray] = np.asarray(groups) if groups is not None else None
     rng = check_random_state(random_state)
     max_rows = min(n, 3000)
     if n > max_rows:
-        idx = rng.choice(n, size=max_rows, replace=False)
-        df_s = df.iloc[idx].reset_index(drop=True)
-        y_s = np.asarray(y)[idx]
+        if groups_s is not None:
+            df_s, y_sub, groups_s = sample_by_groups(
+                df,
+                y=y,
+                groups=groups_s,
+                max_rows=max_rows,
+                random_state=random_state,
+            )
+            df_s = df_s.reset_index(drop=True)
+            y_s = np.asarray(y_sub)
+        else:
+            idx = rng.choice(n, size=max_rows, replace=False)
+            df_s = df.iloc[idx].reset_index(drop=True)
+            y_s = np.asarray(y)[idx]
     else:
         df_s = df
         y_s = np.asarray(y)
@@ -240,15 +388,18 @@ def _univariate_predictive_power_detailed(
     if not np.all(valid_mask):
         df_s = df_s.iloc[valid_mask].reset_index(drop=True)
         y_ser = y_ser.iloc[valid_mask].reset_index(drop=True)
+        if groups_s is not None:
+            groups_s = groups_s[valid_mask]
     if len(y_ser) < 4:
         return [], 0.0
 
     if task == "classification":
-        y_arr = y_ser.astype(object).to_numpy() if not pd.api.types.is_numeric_dtype(y_ser) else y_ser.to_numpy()
+        y_arr = _to_classification_target_array(y_ser)
         uniq_y, counts_y = np.unique(y_arr, return_counts=True)
         if len(uniq_y) < 2:
             return [], 0.0
         min_class_count = int(counts_y.min())
+        max_class_count = int(counts_y.max())
     else:
         y_float = pd.to_numeric(y_ser, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
         finite_y = np.isfinite(y_float)
@@ -257,10 +408,13 @@ def _univariate_predictive_power_detailed(
         if not np.all(finite_y):
             df_s = df_s.iloc[finite_y].reset_index(drop=True)
             y_float = y_float[finite_y]
+            if groups_s is not None:
+                groups_s = groups_s[finite_y]
         if float(np.std(y_float)) < 1e-12:
             return [], 0.0
         y_arr = y_float
         min_class_count = len(y_arr)
+        max_class_count = len(y_arr)
 
     # Normalize duplicate column names for safe positional indexing
     orig_col_names = [str(c) for c in df_s.columns]
@@ -360,20 +514,58 @@ def _univariate_predictive_power_detailed(
     candidates.sort(key=lambda item: item[2], reverse=True)
     top_k = candidates[: min(10, len(candidates))]
 
+    if groups_s is not None and len(np.unique(groups_s)) < 2:
+        fallback = [(orig_name, float(sc)) for _, orig_name, sc, _ in top_k]
+        return fallback, float(fallback[0][1])
+
     if task == "classification":
         if min_class_count < 2:
             fallback = [(orig_name, float(sc)) for _, orig_name, sc, _ in top_k]
             return fallback, float(fallback[0][1])
-        cv_eval = max(2, min(cv, 3, min_class_count))
-        splitter = StratifiedKFold(n_splits=cv_eval, shuffle=True, random_state=random_state)
+        if groups_s is not None:
+            n_uniq_g = int(len(np.unique(groups_s)))
+            cv_eval = max(2, min(cv, 3, n_uniq_g))
+        else:
+            cv_eval = max(2, min(cv, 3, min_class_count))
+        splitter = build_cv_splitter(
+            cv=cv_eval,
+            y=y_arr,
+            groups=groups_s,
+            task=task,
+            cv_strategy=cv_strategy,
+            random_state=random_state,
+        )
         eval_scorer = "f1_weighted" if str(scorer).startswith("neg_") else scorer
         eval_scorer = _auto_adjust_scorer_for_risk(eval_scorer, y_arr, task)
         base_model = LogisticRegression(max_iter=500, random_state=random_state)
     else:
-        cv_eval = max(2, min(cv, 3, len(y_arr) // 2))
-        splitter = KFold(n_splits=cv_eval, shuffle=True, random_state=random_state)
+        if groups_s is not None:
+            n_uniq_g = int(len(np.unique(groups_s)))
+            cv_eval = max(2, min(cv, 3, n_uniq_g, max(2, len(y_arr) // 2)))
+        else:
+            cv_eval = max(2, min(cv, 3, len(y_arr) // 2))
+        splitter = build_cv_splitter(
+            cv=cv_eval,
+            y=y_arr,
+            groups=groups_s,
+            task=task,
+            cv_strategy=cv_strategy,
+            random_state=random_state,
+        )
         eval_scorer = "r2"
         base_model = Ridge(random_state=random_state)
+
+    try:
+        eval_splits = iter_cv_splits(
+            splitter,
+            df_scan,
+            y_arr,
+            groups_s,
+            validate_groups_leakage=(groups_s is not None),
+        )
+    except Exception:
+        fallback = [(orig_name, float(sc)) for _, orig_name, sc, _ in top_k]
+        return fallback, float(fallback[0][1])
 
     scored: List[Tuple[str, float]] = []
 
@@ -399,7 +591,7 @@ def _univariate_predictive_power_detailed(
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
                 warnings.filterwarnings("ignore", category=RuntimeWarning)
-                cv_scores = cross_val_score(pipe, x_col, y_arr, scoring=eval_scorer, cv=splitter)
+                cv_scores = cross_val_score(pipe, x_col, y_arr, scoring=eval_scorer, cv=eval_splits)
             scored.append((orig_name, float(np.mean(cv_scores))))
         except Exception:
             continue
@@ -419,6 +611,8 @@ def _univariate_predictive_power(
     scorer: str,
     cv: int,
     random_state: int,
+    groups: Optional[Any] = None,
+    cv_strategy: str = "auto",
 ) -> Tuple[List[str], float]:
     """
     Detect potential leakage via univariate predictive power.
@@ -440,6 +634,10 @@ def _univariate_predictive_power(
         Number of cross-validation folds.
     random_state : int
         Random seed for reproducibility.
+    groups : array-like, optional
+        Entity/group identifiers aligned with df/y.
+    cv_strategy : str, default="auto"
+        Cross-validation strategy name.
 
     Returns
     -------
@@ -447,7 +645,15 @@ def _univariate_predictive_power(
         Tuple of (top_features, max_score).
     """
     scored, max_score = _univariate_predictive_power_detailed(
-        df, y, task=task, scorer=scorer, cv=cv, random_state=random_state, deadline=None
+        df,
+        y,
+        task=task,
+        scorer=scorer,
+        cv=cv,
+        random_state=random_state,
+        deadline=None,
+        groups=groups,
+        cv_strategy=cv_strategy,
     )
     return [f for f, _ in scored[:5]], max_score
 
@@ -512,6 +718,8 @@ def _detect_linearity(
     task: str,
     cv: int = 5,
     random_state: int = 42,
+    groups: Optional[Any] = None,
+    cv_strategy: str = "auto",
 ) -> Tuple[bool, float]:
     """
     Detect whether the dataset exhibits strong linear relationships.
@@ -529,6 +737,7 @@ def _detect_linearity(
 
     X = df[num_cols].astype(np.float64, copy=False).to_numpy(dtype=np.float64, copy=True)
     X[~np.isfinite(X)] = np.nan
+    groups_arr: Optional[np.ndarray] = np.asarray(groups) if groups is not None else None
     y_ser = pd.Series(y)
     valid_y = y_ser.notna().to_numpy()
     if task != "classification":
@@ -537,13 +746,17 @@ def _detect_linearity(
         if not np.all(valid_y):
             X = X[valid_y]
             y_arr = y_num[valid_y]
+            if groups_arr is not None:
+                groups_arr = groups_arr[valid_y]
         else:
             y_arr = y_num
     else:
         if not np.all(valid_y):
             X = X[valid_y]
             y_ser = y_ser.iloc[valid_y]
-        y_arr = y_ser.astype(object).to_numpy() if not pd.api.types.is_numeric_dtype(y_ser) else y_ser.to_numpy()
+            if groups_arr is not None:
+                groups_arr = groups_arr[valid_y]
+        y_arr = _to_classification_target_array(y_ser)
 
     n = len(y_arr)
     if n < 4:
@@ -552,9 +765,19 @@ def _detect_linearity(
     max_samples = min(n, 3000)
     rng = np.random.RandomState(random_state)
     if n > max_samples:
-        idx = rng.choice(n, size=max_samples, replace=False)
-        X = X[idx]
-        y_arr = y_arr[idx]
+        if groups_arr is not None:
+            X, y_sub, groups_arr = sample_by_groups(
+                X,
+                y=y_arr,
+                groups=groups_arr,
+                max_rows=max_samples,
+                random_state=random_state,
+            )
+            y_arr = np.asarray(y_sub)
+        else:
+            idx = rng.choice(n, size=max_samples, replace=False)
+            X = X[idx]
+            y_arr = y_arr[idx]
 
     try:
         with warnings.catch_warnings():
@@ -574,19 +797,38 @@ def _detect_linearity(
         uniq, counts = np.unique(y_arr, return_counts=True)
         if len(uniq) < 2 or int(counts.min()) < 2:
             return False, 0.0
-        cv_actual = min(cv_actual, int(counts.min()))
+        if groups_arr is None:
+            cv_actual = min(cv_actual, int(counts.min()))
+    if groups_arr is not None:
+        n_uniq_g = int(len(np.unique(groups_arr)))
+        if n_uniq_g < 2:
+            return False, 0.0
+        cv_actual = min(cv_actual, n_uniq_g)
     cv_actual = max(2, cv_actual)
 
     try:
+        splitter = build_cv_splitter(
+            cv=cv_actual,
+            y=y_arr,
+            groups=groups_arr,
+            task=task,
+            cv_strategy=cv_strategy,
+            random_state=random_state,
+        )
+        lin_splits = iter_cv_splits(
+            splitter,
+            X,
+            y_arr,
+            groups_arr,
+            validate_groups_leakage=(groups_arr is not None),
+        )
         if task == "classification":
-            splitter = StratifiedKFold(n_splits=cv_actual, shuffle=True, random_state=random_state)
             linear_model = LogisticRegression(max_iter=500, random_state=random_state)
             nonlinear_model = RandomForestClassifier(
                 n_estimators=30, max_depth=10, random_state=random_state, n_jobs=1
             )
             scorer = "accuracy"
         else:
-            splitter = KFold(n_splits=cv_actual, shuffle=True, random_state=random_state)
             linear_model = Ridge(random_state=random_state)
             nonlinear_model = RandomForestRegressor(
                 n_estimators=30,
@@ -599,9 +841,9 @@ def _detect_linearity(
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
-            linear_scores = cross_val_score(linear_model, X, y_arr, cv=splitter, scoring=scorer)
+            linear_scores = cross_val_score(linear_model, X, y_arr, cv=lin_splits, scoring=scorer)
             linear_mean = float(np.mean(linear_scores))
-            nonlinear_scores = cross_val_score(nonlinear_model, X, y_arr, cv=splitter, scoring=scorer)
+            nonlinear_scores = cross_val_score(nonlinear_model, X, y_arr, cv=lin_splits, scoring=scorer)
             nonlinear_mean = float(np.mean(nonlinear_scores))
 
         if nonlinear_mean <= 0:
@@ -632,9 +874,48 @@ def _detect_linearity(
         return False, 0.0
 
 
+_CLASSIFICATION_ONLY_SCORERS = frozenset({
+    "accuracy",
+    "balanced_accuracy",
+    "top_k_accuracy",
+    "average_precision",
+    "neg_brier_score",
+    "brier_score_loss",
+    "f1",
+    "f1_micro",
+    "f1_macro",
+    "f1_weighted",
+    "f1_samples",
+    "precision",
+    "precision_micro",
+    "precision_macro",
+    "precision_weighted",
+    "precision_samples",
+    "recall",
+    "recall_micro",
+    "recall_macro",
+    "recall_weighted",
+    "recall_samples",
+    "jaccard",
+    "jaccard_micro",
+    "jaccard_macro",
+    "jaccard_weighted",
+    "jaccard_samples",
+    "roc_auc",
+    "roc_auc_ovr",
+    "roc_auc_ovo",
+    "roc_auc_ovr_weighted",
+    "roc_auc_ovo_weighted",
+    "neg_log_loss",
+    "log_loss",
+    "matthews_corrcoef",
+    "cohen_kappa",
+})
+
+
 def _auto_adjust_scorer_for_risk(scorer: str, y: Any, task: str) -> str:
     """
-    Auto-adjust scorer for risk analysis to handle multiclass/non-standard labels.
+    Auto-adjust scorer for risk analysis to handle regression defaults and multiclass/non-standard labels.
     
     Parameters
     ----------
@@ -650,7 +931,15 @@ def _auto_adjust_scorer_for_risk(scorer: str, y: Any, task: str) -> str:
     str
         Adjusted scorer name.
     """
-    if task != "classification":
+    task_norm = str(task or "").strip().lower()
+    if task_norm != "classification":
+        if task_norm == "regression":
+            scorer_norm = str(scorer or "").strip().lower()
+            if (
+                scorer_norm in _CLASSIFICATION_ONLY_SCORERS
+                or scorer_norm.startswith(("f1_", "precision_", "recall_", "roc_auc_", "jaccard_"))
+            ):
+                return "r2"
         return scorer
 
     y_clean = pd.Series(y).dropna()
@@ -661,10 +950,15 @@ def _auto_adjust_scorer_for_risk(scorer: str, y: Any, task: str) -> str:
     binary_only_scorers = ["f1", "precision", "recall", "roc_auc"]
 
     if scorer in binary_only_scorers:
-        # Multiclass or non-standard binary labels
-        if n_classes > 2 or (n_classes == 2 and set(unique_labels.tolist()) != {0, 1}):
+        # Multiclass requires ovr_weighted / weighted; binary non-{0,1} keeps roc_auc
+        # because sklearn roc_auc handles arbitrary 2-class labels natively.
+        if n_classes > 2:
             if scorer == "roc_auc":
                 return "roc_auc_ovr_weighted"
+            return f"{scorer}_weighted"
+        if n_classes == 2 and set(unique_labels.tolist()) != {0, 1}:
+            if scorer == "roc_auc":
+                return "roc_auc"
             return f"{scorer}_weighted"
 
     return scorer
@@ -679,6 +973,8 @@ def analyze_risk(
     random_state: int = 42,
     llm_advisor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     time_budget_s: Optional[float] = None,
+    groups: Optional[Any] = None,
+    cv_strategy: str = "auto",
 ) -> RiskReport:
     """
     Perform comprehensive risk analysis on a dataset.
@@ -703,6 +999,11 @@ def analyze_risk(
         Optional LLM advisor function for semantic analysis.
     time_budget_s : Optional[float], default=None
         Optional time budget in seconds for risk diagnostics.
+    groups : array-like, optional
+        Entity/group identifiers aligned with X and y for grouped CV.
+    cv_strategy : str, default="auto"
+        Cross-validation strategy ("auto", "kfold", "stratified",
+        "group_kfold", "stratified_group_kfold", or "temporal").
 
     Returns
     -------
@@ -717,11 +1018,101 @@ def analyze_risk(
         else:
             deadline = time.perf_counter() + float(time_budget_s)
 
+    df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+    n_rows, n_cols = int(df.shape[0]), int(df.shape[1])
+
+    y_len = len(y) if hasattr(y, "__len__") else int(np.asarray(y).shape[0])
+    if y_len != n_rows:
+        raise ValueError(f"X and y must have the same number of rows ({n_rows} vs {y_len}).")
+
+    groups_arr: Optional[np.ndarray] = None
+    n_groups: Optional[int] = None
+    if groups is not None:
+        groups_arr = validate_groups(groups, n_samples=n_rows, min_unique=2)
+        n_groups = int(len(np.unique(groups_arr)))
+
+    # Filter/normalize target for probe_splitter consistency with internal CV diagnostics
+    strategy_norm = cv_strategy.strip().lower() if isinstance(cv_strategy, str) else ""
+    is_temporal = strategy_norm == "temporal"
+
+    y_ser_probe = pd.Series(y)
+    valid_probe = y_ser_probe.notna().to_numpy()
+    groups_probe: Optional[np.ndarray] = groups_arr
+    if str(task or "").strip().lower() == "classification":
+        if not np.all(valid_probe):
+            y_ser_probe = y_ser_probe.iloc[valid_probe].reset_index(drop=True)
+            if groups_probe is not None:
+                groups_probe = groups_probe[valid_probe]
+        y_probe: Any = (
+            _to_classification_target_array(y_ser_probe)
+            if len(y_ser_probe) > 0
+            else np.asarray([], dtype=object)
+        )
+    else:
+        y_num_probe = pd.to_numeric(y_ser_probe, errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)
+        valid_probe = valid_probe & np.isfinite(y_num_probe)
+        if not np.all(valid_probe):
+            y_probe = y_num_probe[valid_probe]
+            if groups_probe is not None:
+                groups_probe = groups_probe[valid_probe]
+        else:
+            y_probe = y_num_probe
+
+    n_groups_probe = int(len(np.unique(groups_probe))) if (groups_probe is not None and len(groups_probe) > 0) else 0
+    has_enough_filtered = len(y_probe) >= 2 and (groups_probe is None or n_groups_probe >= 2)
+    if has_enough_filtered:
+        if is_temporal and len(y_probe) < 3 and n_rows >= 3:
+            y_for_probe: Any = None
+            groups_for_probe: Optional[np.ndarray] = groups_arr
+        else:
+            y_for_probe = y_probe
+            groups_for_probe = groups_probe
+    else:
+        y_for_probe = None
+        groups_for_probe = groups_arr
+
+    eff_n_groups = (
+        int(len(np.unique(groups_for_probe)))
+        if (groups_for_probe is not None and len(groups_for_probe) > 0)
+        else None
+    )
+
+    # Validate cv / cv_strategy / groups compatibility upfront before try/except blocks
+    if (
+        groups_for_probe is not None
+        and eff_n_groups is not None
+        and not hasattr(cv, "split")
+        and not isinstance(cv, bool)
+        and isinstance(cv, (int, np.integer))
+        and int(cv) >= 2
+        and int(cv) > eff_n_groups
+        and not is_temporal
+    ):
+        cv_probe: Any = max(2, min(int(cv), eff_n_groups))
+    else:
+        cv_probe = cv
+
+    probe_splitter = build_cv_splitter(
+        cv=cv_probe,
+        y=y_for_probe,
+        groups=groups_for_probe,
+        task=task,
+        cv_strategy=cv_strategy,
+        random_state=random_state,
+    )
+    resolved_cv_strategy = resolve_cv_strategy_name(probe_splitter)
+    if hasattr(probe_splitter, "get_n_splits"):
+        try:
+            cv_int = int(probe_splitter.get_n_splits(df, y, groups_arr))
+        except TypeError:
+            cv_int = int(probe_splitter.get_n_splits(df))
+    else:
+        cv_int = int(cv)
+    cv_int = max(2, cv_int)
+
     # Auto-adjust scorer for multiclass or non-standard binary labels
     scorer = _auto_adjust_scorer_for_risk(scorer, y, task)
 
-    df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
-    n_rows, n_cols = int(df.shape[0]), int(df.shape[1])
     num_cols, cat_cols = split_columns(df)
 
     missing_ratio = compute_missing_ratio(df)
@@ -737,10 +1128,22 @@ def analyze_risk(
     else:
         col_map = {str(c): str(c) for c in df.columns}
         df_work = df
+    raw_tcol = detect_datetime_column(df_work)
     df_work = sanitize_features(df_work)
     work_num_cols, _ = split_columns(df_work)
 
     notes: List[str] = []
+    warnings_list: List[str] = []
+
+    if groups_arr is not None and not hasattr(cv, "split"):
+        if not is_temporal and n_groups is not None and n_groups < int(cv):
+            msg = f"Only {n_groups} unique groups found (< cv={cv}); CV folds clamped to {n_groups}."
+            warnings_list.append(msg)
+            notes.append(msg)
+        if strategy_norm in ("kfold", "stratified"):
+            msg = f"groups provided with non-grouped cv_strategy={cv_strategy!r}; entity grouping is not enforced."
+            warnings_list.append(msg)
+            notes.append(msg)
 
     # Univariate predictive power (leakage proxy detection)
     max_pp = 0.0
@@ -750,9 +1153,11 @@ def analyze_risk(
             df_work, y,
             task=task,
             scorer=scorer,
-            cv=max(3, cv),
+            cv=max(3, cv_int),
             random_state=random_state,
             deadline=deadline,
+            groups=groups_arr,
+            cv_strategy=cv_strategy,
         )
         leak_feats = [col_map.get(name, name) for name, sc in scored_feats if sc >= 0.95]
         if leak_feats:
@@ -767,9 +1172,12 @@ def analyze_risk(
         gap = _temporal_leakage_gap(
             df_work, y,
             scorer=scorer,
-            cv=min(max(3, cv), 3),
+            cv=min(max(3, cv_int), 3),
             task=task,
             random_state=random_state,
+            groups=groups_arr,
+            cv_strategy=cv_strategy,
+            tcol_hint=raw_tcol,
         )
         if gap is not None and gap >= 0.05:
             notes.append(f"Temporal leakage suspicion: shuffled-chronological score gap={gap:.3f}.")
@@ -793,8 +1201,10 @@ def analyze_risk(
         is_linear, linearity_score = _detect_linearity(
             df_work, y,
             task=task,
-            cv=min(max(3, cv), 3),
+            cv=min(max(3, cv_int), 3),
             random_state=random_state,
+            groups=groups_arr,
+            cv_strategy=cv_strategy,
         )
         if is_linear:
             notes.append(
@@ -816,6 +1226,13 @@ def analyze_risk(
         except Exception as e:
             notes.append(f"LLM advisor error ignored: {type(e).__name__}")
 
+    details = {
+        "cv_strategy_requested": str(cv_strategy),
+        "cv_strategy_resolved": resolved_cv_strategy,
+        "groups_provided": groups_arr is not None,
+        "n_groups": n_groups,
+    }
+
     return RiskReport(
         task=task,
         target_type=target_type,
@@ -835,6 +1252,10 @@ def analyze_risk(
         is_linear=is_linear,
         linearity_score=float(linearity_score),
         notes=notes,
+        cv_strategy=resolved_cv_strategy,
+        n_groups=n_groups,
+        details=details,
+        warnings=warnings_list,
     )
 
 
@@ -876,7 +1297,7 @@ def compute_risk_penalty(
 
     # Temporal leakage risk
     temp = 0.0
-    if rr.temporal_leakage_gap is not None:
+    if rr.temporal_leakage_gap is not None and np.isfinite(float(rr.temporal_leakage_gap)):
         temp = float(np.clip(rr.temporal_leakage_gap / 0.20, 0.0, 1.0))
 
     # Multicollinearity risk (VIF)

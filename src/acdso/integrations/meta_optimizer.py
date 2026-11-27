@@ -30,6 +30,12 @@ from sklearn.metrics import get_scorer
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 
+from acdso.cv import (
+    build_cv_splitter,
+    iter_cv_splits,
+    resolve_cv_strategy_name,
+    validate_groups,
+)
 from acdso.integrations.base import (
     BaseAutoMLAdapter,
     CandidateSource,
@@ -145,6 +151,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
         llm_advisor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         random_state: int = 42,
         verbose: int = 0,
+        cv_strategy: str = "auto",
     ):
         self.adapters = adapters or []
         self.include_acdso_candidates = include_acdso_candidates
@@ -158,6 +165,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
         self.llm_advisor = llm_advisor
         self.random_state = random_state
         self.verbose = verbose
+        self.cv_strategy = cv_strategy
 
         # Fitted attributes
         self.best_estimator_: Optional[Any] = None
@@ -165,6 +173,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
         self.risk_report_: Optional[Dict[str, Any]] = None
         self.pareto_front_: Optional[List[Dict[str, Any]]] = None
         self.audit_trail_: Optional[Dict[str, Any]] = None
+        self.cv_strategy_: Optional[str] = None
         self._task: Optional[str] = None
         self._effective_scorer_: Optional[str] = None
 
@@ -203,6 +212,8 @@ class ACDSOMetaOptimizer(BaseEstimator):
         X: Any,
         y: Any,
         task: str,
+        groups: Optional[np.ndarray] = None,
+        cv_strategy: str = "auto",
     ) -> List[CandidateSource]:
         """Collect candidates from all adapters."""
         all_candidates = []
@@ -221,6 +232,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
 
                 stats = adapter.get_generation_stats()
                 stats["candidates_generated"] = len(candidates)
+                stats["groups_forwarded"] = False
                 adapter_stats.append(stats)
 
                 self._log(f"  -> {len(candidates)} candidates generated")
@@ -237,11 +249,14 @@ class ACDSOMetaOptimizer(BaseEstimator):
         if self.include_acdso_candidates:
             self._log("Generating ACDSO native candidates...")
             try:
-                acdso_candidates = self._generate_acdso_candidates(X, y, task)
+                acdso_candidates = self._generate_acdso_candidates(
+                    X, y, task, groups=groups, cv_strategy=cv_strategy
+                )
                 all_candidates.extend(acdso_candidates)
                 adapter_stats.append({
                     "adapter": "ACDSO",
                     "candidates_generated": len(acdso_candidates),
+                    "groups_forwarded": groups is not None,
                 })
                 self._log(f"  -> {len(acdso_candidates)} candidates generated")
             except Exception as e:
@@ -255,6 +270,8 @@ class ACDSOMetaOptimizer(BaseEstimator):
         X: Any,
         y: Any,
         task: str,
+        groups: Optional[np.ndarray] = None,
+        cv_strategy: str = "auto",
     ) -> List[CandidateSource]:
         """Generate ACDSO's native candidates."""
         from acdso.core import _ACDSOEngineV3
@@ -276,6 +293,7 @@ class ACDSOMetaOptimizer(BaseEstimator):
             enable_feature_selection=True,
             llm_advisor=None,  # Skip LLM for internal generation
             verbose=0,
+            cv_strategy=cv_strategy,
         )
 
         # Get the candidate pipelines without full evaluation
@@ -285,6 +303,8 @@ class ACDSOMetaOptimizer(BaseEstimator):
             scorer=effective_scorer,
             cv=self.cv,
             random_state=self.random_state,
+            groups=groups,
+            cv_strategy=cv_strategy,
         )
 
         pipelines = engine._generate_candidates(X, y, risk_report)
@@ -312,6 +332,8 @@ class ACDSOMetaOptimizer(BaseEstimator):
         candidate: CandidateSource,
         risk_report: RiskReport,
         task: str,
+        groups: Optional[np.ndarray] = None,
+        cv_strategy: str = "auto",
     ) -> Optional[CandidateResult]:
         """Evaluate a single candidate with ACDSO's multi-objective metrics."""
         try:
@@ -324,18 +346,26 @@ class ACDSOMetaOptimizer(BaseEstimator):
             effective_scorer = getattr(self, "_effective_scorer_", None) or self._resolve_scorer(y, task)
             scorer = get_scorer(effective_scorer)
 
-            if task == "classification":
-                splitter = StratifiedKFold(
-                    n_splits=self.cv,
-                    shuffle=True,
-                    random_state=self.random_state,
-                )
+            if (
+                groups is not None
+                and not hasattr(self.cv, "split")
+                and not isinstance(self.cv, bool)
+                and isinstance(self.cv, (int, np.integer))
+                and int(self.cv) >= 2
+                and not (isinstance(cv_strategy, str) and cv_strategy.strip().lower() == "temporal")
+            ):
+                n_splits_eff = max(2, min(int(self.cv), int(len(np.unique(groups)))))
             else:
-                splitter = KFold(
-                    n_splits=self.cv,
-                    shuffle=True,
-                    random_state=self.random_state,
-                )
+                n_splits_eff = self.cv
+
+            splitter = build_cv_splitter(
+                cv=n_splits_eff,
+                y=y,
+                groups=groups,
+                task=task,
+                cv_strategy=cv_strategy,
+                random_state=self.random_state,
+            )
 
             started_tracemalloc = not tracemalloc.is_tracing()
             if started_tracemalloc:
@@ -358,10 +388,17 @@ class ACDSOMetaOptimizer(BaseEstimator):
                         scores = np.array([score])
                 else:
                     # Clone and cross-validate
+                    cv_splits = iter_cv_splits(
+                        splitter,
+                        X,
+                        y,
+                        groups,
+                        validate_groups_leakage=(groups is not None),
+                    )
                     cloned = clone(estimator)
                     scores = cross_val_score(
                         cloned, X, y,
-                        cv=splitter,
+                        cv=cv_splits,
                         scoring=scorer,
                         n_jobs=None,
                     )
@@ -445,7 +482,13 @@ class ACDSOMetaOptimizer(BaseEstimator):
             return False
         return True
 
-    def fit(self, X: Any, y: Any) -> "ACDSOMetaOptimizer":
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        groups: Optional[Any] = None,
+        cv_strategy: Optional[str] = None,
+    ) -> "ACDSOMetaOptimizer":
         """
         Fit the meta optimizer.
 
@@ -464,6 +507,10 @@ class ACDSOMetaOptimizer(BaseEstimator):
             Training features.
         y : array-like
             Target values.
+        groups : array-like, optional
+            Entity/group identifiers aligned with X and y for grouped CV.
+        cv_strategy : str, optional
+            Cross-validation strategy override for this fit call.
 
         Returns
         -------
@@ -472,10 +519,47 @@ class ACDSOMetaOptimizer(BaseEstimator):
         """
         t0 = time.time()
 
+        # Step 0: Validate inputs & CV configuration upfront
+        n_x = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        y_len = len(y) if hasattr(y, "__len__") else int(np.asarray(y).shape[0])
+        if y_len != n_x:
+            raise ValueError(f"X and y must have the same number of samples (got {n_x} vs {y_len}).")
+
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
+        groups_arr: Optional[np.ndarray] = None
+        n_groups: Optional[int] = None
+        if groups is not None:
+            groups_arr = validate_groups(groups, n_samples=n_x, min_unique=2)
+            n_groups = int(len(np.unique(groups_arr)))
+
         # Step 1: Infer task
         self._task = self._infer_task(y)
         self._effective_scorer_ = self._resolve_scorer(y, self._task)
         self._log(f"Task: {self._task}")
+
+        if (
+            groups_arr is not None
+            and n_groups is not None
+            and not hasattr(self.cv, "split")
+            and not isinstance(self.cv, bool)
+            and isinstance(self.cv, (int, np.integer))
+            and int(self.cv) >= 2
+            and not (isinstance(eff_strategy, str) and eff_strategy.strip().lower() == "temporal")
+        ):
+            cv_probe: Any = max(2, min(int(self.cv), n_groups))
+        else:
+            cv_probe = self.cv
+
+        probe_splitter = build_cv_splitter(
+            cv=cv_probe,
+            y=y,
+            groups=groups_arr,
+            task=self._task,
+            cv_strategy=eff_strategy,
+            random_state=self.random_state,
+        )
+        resolved_cv_strategy = resolve_cv_strategy_name(probe_splitter)
+        self.cv_strategy_ = resolved_cv_strategy
 
         # Step 2: Risk analysis
         self._log("Analyzing dataset risk...")
@@ -486,13 +570,17 @@ class ACDSOMetaOptimizer(BaseEstimator):
             cv=self.cv,
             random_state=self.random_state,
             llm_advisor=self.llm_advisor,
+            groups=groups_arr,
+            cv_strategy=eff_strategy,
         )
         self._log(f"Risk analysis complete. VIF={risk_report.vif_max:.1f}, "
                   f"Imbalance={risk_report.imbalance_severity:.2f}")
 
         # Step 3: Collect candidates
         self._log("Collecting candidates from adapters...")
-        candidates = self._collect_candidates(X, y, self._task)
+        candidates = self._collect_candidates(
+            X, y, self._task, groups=groups_arr, cv_strategy=eff_strategy
+        )
         self._log(f"Total candidates collected: {len(candidates)}")
 
         if not candidates:
@@ -511,7 +599,11 @@ class ACDSOMetaOptimizer(BaseEstimator):
 
             self._log(f"  Evaluating: {candidate.name} ({candidate.source})")
 
-            result = self._evaluate_candidate(X, y, candidate, risk_report, self._task)
+            result = self._evaluate_candidate(
+                X, y, candidate, risk_report, self._task,
+                groups=groups_arr,
+                cv_strategy=eff_strategy,
+            )
 
             if result is None:
                 failures.append({
@@ -624,6 +716,9 @@ class ACDSOMetaOptimizer(BaseEstimator):
         # Step 8: Build audit trail
         self.audit_trail_ = {
             "task": self._task,
+            "cv_strategy": resolved_cv_strategy,
+            "cv_strategy_requested": eff_strategy,
+            "n_groups": n_groups,
             "total_time_s": time.time() - t0,
             "risk_report": asdict(risk_report),
             "constraints": {

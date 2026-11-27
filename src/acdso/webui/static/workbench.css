@@ -638,6 +638,36 @@
     border-color: var(--ok);
     color: var(--ok);
   }
+
+  .task-opts-box {
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-block-end: 12px;
+    background: rgba(91, 157, 255, .04);
+  }
+
+  .task-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 10px;
+    margin-block-start: 12px;
+  }
+
+  .task-block {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+
+  .task-block h3 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .6px;
+    color: var(--accent);
+  }
 }
 
 @layer charts {

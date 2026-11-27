@@ -363,7 +363,12 @@ class EDAReport:
     # Pareto optimization results
     pareto_front: List[Dict[str, Any]] = field(default_factory=list)
     selected_analyses: List[str] = field(default_factory=list)
-    
+
+    # Scale guard / subsampling metadata
+    subsampled: bool = False
+    original_n_rows: Optional[int] = None
+    sampling_metadata: Dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
         return _sanitize_json_obj(asdict(self))
 
@@ -1000,6 +1005,8 @@ class ACDSOAutoEDA:
         time_budget_s: Optional[float] = None,
         llm_advisor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         verbose: int = 0,
+        max_in_memory_rows: Optional[int] = 200_000,
+        random_state: Optional[int] = 42,
     ) -> None:
         self.correlation_threshold = correlation_threshold
         self.outlier_method = outlier_method
@@ -1009,18 +1016,54 @@ class ACDSOAutoEDA:
         self.time_budget_s = time_budget_s
         self.llm_advisor = llm_advisor
         self.verbose = verbose
-        
+        self.max_in_memory_rows = max_in_memory_rows
+        self.random_state = random_state
+
         # Results (populated after analyze)
         self.report_: Optional[EDAReport] = None
         self.column_profiles_: List[ColumnProfile] = []
         self.data_quality_: Optional[DataQualityReport] = None
         self.pareto_front_: List[EDACandidate] = []
         self.all_candidates_: List[EDACandidate] = []
-    
+        self.anomaly_detector_: Optional[Any] = None
+        self.audit_trail_: Dict[str, Any] = {}
+
     def _log(self, msg: str, level: int = 1) -> None:
         """Log message if verbose level is sufficient."""
         if self.verbose >= level:
             print(f"[ACDSO AutoEDA] {msg}")
+
+    def _subsample_for_memory(
+        self,
+        data: Union[pd.DataFrame, np.ndarray],
+    ) -> Tuple[Union[pd.DataFrame, np.ndarray], Dict[str, Any]]:
+        """Apply deterministic bounded subsampling when input exceeds ``max_in_memory_rows``."""
+        if self.max_in_memory_rows is not None:
+            if isinstance(self.max_in_memory_rows, bool) or int(self.max_in_memory_rows) < 1:
+                raise ValueError(
+                    f"max_in_memory_rows must be a positive integer or None, got {self.max_in_memory_rows!r}."
+                )
+        orig_rows = int(len(data))
+        if self.max_in_memory_rows is None or orig_rows <= int(self.max_in_memory_rows):
+            return data, {
+                "max_in_memory_rows": int(self.max_in_memory_rows) if self.max_in_memory_rows is not None else None,
+                "subsampled": False,
+                "original_rows": orig_rows,
+                "analyzed_rows": orig_rows,
+                "sampling_method": "none",
+            }
+
+        limit = int(self.max_in_memory_rows)
+        rng = np.random.RandomState(self.random_state)
+        idx = np.sort(rng.choice(orig_rows, size=limit, replace=False).astype(np.intp))
+        sampled = data.iloc[idx] if hasattr(data, "iloc") else data[idx]
+        return sampled, {
+            "max_in_memory_rows": limit,
+            "subsampled": True,
+            "original_rows": orig_rows,
+            "analyzed_rows": int(len(sampled)),
+            "sampling_method": "uniform_deterministic",
+        }
     
     def analyze(
         self,
@@ -1044,12 +1087,14 @@ class ACDSOAutoEDA:
         """
         t_start = time.time()
         timestamp = pd.Timestamp.now().isoformat()
-        
+
+        data_bounded, scale_meta = self._subsample_for_memory(data)
+
         # Convert to DataFrame if needed (zero-copy read-only reference for DataFrames)
-        if isinstance(data, np.ndarray):
-            df_orig = pd.DataFrame(data, columns=[f"col_{i}" for i in range(data.shape[1])])
+        if isinstance(data_bounded, np.ndarray):
+            df_orig = pd.DataFrame(data_bounded, columns=[f"col_{i}" for i in range(data_bounded.shape[1])])
         else:
-            df_orig = data
+            df_orig = data_bounded
 
         has_dup_cols = bool(df_orig.columns.has_duplicates)
         orig_names = [str(c) for c in df_orig.columns]
@@ -1276,12 +1321,19 @@ class ACDSOAutoEDA:
             recommendations.append(
                 f"Investigate {len(anomalies)} detected anomalies before modeling"
             )
-        
+
+        if scale_meta.get("subsampled"):
+            recommendations.append(
+                f"Dataset deterministically subsampled from {scale_meta['original_rows']} "
+                f"to {scale_meta['analyzed_rows']} rows (max_in_memory_rows={scale_meta['max_in_memory_rows']})."
+            )
+
         # =====================================================================
         # Build Final Report
         # =====================================================================
         total_time = time.time() - t_start
-        
+
+        sanitized_scale_meta = _sanitize_json_obj(scale_meta)
         report = EDAReport(
             dataset_name=dataset_name,
             n_rows=int(df.shape[0]),
@@ -1298,9 +1350,23 @@ class ACDSOAutoEDA:
             total_analysis_time_s=round(total_time, 3),
             pareto_front=[c.to_dict() for c in front],
             selected_analyses=selected_analyses,
+            subsampled=bool(sanitized_scale_meta.get("subsampled", False)),
+            original_n_rows=int(sanitized_scale_meta["original_rows"]),
+            sampling_metadata=sanitized_scale_meta,
         )
-        
+
         self.report_ = report
+        prev_audit = dict(self.audit_trail_) if isinstance(getattr(self, "audit_trail_", None), dict) else {}
+        prev_audit.update(
+            {
+                **sanitized_scale_meta,
+                "dataset_name": dataset_name,
+                "n_rows": int(df.shape[0]),
+                "n_cols": int(df.shape[1]),
+                "quality_score": quality_report.quality_score,
+            }
+        )
+        self.audit_trail_ = _sanitize_json_obj(prev_audit)
         
         self._log(f"Analysis complete in {total_time:.2f}s")
         self._log(f"Quality Score: {quality_report.quality_score:.1f}/100")
@@ -1645,6 +1711,44 @@ class ACDSOAutoEDA:
         ])
         
         return "\n".join(lines)
+
+    def fit_anomaly_detector(
+        self,
+        data: Union[pd.DataFrame, np.ndarray],
+        algorithm: str = "auto",
+        contamination: Union[str, float] = "auto",
+        **kwargs: Any,
+    ) -> Any:
+        """Fit and store a trainable ``ACDSOAnomalyDetector`` on ``data``.
+
+        Uses a lazy import of ``acdso.anomaly`` so importing ``acdso.eda``
+        never eagerly loads scikit-learn.
+        """
+        from acdso.anomaly import ACDSOAnomalyDetector
+
+        data_fit, anom_scale_meta = self._subsample_for_memory(data)
+        self.audit_trail_["anomaly_detector_scale_guard"] = _sanitize_json_obj(anom_scale_meta)
+
+        kwargs.setdefault("verbose", self.verbose)
+        detector = ACDSOAnomalyDetector(
+            algorithm=algorithm,
+            contamination=contamination,
+            **kwargs,
+        )
+        detector.fit(data_fit)
+        self.anomaly_detector_ = detector
+        return detector
+
+    def score_anomalies(
+        self,
+        data: Union[pd.DataFrame, np.ndarray],
+    ) -> np.ndarray:
+        """Score unseen observations using the fitted ``anomaly_detector_``."""
+        if self.anomaly_detector_ is None:
+            raise RuntimeError(
+                "No anomaly detector fitted yet. Call fit_anomaly_detector() first."
+            )
+        return self.anomaly_detector_.anomaly_scores(data)
 
 
 # ============================================================================

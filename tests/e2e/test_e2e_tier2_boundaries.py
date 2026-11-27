@@ -496,7 +496,7 @@ def test_f4_t2_run_invalid_payloads_return_400(webui_client, dataset_factory) ->
     uid = up.get_json()["upload_id"]
 
     assert client.post("/api/run", json={"upload_id": uid}).status_code == 400
-    assert client.post("/api/run", json={"upload_id": uid, "predict": ["tip"], "task": "clustering"}).status_code == 400
+    assert client.post("/api/run", json={"upload_id": uid, "predict": ["tip"], "task": "invalid_task"}).status_code == 400
     assert client.post("/api/run", json={"upload_id": uid, "predict": ["tip"], "horizon": 0}).status_code == 400
     assert client.post("/api/run", json={"upload_id": uid, "predict": ["tip"], "budget": -10}).status_code == 400
     assert client.post(

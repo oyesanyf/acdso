@@ -38,6 +38,12 @@
         ));
   }
 
+  function toFiniteNum(v) {
+    if (v == null || typeof v === 'boolean' || String(v).trim() === '') return NaN;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : NaN;
+  }
+
   function flash(text, kind, targetId = 'uploadMsg') {
     const el = $(targetId);
     if (!el) return;
@@ -72,7 +78,7 @@
 
   function fmtNum(v, digits) {
     if (Charts.fmtNum) return Charts.fmtNum(v, digits);
-    if (v == null || v === '') return 'n/a';
+    if (v == null || typeof v === 'boolean' || String(v).trim() === '') return 'n/a';
     const n = Number(v);
     return Number.isFinite(n) ? n.toFixed(digits) : 'n/a';
   }
@@ -237,7 +243,7 @@
   if ($('refreshUploadsBtn')) $('refreshUploadsBtn').addEventListener('click', () => loadRecentUploads());
 
   /* ── target goal toggle & searchable picker ────────────────────────── */
-  function setGoalMode(mode) {
+  function setGoalMode(mode, opts) {
     state.goalMode = mode;
     const isPredict = mode === 'predict';
     $('goalPredictBtn').classList.toggle('active', isPredict);
@@ -251,7 +257,10 @@
     }
     renderTargetPicker();
     refreshCommand();
-    checkColumns();
+    if (!opts || !opts.skipCheck) {
+      clearTimeout(columnCheckTimer);
+      checkColumns();
+    }
   }
 
   if ($('goalPredictBtn')) $('goalPredictBtn').addEventListener('click', () => setGoalMode('predict'));
@@ -377,8 +386,10 @@
   function fmtVotes(votes) {
     if (!votes) return '';
     const parts = [];
-    if (votes.rule_based != null) parts.push('naming/dtype: ' + votes.rule_based.toFixed(2));
-    if (votes.learnability) parts.push(votes.learnability.metric + '=' + votes.learnability.score.toFixed(2));
+    const rb = toFiniteNum(votes.rule_based);
+    if (Number.isFinite(rb)) parts.push('naming/dtype: ' + rb.toFixed(2));
+    const lm = votes.learnability ? toFiniteNum(votes.learnability.score) : NaN;
+    if (votes.learnability && Number.isFinite(lm)) parts.push(String(votes.learnability.metric || 'score') + '=' + lm.toFixed(2));
     else parts.push('learnability: n/a');
     return parts.length ? ' · votes: ' + parts.join(', ') : '';
   }
@@ -452,6 +463,43 @@
     if ($('decisionOptsWrap') && $('f_decision')) {
       $('decisionOptsWrap').style.display = $('f_decision').checked ? 'block' : 'none';
     }
+  }
+
+  const TASK_TARGET_HINTS = {
+    auto: 'Pick target column(s) above. Leave Task on auto to infer classification vs regression.',
+    classification: 'Pick a categorical or binary target column to classify.',
+    regression: 'Pick a continuous numeric target column to regress.',
+    clustering: 'Clustering is targetless -- no Predict/Target column is needed.',
+    anomaly: 'Anomaly detection is targetless -- no Predict/Target column is needed.',
+    multilabel: 'Pick 2+ target columns (or a delimited multi-label column).',
+    ranking: 'Pick a relevance target column and a Query group column (--query-col).',
+    survival: 'Pick Time column (--time-col) and Event column (--event-col), or 2 target columns.',
+    recommender: 'Recommender is targetless -- pick User (--user-col) and Item (--item-col) columns.',
+  };
+
+  function syncTaskOptsVisibility() {
+    const task = ($('f_task') && $('f_task').value) ? String($('f_task').value).trim().toLowerCase() : 'auto';
+    const wraps = {
+      clusterOptsWrap: task === 'clustering',
+      anomalyOptsWrap: task === 'anomaly',
+      survivalOptsWrap: task === 'survival',
+      rankingOptsWrap: task === 'ranking',
+      recommenderOptsWrap: task === 'recommender',
+    };
+    for (const [id, show] of Object.entries(wraps)) {
+      if ($(id)) $(id).style.display = show ? 'block' : 'none';
+    }
+    if ($('taskTargetHint')) {
+      $('taskTargetHint').textContent = TASK_TARGET_HINTS[task] || '';
+    }
+  }
+
+  if ($('f_task')) {
+    $('f_task').addEventListener('change', () => {
+      syncTaskOptsVisibility();
+      refreshCommand();
+      checkColumns();
+    });
   }
 
   if ($('runMode')) {
@@ -587,13 +635,29 @@
   }
 
   /* ── payload + command preview ──────────────────────────────────────── */
+  const CLUSTER_ONLY_FLAGS = new Set(['cluster_algo', 'n_clusters', 'dim_reduce', 'cluster_metric']);
+  const ANOMALY_ONLY_FLAGS = new Set(['anomaly_algo', 'contamination']);
+  const SURVIVAL_ONLY_FLAGS = new Set(['time_col', 'event_col']);
+  const RANKING_ONLY_FLAGS = new Set(['query_col']);
+  const RECOMMENDER_ONLY_FLAGS = new Set(['user_col', 'item_col', 'rating_col']);
+
   function collectPayload() {
     const payload = { upload_id: state.uploadId };
     const decisionActive = $('f_decision') ? $('f_decision').checked : false;
+    const task = ($('f_task') && $('f_task').value) ? String($('f_task').value).trim().toLowerCase() : 'auto';
     const formEl = $('form');
     if (formEl) {
       formEl.querySelectorAll('[data-kind]').forEach((el) => {
         if ((el.name === 'treatment' || el.name === 'budget') && !decisionActive) return;
+        if (CLUSTER_ONLY_FLAGS.has(el.name) && task !== 'clustering') return;
+        if (ANOMALY_ONLY_FLAGS.has(el.name) && task !== 'anomaly') return;
+        if (SURVIVAL_ONLY_FLAGS.has(el.name) && task !== 'survival') return;
+        if (RANKING_ONLY_FLAGS.has(el.name) && task !== 'ranking') return;
+        if (RECOMMENDER_ONLY_FLAGS.has(el.name) && task !== 'recommender') return;
+        if ((el.name === 'predict' || el.name === 'target') && (task === 'clustering' || task === 'anomaly' || task === 'recommender')) {
+          payload[el.name] = [];
+          return;
+        }
         const kind = el.dataset.kind;
         if (kind === 'bool') {
           payload[el.name] = el.checked;
@@ -616,9 +680,13 @@
     const cmdEl = $('cmd');
     if (!cmdEl) return;
     const p = collectPayload();
+    const task = String(p.task || 'auto').trim().toLowerCase();
     const parts = ['python', 'run_acdso.py'];
     if (state.uploadId) parts.push('--file', 'uploads/' + (state.uploadFileName || '<your file>'));
     for (const meta of FLAG_META) {
+      if ((meta.name === 'predict' || meta.name === 'target') && (task === 'clustering' || task === 'anomaly' || task === 'recommender')) {
+        continue;
+      }
       const v = p[meta.name];
       if (meta.kind === 'bool') { if (v) parts.push(meta.cli); continue; }
       if (meta.kind === 'columns') {
@@ -628,6 +696,10 @@
         continue;
       }
       if (v === null || v === '' || v === undefined) continue;
+      if (meta.name === 'contamination') {
+        const ct = String(v).trim().toLowerCase();
+        if (ct === '' || ct === 'auto') continue;
+      }
       if (meta.kind === 'choice' && String(v) === String(meta.default)) continue;
       parts.push(meta.cli, String(v));
     }
@@ -640,7 +712,11 @@
   }
 
   /* ── column-role validation & horizon suggestion ────────────────────── */
-  const ROLE_FIELDS = ['f_predict', 'f_target', 'f_exclude', 'f_datetime_col', 'f_treatment'];
+  const ROLE_FIELDS = [
+    'f_predict', 'f_target', 'f_exclude', 'f_datetime_col', 'f_treatment',
+    'f_group_col', 'f_text_cols', 'f_time_col', 'f_event_col',
+    'f_query_col', 'f_user_col', 'f_item_col', 'f_rating_col',
+  ];
   let columnCheckTimer = null;
   let horizonCheckTimer = null;
 
@@ -668,13 +744,27 @@
     if (!state.uploadId) { renderColumnCheck({ ok: true, issues: [] }); return; }
     const roles = {
       upload_id: state.uploadId,
+      task: ($('f_task') && $('f_task').value) ? $('f_task').value : 'auto',
       predict: collectColumnValues('f_predict'),
       target: collectColumnValues('f_target'),
       exclude: collectColumnValues('f_exclude'),
       datetime_col: collectColumnValues('f_datetime_col'),
       treatment: collectColumnValues('f_treatment'),
+      group_col: collectColumnValues('f_group_col'),
+      text_cols: collectColumnValues('f_text_cols'),
+      time_col: collectColumnValues('f_time_col'),
+      event_col: collectColumnValues('f_event_col'),
+      query_col: collectColumnValues('f_query_col'),
+      user_col: collectColumnValues('f_user_col'),
+      item_col: collectColumnValues('f_item_col'),
+      rating_col: collectColumnValues('f_rating_col'),
     };
-    if (!roles.predict.length && !roles.target.length && !roles.exclude.length && !roles.datetime_col.length && !roles.treatment.length) {
+    const hasAnyRole = [
+      'predict', 'target', 'exclude', 'datetime_col', 'treatment',
+      'group_col', 'text_cols', 'time_col', 'event_col',
+      'query_col', 'user_col', 'item_col', 'rating_col',
+    ].some((k) => roles[k].length > 0);
+    if (!hasAnyRole) {
       renderColumnCheck({ ok: true, issues: [] });
       return;
     }
@@ -769,13 +859,36 @@
     const warnings = (plan.warnings || []).map((w) =>
       '<div class="msg warn" style="display:block; margin-bottom:6px">&#9888; ' + esc(w) + '</div>'
     ).join('');
+    const taskName = plan.task || 'auto';
+    const isTargetless = taskName === 'clustering' || taskName === 'anomaly' || taskName === 'survival' || taskName === 'recommender';
+    const predText = (plan.predict || []).join(', ') || (isTargetless ? '(not required for ' + taskName + ')' : '(none found)');
+    const extraPairs = [
+      ['Group column', plan.group_col],
+      ['CV strategy', plan.cv_strategy],
+      ['Text columns', plan.text_cols],
+      ['NLP method', plan.nlp_method],
+      ['Cluster algo', plan.cluster_algo],
+      ['Dim reduce', plan.dim_reduce],
+      ['Anomaly algo', plan.anomaly_algo],
+      ['Time column', plan.time_col],
+      ['Event column', plan.event_col],
+      ['Query column', plan.query_col],
+      ['User column', plan.user_col],
+      ['Item column', plan.item_col],
+      ['Rating column', plan.rating_col],
+      ['Scale mode', plan.scale_mode],
+    ].map(([lbl, v]) => {
+      const text = Array.isArray(v) ? v.join(', ') : (v || '');
+      return text ? '<strong>' + esc(lbl) + ':</strong> ' + esc(text) + '<br>' : '';
+    }).join('');
     $('nlPlanOut').innerHTML =
       warnings +
       '<div class="msg ok" style="display:block">' +
-      '<strong>Predict:</strong> ' + esc((plan.predict || []).join(', ') || '(none found)') + '<br>' +
-      '<strong>Task:</strong> ' + esc(plan.task) + '<br>' +
+      '<strong>Predict:</strong> ' + esc(predText) + '<br>' +
+      '<strong>Task:</strong> ' + esc(taskName) + '<br>' +
       (plan.exclude && plan.exclude.length ? '<strong>Exclude:</strong> ' + esc(plan.exclude.join(', ')) + '<br>' : '') +
       (plan.datetime_col && plan.datetime_col.length ? '<strong>Datetime column:</strong> ' + esc(plan.datetime_col.join(', ')) + '<br>' : '') +
+      extraPairs +
       '<div class="hint" style="margin:6px 0 0">' + esc(plan.explanation) + ' (' + sourceNote + ')</div>' +
       '<div class="row" style="margin-top:10px">' +
       '<button type="button" class="sm" id="nlApply">Use this plan</button>' +
@@ -787,13 +900,22 @@
   function setColumnSelect(id, values) {
     const sel = $(id);
     if (!sel) return;
-    const wanted = new Set(values || []);
+    const wanted = new Set(Array.isArray(values) ? values : (values ? [values] : []));
     Array.from(sel.options).forEach((o) => { o.selected = wanted.has(o.value); });
+    if (!sel.multiple && wanted.size === 1) {
+      sel.value = Array.from(wanted)[0];
+    } else if (!sel.multiple && wanted.size === 0) {
+      sel.value = '';
+    }
     sel.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
   function applyNlPlan(plan) {
-    setGoalMode('predict');
+    setGoalMode('predict', { skipCheck: true });
+    if ($('f_task')) {
+      $('f_task').value = plan.task || 'auto';
+      syncTaskOptsVisibility();
+    }
     const rawPred = plan.predict || [];
     const allowedPred = state.predictableSet && state.predictableSet.size
       ? rawPred.filter((c) => state.predictableSet.has(c))
@@ -802,15 +924,32 @@
     setColumnSelect('f_predict', allowedPred);
     setColumnSelect('f_exclude', plan.exclude);
     setColumnSelect('f_datetime_col', plan.datetime_col);
-    if ($('f_task')) {
-      $('f_task').value = plan.task || 'auto';
-      $('f_task').dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    if (skipped.length && $('nlPlanStatus')) {
-      $('nlPlanStatus').textContent = 'Skipped non-predictable target(s): ' + skipped.join(', ');
+    setColumnSelect('f_group_col', plan.group_col);
+    setColumnSelect('f_text_cols', plan.text_cols);
+    setColumnSelect('f_time_col', plan.time_col);
+    setColumnSelect('f_event_col', plan.event_col);
+    setColumnSelect('f_query_col', plan.query_col);
+    setColumnSelect('f_user_col', plan.user_col);
+    setColumnSelect('f_item_col', plan.item_col);
+    setColumnSelect('f_rating_col', plan.rating_col);
+    if ($('f_cv_strategy')) $('f_cv_strategy').value = plan.cv_strategy || 'auto';
+    if ($('f_nlp_method')) $('f_nlp_method').value = plan.nlp_method || 'auto';
+    if ($('f_cluster_algo')) $('f_cluster_algo').value = plan.cluster_algo || 'auto';
+    if ($('f_dim_reduce')) $('f_dim_reduce').value = plan.dim_reduce || 'none';
+    if ($('f_cluster_metric')) $('f_cluster_metric').value = plan.cluster_metric || 'silhouette';
+    if ($('f_anomaly_algo')) $('f_anomaly_algo').value = plan.anomaly_algo || 'auto';
+    if ($('f_scale_mode')) $('f_scale_mode').value = plan.scale_mode || 'auto';
+    if ($('f_n_clusters')) $('f_n_clusters').value = plan.n_clusters != null ? String(plan.n_clusters) : '';
+    if ($('f_contamination')) $('f_contamination').value = plan.contamination != null ? String(plan.contamination) : '';
+    if ($('nlPlanStatus')) {
+      $('nlPlanStatus').textContent = skipped.length
+        ? ('Skipped non-predictable target(s): ' + skipped.join(', '))
+        : '';
     }
     renderTargetPicker();
     refreshCommand();
+    clearTimeout(columnCheckTimer);
+    checkColumns();
   }
 
   /* ── preflight, run, stop, SSE streaming + polling fallback & queue ── */
@@ -821,10 +960,36 @@
       (payload.benchmark && !state.uploadId)
     );
     if (!state.uploadId && !noFileMode) return 'Upload or select a dataset first (or pick a built-in demo mode).';
+    const task = String(payload.task || 'auto').trim().toLowerCase();
     const predict = payload.predict || [];
     const target = payload.target || [];
-    if (state.uploadId && !noFileMode && !predict.length && !target.length) {
-      return 'Pick at least one target column to predict or train on.';
+    if (state.uploadId && !noFileMode) {
+      if (task === 'clustering' || task === 'anomaly') {
+        // Targetless tasks permitted without predict/target
+      } else if (task === 'survival') {
+        const hasTime = Array.isArray(payload.time_col) ? payload.time_col.length > 0 : Boolean(payload.time_col);
+        const hasEvent = Array.isArray(payload.event_col) ? payload.event_col.length > 0 : Boolean(payload.event_col);
+        if (!(hasTime && hasEvent) && predict.length !== 2 && target.length !== 2) {
+          return 'Survival analysis requires Time column + Event column (or 2 target columns).';
+        }
+      } else if (task === 'recommender') {
+        const hasUser = Array.isArray(payload.user_col) ? payload.user_col.length > 0 : Boolean(payload.user_col);
+        const hasItem = Array.isArray(payload.item_col) ? payload.item_col.length > 0 : Boolean(payload.item_col);
+        if (!(hasUser && hasItem)) {
+          return 'Recommender requires User column (--user-col) and Item column (--item-col).';
+        }
+      } else if (task === 'ranking') {
+        const hasQuery = Array.isArray(payload.query_col) ? payload.query_col.length > 0 : Boolean(payload.query_col);
+        const hasGroup = Array.isArray(payload.group_col) ? payload.group_col.length > 0 : Boolean(payload.group_col);
+        if (!predict.length && !target.length) {
+          return 'Ranking requires a relevance target column.';
+        }
+        if (!hasQuery && !hasGroup) {
+          return 'Ranking requires a Query group column (--query-col or --group-col).';
+        }
+      } else if (!predict.length && !target.length) {
+        return 'Pick at least one target column to predict or train on.';
+      }
     }
     const exSet = new Set(payload.exclude || []);
     const overlap = [...predict, ...target].filter((c) => exSet.has(c));
@@ -842,6 +1007,21 @@
     }
     if (payload.time_budget != null && (!Number.isInteger(payload.time_budget) || payload.time_budget < 1)) {
       return 'Time budget (--time-budget) must be a positive integer (>= 1).';
+    }
+    if (payload.n_clusters != null && (!Number.isInteger(payload.n_clusters) || payload.n_clusters < 2)) {
+      return 'Number of clusters (--n-clusters) must be an integer >= 2.';
+    }
+    if (payload.chunk_size != null && (!Number.isInteger(payload.chunk_size) || payload.chunk_size < 1)) {
+      return 'Chunk size (--chunk-size) must be a positive integer (>= 1).';
+    }
+    if (payload.contamination != null && String(payload.contamination).trim() !== '') {
+      const ct = String(payload.contamination).trim().toLowerCase();
+      if (ct !== 'auto') {
+        const cn = Number(ct);
+        if (!Number.isFinite(cn) || cn <= 0 || cn > 0.5) {
+          return "Contamination (--contamination) must be 'auto' or a finite number in (0, 0.5].";
+        }
+      }
     }
     return null;
   }
@@ -898,7 +1078,8 @@
     let activeIdx = -1;
     if (nameLower) {
       activeIdx = steps.findIndex((el) => {
-        const tokens = String(el.dataset.match || '').split(',').map((s) => s.trim()).filter(Boolean);
+        const raw = [el.dataset.match || '', el.dataset.matchR7 || ''].join(',');
+        const tokens = raw.split(',').map((s) => s.trim()).filter(Boolean);
         return tokens.some((tok) => nameLower.includes(tok));
       });
     }
@@ -1302,9 +1483,13 @@
           return '<td' + hl + '>' + esc(r[c] == null ? '' : r[c]) + '</td>';
         }).join('') + '</tr>'
       ).join('') + '</tbody>';
+      const totalRowsNum = d.total_rows != null && String(d.total_rows).trim() !== '' && typeof d.total_rows !== 'boolean'
+        ? Number(d.total_rows)
+        : 0;
+      const totalRowsStr = Number.isFinite(totalRowsNum) ? totalRowsNum.toLocaleString() : 'n/a';
       body.innerHTML =
         '<div class="row" style="justify-content:space-between; margin-bottom:8px">' +
-          '<span class="hint" style="margin:0">Showing ' + rows.length + ' of ' + Number(d.total_rows || 0).toLocaleString() + ' rows</span>' +
+          '<span class="hint" style="margin:0">Showing ' + rows.length + ' of ' + totalRowsStr + ' rows</span>' +
           '<a class="btn sm" href="/api/artifact?path=' + encodeURIComponent(d.path) + '">Download full CSV</a>' +
         '</div>' +
         '<div class="scroll-x" tabindex="0" role="region" aria-label="CSV predictions preview" style="max-height:320px; overflow-y:auto"><table>' + head + trs + '</table></div>';
@@ -1314,10 +1499,22 @@
     if (tab === 'overview') {
       const sel = d.selected_model || {};
       const metrics = sel.metrics || {};
+      const topMetrics = d.metrics && typeof d.metrics === 'object' ? d.metrics : {};
       const tp = d.test_performance || {};
       const sum = d.summary || {};
       const ds = d.dataset_info || {};
       const phases = d.phases || [];
+      const taskLabel = d.task || (d.meta && d.meta.task) || '';
+      const primaryScore = (() => {
+        if (metrics.metric != null) return metrics.metric;
+        if (sel.metric != null) return sel.metric;
+        for (const k of ['metric', 'silhouette_score', 'f1_micro', 'ndcg_at_k', 'c_index', 'rmse', 'accuracy', 'r2', 'f1', 'roc_auc', 'n_anomalies']) {
+          if (Number.isFinite(toFiniteNum(topMetrics[k]))) {
+            return topMetrics[k];
+          }
+        }
+        return null;
+      })();
       const targetReports = d.target_reports && typeof d.target_reports === 'object' ? d.target_reports : null;
       const mtRows = targetReports
         ? Object.entries(targetReports).map(([tname, tr]) => {
@@ -1328,22 +1525,25 @@
             return '<tr><td><strong>' + esc(tname) + '</strong></td><td>' +
               esc(ts.name || ts.model_name || 'None') + '</td><td>' +
               fmtNum(sc, 4) + '</td><td>' +
-              (tt != null && Number.isFinite(Number(tt)) ? fmtNum(tt, 2) + 's' : 'n/a') +
+              (Number.isFinite(toFiniteNum(tt)) ? fmtNum(tt, 2) + 's' : 'n/a') +
               '</td></tr>';
           }).join('')
         : '';
-      const dsRowsNum = ds.rows != null ? Number(ds.rows) : NaN;
+      const dsRowsNum = toFiniteNum(ds.rows);
+      const taskBlocksHtml = Charts.renderTaskSummaryBlocksHtml ? Charts.renderTaskSummaryBlocksHtml(d) : '';
       body.innerHTML =
         '<div class="kpi-grid">' +
+          (taskLabel ? '<div class="kpi-card"><div class="k-label">Task</div><div class="k-val">' + esc(taskLabel) + '</div></div>' : '') +
           '<div class="kpi-card"><div class="k-label">Selected Model</div><div class="k-val">' + esc(sel.name || sel.model_name || 'None') + '</div></div>' +
-          '<div class="kpi-card"><div class="k-label">CV Score</div><div class="k-val">' + (metrics.metric != null ? fmtNum(metrics.metric, 4) : fmtNum(sel.metric, 4)) + '</div></div>' +
-          '<div class="kpi-card"><div class="k-label">Train Time</div><div class="k-val">' + (metrics.train_time_s != null && Number.isFinite(Number(metrics.train_time_s)) ? fmtNum(metrics.train_time_s, 2) + 's' : (sum.total_time != null && Number.isFinite(Number(sum.total_time)) ? fmtNum(sum.total_time, 1) + 's' : 'n/a')) + '</div></div>' +
-          '<div class="kpi-card"><div class="k-label">Peak Memory</div><div class="k-val">' + (metrics.peak_mem_mb != null && Number.isFinite(Number(metrics.peak_mem_mb)) ? fmtNum(metrics.peak_mem_mb, 1) + ' MB' : 'n/a') + '</div></div>' +
+          '<div class="kpi-card"><div class="k-label">Primary Score</div><div class="k-val">' + fmtNum(primaryScore, 4) + '</div></div>' +
+          '<div class="kpi-card"><div class="k-label">Train Time</div><div class="k-val">' + (Number.isFinite(toFiniteNum(metrics.train_time_s)) ? fmtNum(metrics.train_time_s, 2) + 's' : (Number.isFinite(toFiniteNum(sum.total_time)) ? fmtNum(sum.total_time, 1) + 's' : 'n/a')) + '</div></div>' +
+          '<div class="kpi-card"><div class="k-label">Peak Memory</div><div class="k-val">' + (Number.isFinite(toFiniteNum(metrics.peak_mem_mb)) ? fmtNum(metrics.peak_mem_mb, 1) + ' MB' : 'n/a') + '</div></div>' +
           '<div class="kpi-card"><div class="k-label">Dataset</div><div class="k-val">' + (Number.isFinite(dsRowsNum) ? dsRowsNum.toLocaleString() + ' x ' + esc(ds.columns || '?') : 'n/a') + '</div></div>' +
           '<div class="kpi-card"><div class="k-label">Phases OK</div><div class="k-val">' + (sum.successful != null ? esc(sum.successful + '/' + sum.total_phases) : (phases.length || 'n/a')) + '</div></div>' +
         '</div>' +
+        taskBlocksHtml +
         (mtRows
-          ? '<div class="scroll-x" style="max-height:220px; overflow-y:auto; margin-bottom:8px"><table><thead><tr><th>Target</th><th>Selected Model</th><th>CV Score</th><th>Train (s)</th></tr></thead><tbody>' +
+          ? '<div class="scroll-x" style="max-height:220px; overflow-y:auto; margin-bottom:8px; margin-top:10px"><table><thead><tr><th>Target</th><th>Selected Model</th><th>CV Score</th><th>Train (s)</th></tr></thead><tbody>' +
             mtRows + '</tbody></table></div>'
           : '') +
         (Object.keys(tp).length
@@ -1355,12 +1555,25 @@
             }).join('') + '</div>'
           : '') +
         (phases.length
-          ? '<div class="scroll-x" tabindex="0" role="region" aria-label="Pipeline phases" style="max-height:220px; overflow-y:auto"><table><thead><tr><th>Phase</th><th>Status</th><th>Time (s)</th></tr></thead><tbody>' +
-            phases.map((p) => '<tr><td>' + esc(p.name || '') + '</td><td>' + esc(p.status || '') + '</td><td>' + (p.time != null && Number.isFinite(Number(p.time)) ? fmtNum(p.time, 2) : '') + '</td></tr>').join('') +
+          ? '<div class="scroll-x" tabindex="0" role="region" aria-label="Pipeline phases" style="max-height:220px; overflow-y:auto; margin-top:10px"><table><thead><tr><th>Phase</th><th>Status</th><th>Time (s)</th></tr></thead><tbody>' +
+            phases.map((p) => '<tr><td>' + esc(p.name || '') + '</td><td>' + esc(p.status || '') + '</td><td>' + (Number.isFinite(toFiniteNum(p.time)) ? fmtNum(p.time, 2) : '') + '</td></tr>').join('') +
             '</tbody></table></div>'
           : '');
     } else if (tab === 'models') {
-      const cands = d.candidates_evaluated || [];
+      const rawCands = (d.candidates_evaluated && d.candidates_evaluated.length)
+        ? d.candidates_evaluated
+        : ((d.audit_trail && d.audit_trail.candidates) || []);
+      const cands = rawCands.map((c) => {
+        if (!c || typeof c !== 'object') return c;
+        const mScore = c.metric != null ? c.metric
+          : (c.silhouette_score != null ? c.silhouette_score
+          : (c.cv_ndcg_at_k != null ? c.cv_ndcg_at_k
+          : (c.cv_c_index != null ? c.cv_c_index
+          : (c.f1_micro != null ? c.f1_micro
+          : (c.score != null ? c.score : c.rmse)))));
+        const mName = c.model_name || c.name || c.algorithm || c.strategy || c.method || '';
+        return Object.assign({}, c, { name: mName, metric: mScore });
+      });
       const paretoNames = new Set((d.pareto_front || []).map((p) => (typeof p === 'string' ? p : (p.model_name || p.name || ''))));
       const selName = (d.selected_model && (d.selected_model.name || d.selected_model.model_name)) || '';
       if (!cands.length) {
@@ -1403,7 +1616,8 @@
         return;
       }
       const notes = rr.notes || [];
-      const missPct = rr.missing_ratio != null && Number.isFinite(Number(rr.missing_ratio)) ? (Number(rr.missing_ratio) * 100).toFixed(1) + '%' : 'n/a';
+      const missNum = toFiniteNum(rr.missing_ratio);
+      const missPct = Number.isFinite(missNum) ? (missNum * 100).toFixed(1) + '%' : 'n/a';
       body.innerHTML =
         '<div class="kpi-grid">' +
           '<div class="kpi-card"><div class="k-label">Task</div><div class="k-val">' + esc(rr.task || 'n/a') + '</div></div>' +
@@ -1416,12 +1630,12 @@
           : '<div class="hint">No risk warnings recorded.</div>');
     } else if (tab === 'eda') {
       const eda = d.eda_report || {};
-      const htmlPath = d.meta && d.meta.html_report_path ? d.meta.html_report_path.split(/[\\/]/).pop() : '';
-      const edaRowsNum = eda.n_rows != null ? Number(eda.n_rows) : NaN;
+      const htmlPath = d.meta && typeof d.meta.html_report_path === 'string' ? d.meta.html_report_path.split(/[\\/]/).pop() : '';
+      const edaRowsNum = toFiniteNum(eda.n_rows);
       const fiChart = Charts.renderFeatureImportanceHtml ? Charts.renderFeatureImportanceHtml(d.feature_importance) : '';
       body.innerHTML =
         '<div class="kpi-grid">' +
-          '<div class="kpi-card"><div class="k-label">Quality Score</div><div class="k-val">' + (eda.quality_score != null && Number.isFinite(Number(eda.quality_score)) ? fmtNum(eda.quality_score, 1) + '/100' : 'n/a') + '</div></div>' +
+          '<div class="kpi-card"><div class="k-label">Quality Score</div><div class="k-val">' + (Number.isFinite(toFiniteNum(eda.quality_score)) ? fmtNum(eda.quality_score, 1) + '/100' : 'n/a') + '</div></div>' +
           '<div class="kpi-card"><div class="k-label">Rows</div><div class="k-val">' + (Number.isFinite(edaRowsNum) ? edaRowsNum.toLocaleString() : 'n/a') + '</div></div>' +
           '<div class="kpi-card"><div class="k-label">Columns</div><div class="k-val">' + (eda.n_cols != null ? esc(eda.n_cols) : 'n/a') + '</div></div>' +
         '</div>' +
@@ -1429,15 +1643,18 @@
         (htmlPath ? '<a class="btn sm" href="/api/artifact?path=' + encodeURIComponent(htmlPath) + '&inline=1" target="_blank">Open full HTML report</a>' : '');
     } else if (tab === 'predictions') {
       const pred = d.predictions;
-      const task = (d.meta && d.meta.task) || (d.risk_report && d.risk_report.task) || '';
+      var predTask = d.task || (d.meta && d.meta.task) || (d.risk_report && d.risk_report.task) || '';
       if (!pred) {
         body.innerHTML = '<div class="hint">Inspect a <code class="inline">predictions_*.csv</code> or <code class="inline">forecast_*.csv</code> file in Report History to preview predicted rows.</div>';
       } else if (typeof pred === 'object' && !Array.isArray(pred)) {
         const stats = pred.statistics && typeof pred.statistics === 'object' ? pred.statistics : {};
         const samples = Array.isArray(pred.sample_values) ? pred.sample_values : [];
+        const totalPredNum = pred.total_predictions != null && String(pred.total_predictions).trim() !== '' && typeof pred.total_predictions !== 'boolean'
+          ? Number(pred.total_predictions)
+          : NaN;
         const kpis = [
           pred.total_predictions != null
-            ? '<div class="kpi-card"><div class="k-label">Predictions</div><div class="k-val">' + Number(pred.total_predictions).toLocaleString() + '</div></div>'
+            ? '<div class="kpi-card"><div class="k-label">Predictions</div><div class="k-val">' + (Number.isFinite(totalPredNum) ? totalPredNum.toLocaleString() : 'n/a') + '</div></div>'
             : '',
           stats.mean != null ? '<div class="kpi-card"><div class="k-label">Mean</div><div class="k-val">' + fmtNum(stats.mean, 4) + '</div></div>' : '',
           stats.std != null ? '<div class="kpi-card"><div class="k-label">Std Dev</div><div class="k-val">' + fmtNum(stats.std, 4) + '</div></div>' : '',
@@ -1445,7 +1662,10 @@
             ? '<div class="kpi-card"><div class="k-label">Range</div><div class="k-val">' + fmtNum(stats.min, 3) + ' – ' + fmtNum(stats.max, 3) + '</div></div>'
             : '',
         ].filter(Boolean).join('');
-        const diagChart = Charts.renderPredictionDiagnosticsHtml ? Charts.renderPredictionDiagnosticsHtml(pred, task) : '';
+        let diagChart = Charts.renderPredictionDiagnosticsHtml ? Charts.renderPredictionDiagnosticsHtml(pred, predTask) : '';
+        if (!diagChart && stats.distribution && Charts.renderDistributionHtml) {
+          diagChart = Charts.renderDistributionHtml(stats.distribution, predTask);
+        }
         const sampleCols = samples.length && typeof samples[0] === 'object' ? Object.keys(samples[0]) : [];
         const sampleTable = sampleCols.length
           ? '<div class="scroll-x" tabindex="0" role="region" aria-label="Sample predictions" style="max-height:240px; overflow-y:auto"><table><thead><tr>' +
@@ -1620,6 +1840,7 @@
 
   /* ── workbench initialization & active-job reconnect ───────────────── */
   async function initWorkbench() {
+    syncTaskOptsVisibility();
     refreshCommand();
     const [healthRes] = await Promise.all([
       safeFetchJson('/api/health'),
@@ -1636,6 +1857,12 @@
   globalScope.state = state;
   globalScope.renderInspector = renderInspector;
   globalScope.renderForecast = renderForecast;
+  globalScope.collectPayload = collectPayload;
+  globalScope.validateRunPreflight = validateRunPreflight;
+  globalScope.applyNlPlan = applyNlPlan;
+  globalScope.refreshCommand = refreshCommand;
+  globalScope.syncTaskOptsVisibility = syncTaskOptsVisibility;
+  globalScope.fmtVotes = fmtVotes;
 
   initWorkbench();
 })(typeof globalThis !== 'undefined' ? globalThis : window);

@@ -447,6 +447,57 @@ class TestWebUIForecast:
             bad = client.post("/api/forecast", json=bad_payload)
             assert bad.status_code == 400, f"Expected 400 for {bad_payload}, got {bad.status_code}"
 
+    def test_forecast_long_filename_and_value_col_bounded_in_deep_reports_dir(self, tmp_path, monkeypatch):
+        import acdso.webui.app as webui_app
+        from acdso.webui import create_app
+
+        deep_rep = tmp_path
+        while len(str(deep_rep.resolve())) < 175:
+            rem = 185 - len(str(deep_rep.resolve())) - 9
+            if rem <= 3:
+                break
+            deep_rep = deep_rep / ("d" * min(40, rem))
+        deep_rep = deep_rep / "reports"
+        deep_rep.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(webui_app, "REPORTS_DIR", deep_rep)
+        monkeypatch.setattr(webui_app, "LOG_DIR", deep_rep / "webui_logs")
+
+        app = create_app()
+        app.config["TESTING"] = False
+        c = app.test_client()
+
+        long_fname = f"telemetry_export_2025_2026_us_east_{'x' * 125}.csv"
+        long_col = f"Cumulative_Data_Transfer_Metric_{'Y' * 55}"
+        assert len(long_fname) > 150
+        assert len(long_col) > 80
+
+        rows = [f"Date,{long_col}"] + [f"2025-0{i}-01,{100 * i}" for i in range(1, 7)]
+        up = _upload_bytes(c, long_fname, ("\n".join(rows) + "\n").encode("utf-8"))
+        assert up["status"] == 200, up
+        uid = up["json"]["upload_id"]
+
+        resp = c.post(
+            "/api/forecast",
+            json={"upload_id": uid, "date_col": "Date", "value_col": long_col, "horizon": 2},
+        )
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert resp.content_type.startswith("application/json")
+        data = resp.get_json()
+        csv_path = data["csv_path"]
+        assert csv_path.startswith("forecast_") and csv_path.endswith(".csv")
+        assert webui_app._run_key(csv_path) is not None
+
+        full_path = deep_rep / csv_path
+        assert full_path.is_file()
+        assert len(str(full_path.resolve())) < 260
+
+        art = c.get(f"/api/artifact?path={csv_path}")
+        assert art.status_code == 200
+        art.close()
+
+        del_resp = c.delete(f"/api/reports?path={csv_path}")
+        assert del_resp.status_code == 200
+
 
 class TestWebUIRunJobsProgressAndStop:
     def test_run_rejects_invalid_inputs_400(self, client):
@@ -752,6 +803,116 @@ class TestWebUIHardeningRegressions:
             },
         )
         assert ok_scalar.status_code == 200, ok_scalar.get_data(as_text=True)
+
+    def test_forecast_write_oserror_returns_json_500(self, monkeypatch):
+        import acdso.webui.app as webui_app
+        from acdso.webui import create_app
+
+        app = create_app()
+        app.config["TESTING"] = False
+        c = app.test_client()
+
+        csv_bytes = (
+            b"Date,val\n"
+            b"2025-01-01,10\n"
+            b"2025-02-01,12\n"
+            b"2025-03-01,15\n"
+            b"2025-04-01,18\n"
+        )
+        up = _upload_bytes(c, "disk_full_test.csv", csv_bytes)
+        assert up["status"] == 200, up
+        uid = up["json"]["upload_id"]
+
+        def _raise_disk_full(*_args, **_kwargs):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(webui_app, "_write_forecast_csv", _raise_disk_full)
+
+        resp = c.post(
+            "/api/forecast",
+            json={"upload_id": uid, "date_col": "Date", "value_col": "val", "horizon": 2},
+        )
+        assert resp.status_code == 500
+        assert resp.content_type.startswith("application/json")
+        body_text = resp.get_data(as_text=True)
+        assert "<html" not in body_text.lower()
+        body = resp.get_json()
+        assert isinstance(body, dict) and "simulated disk full" in body.get("error", "")
+
+        # Scoped /api/* handler preserves 404/405 HTTPException codes as JSON while non-/api/ routes keep HTML
+        missing_resp = c.get("/api/does_not_exist_xyz")
+        assert missing_resp.status_code == 404
+        assert missing_resp.content_type.startswith("application/json")
+        assert "<html" not in missing_resp.get_data(as_text=True).lower()
+        missing_body = missing_resp.get_json()
+        assert isinstance(missing_body, dict) and missing_body.get("error")
+
+        method_resp = c.get("/api/upload")
+        assert method_resp.status_code == 405
+        assert method_resp.content_type.startswith("application/json")
+        assert "<html" not in method_resp.get_data(as_text=True).lower()
+        method_body = method_resp.get_json()
+        assert isinstance(method_body, dict) and method_body.get("error")
+
+        page_missing_resp = c.get("/nonexistent_page_xyz")
+        assert page_missing_resp.status_code == 404
+        assert page_missing_resp.content_type.startswith("text/html")
+
+        def _raise_index_err(*_args, **_kwargs):
+            raise OSError("simulated index error")
+
+        monkeypatch.setattr(webui_app, "_save_upload_index", _raise_index_err)
+        up_fail = c.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(csv_bytes), "idx_fail.csv")},
+            content_type="multipart/form-data",
+        )
+        assert up_fail.status_code == 500
+        assert up_fail.content_type.startswith("application/json")
+        assert "simulated index error" in (up_fail.get_json() or {}).get("error", "")
+
+        def _raise_unexpected(*_args, **_kwargs):
+            raise RuntimeError("simulated unexpected boom")
+
+        monkeypatch.setattr(webui_app, "_all_report_files", _raise_unexpected)
+        rep_fail = c.get("/api/reports")
+        assert rep_fail.status_code == 500
+        assert rep_fail.content_type.startswith("application/json")
+        assert "<html" not in rep_fail.get_data(as_text=True).lower()
+        assert "simulated unexpected boom" in (rep_fail.get_json() or {}).get("error", "")
+
+    def test_upload_index_oserror_rollback_leaves_no_leftover_files_and_empty_uploads(
+        self, isolated_webui_dirs, monkeypatch
+    ):
+        import acdso.webui.app as webui_app
+        from acdso.webui import create_app
+
+        app = create_app()
+        app.config["TESTING"] = False
+        c = app.test_client()
+
+        csv_bytes = b"Date,val\n2025-01-01,10\n2025-02-01,12\n"
+
+        def _raise_index_err(*_args, **_kwargs):
+            raise OSError("simulated index error")
+
+        monkeypatch.setattr(webui_app, "_save_upload_index", _raise_index_err)
+        up_fail = c.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(csv_bytes), "rollback_check.csv")},
+            content_type="multipart/form-data",
+        )
+        assert up_fail.status_code == 500
+        assert up_fail.content_type.startswith("application/json")
+        assert "<html" not in up_fail.get_data(as_text=True).lower()
+        assert "simulated index error" in (up_fail.get_json() or {}).get("error", "")
+
+        leftover_csvs = list(isolated_webui_dirs["uploads"].glob("*.csv"))
+        assert leftover_csvs == [], f"Expected zero leftover .csv files, found: {leftover_csvs}"
+
+        listed = c.get("/api/uploads")
+        assert listed.status_code == 200
+        assert listed.get_json() == {"uploads": []}
 
     def test_concurrent_uploads_and_index_listing_thread_safe(self):
         from concurrent.futures import ThreadPoolExecutor

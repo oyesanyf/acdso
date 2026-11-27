@@ -35,7 +35,27 @@ ROLE_LABELS = {
     "exclude": "excluded feature",
     "datetime_col": "datetime/period column",
     "treatment": "treatment column",
+    "group_col": "entity/group column",
+    "text_cols": "free-text column",
+    "time_col": "survival time column",
+    "event_col": "survival event column",
+    "query_col": "ranking query group column",
+    "user_col": "recommender user column",
+    "item_col": "recommender item column",
+    "rating_col": "recommender rating column",
 }
+
+_SINGLE_COL_ROLES = (
+    "datetime_col",
+    "treatment",
+    "group_col",
+    "time_col",
+    "event_col",
+    "query_col",
+    "user_col",
+    "item_col",
+    "rating_col",
+)
 
 _DATE_TOKEN_RE = re.compile(
     r"^(?:"
@@ -208,16 +228,37 @@ def predictable_columns(df: pd.DataFrame) -> list[str]:
     return keep
 
 
-def _rule_based_validate(df: pd.DataFrame, roles: dict[str, list]) -> ValidationResult:
+def _rule_based_validate(
+    df: pd.DataFrame, roles: dict[str, list], task: str = "auto"
+) -> ValidationResult:
+    import numpy as np
     import pandas as pd
 
     issues: list[ColumnIssue] = []
+    task_norm = (task or "auto").strip().lower()
 
-    # A column can't serve two roles at once -- unambiguous, always blocks.
+    # Single-column roles must have at most one column.
+    for role in _SINGLE_COL_ROLES:
+        cols = list(roles.get(role) or [])
+        if len(cols) > 1:
+            issues.append(ColumnIssue(
+                column=", ".join(cols),
+                role=role,
+                severity="block",
+                message=f"Select at most one column for {ROLE_LABELS.get(role, role)} (got {len(cols)}).",
+            ))
+
+    # A column can't serve two roles at once -- unambiguous, always blocks
+    # (except identical predict/target or ranking query_col==group_col).
     seen: dict[str, str] = {}
     for role, cols in roles.items():
         for col in cols:
             if col in seen and seen[col] != role:
+                pair = {seen[col], role}
+                if pair == {"predict", "target"}:
+                    continue
+                if task_norm == "ranking" and pair == {"query_col", "group_col"}:
+                    continue
                 issues.append(ColumnIssue(
                     column=col, role=role, severity="block",
                     message=f"'{col}' is already selected as {ROLE_LABELS.get(seen[col], seen[col])}; "
@@ -245,7 +286,7 @@ def _rule_based_validate(df: pd.DataFrame, roles: dict[str, list]) -> Validation
     # Unknown columns in any active role.
     df_cols = {str(c) for c in df.columns}
     if df_cols:
-        for role in ("predict", "target", "datetime_col", "exclude", "treatment"):
+        for role in ROLE_LABELS:
             for col in roles.get(role, []):
                 if col not in df_cols:
                     issues.append(ColumnIssue(
@@ -255,23 +296,37 @@ def _rule_based_validate(df: pd.DataFrame, roles: dict[str, list]) -> Validation
                         message=f"Column '{col}' was not found in the uploaded dataset.",
                     ))
 
-        # Check whether exclude + target + datetime_col leave zero feature columns.
-        if predict_cols or target_cols:
+        # Check whether target/role/excluded columns leave zero feature columns.
+        # build_argv strips predict/target for clustering, anomaly, and recommender.
+        eff_predict = [] if task_norm in ("clustering", "anomaly", "recommender") else predict_cols
+        eff_target = [] if task_norm in ("clustering", "anomaly", "recommender") else target_cols
+        if task_norm != "recommender" and (
+            eff_predict
+            or eff_target
+            or (
+                task_norm in ("clustering", "anomaly", "survival")
+                and (roles.get("exclude") or roles.get("time_col") or roles.get("event_col"))
+            )
+        ):
             non_feature = (
-                set(predict_cols)
-                | set(target_cols)
+                set(eff_predict)
+                | set(eff_target)
                 | set(roles.get("exclude", []))
                 | set(roles.get("datetime_col", []))
+                | set(roles.get("group_col", []))
+                | set(roles.get("time_col", []))
+                | set(roles.get("event_col", []))
+                | set(roles.get("query_col", []))
             )
             remaining = [c for c in df_cols if c not in non_feature]
             if not remaining:
                 issues.append(ColumnIssue(
-                    column=", ".join(roles.get("exclude", []) or predict_cols or target_cols),
+                    column=", ".join(roles.get("exclude", []) or eff_predict or eff_target or roles.get("time_col", [])),
                     role="exclude",
                     severity="block",
                     message=(
                         "No feature columns remain after removing the selected target, "
-                        "datetime, and excluded columns."
+                        "role, and excluded columns."
                     ),
                 ))
 
@@ -281,6 +336,76 @@ def _rule_based_validate(df: pd.DataFrame, roles: dict[str, list]) -> Validation
                 column=col, role="datetime_col", severity="warn",
                 message=f"'{col}' doesn't look like a date/time column "
                         f"(dtype {df[col].dtype}) -- double check this is the period column.",
+            ))
+
+    for col in roles.get("time_col", []):
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if pd.api.types.is_bool_dtype(s):
+            issues.append(ColumnIssue(
+                column=col, role="time_col", severity="block",
+                message=f"Survival time column '{col}' must be numeric, not boolean.",
+            ))
+            continue
+        num = pd.to_numeric(s, errors="coerce")
+        valid = num.dropna()
+        if valid.empty or not pd.api.types.is_numeric_dtype(s):
+            issues.append(ColumnIssue(
+                column=col, role="time_col", severity="block",
+                message=f"Survival time column '{col}' must contain numeric values.",
+            ))
+        elif not bool(np.isfinite(valid.to_numpy(dtype=float)).all()):
+            issues.append(ColumnIssue(
+                column=col, role="time_col", severity="block",
+                message=f"Survival time column '{col}' contains non-finite (inf/-inf) durations.",
+            ))
+        elif bool((valid < 0).any()):
+            issues.append(ColumnIssue(
+                column=col, role="time_col", severity="block",
+                message=f"Survival time column '{col}' contains negative durations.",
+            ))
+
+    for col in roles.get("event_col", []):
+        if col not in df.columns:
+            continue
+        s_nn = df[col].dropna()
+        if s_nn.empty:
+            issues.append(ColumnIssue(
+                column=col, role="event_col", severity="block",
+                message=f"Survival event column '{col}' has no non-null values.",
+            ))
+        elif not pd.api.types.is_bool_dtype(s_nn):
+            num = pd.to_numeric(s_nn, errors="coerce")
+            if num.isna().any() or not set(num.unique().tolist()).issubset({0, 1, 0.0, 1.0}):
+                issues.append(ColumnIssue(
+                    column=col, role="event_col", severity="block",
+                    message=f"Survival event column '{col}' must be binary (0/1 or boolean).",
+                ))
+
+    for col in roles.get("rating_col", []):
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if pd.api.types.is_bool_dtype(s) or not pd.api.types.is_numeric_dtype(s):
+            issues.append(ColumnIssue(
+                column=col, role="rating_col", severity="block",
+                message=f"Recommender rating column '{col}' must be numeric.",
+            ))
+
+    for role in ("group_col", "query_col"):
+        for col in roles.get(role, []):
+            if col in df.columns and int(df[col].nunique(dropna=True)) < 2:
+                issues.append(ColumnIssue(
+                    column=col, role=role, severity="warn",
+                    message=f"'{col}' has fewer than 2 distinct non-null groups for {ROLE_LABELS[role]}.",
+                ))
+
+    for col in roles.get("text_cols", []):
+        if col in df.columns and (pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col])):
+            issues.append(ColumnIssue(
+                column=col, role="text_cols", severity="warn",
+                message=f"'{col}' is numeric/boolean rather than unstructured text.",
             ))
 
     for role in ("predict", "target"):
@@ -297,6 +422,11 @@ def _rule_based_validate(df: pd.DataFrame, roles: dict[str, list]) -> Validation
                     message=f"'{col}' looks like an identifier column (mostly unique values) "
                             f"-- unusual choice for a {ROLE_LABELS[role]}.",
                 ))
+            elif _is_datetime_like(s) and not pd.api.types.is_numeric_dtype(s):
+                issues.append(ColumnIssue(
+                    column=col, role=role, severity="warn",
+                    message=f"'{col}' looks like a date/time column, not a value to predict.",
+                ))
             elif (
                 _is_cat_or_text_dtype(s)
                 and n > 0
@@ -307,11 +437,6 @@ def _rule_based_validate(df: pd.DataFrame, roles: dict[str, list]) -> Validation
                     message=f"'{col}' has {nunique} distinct values ({nunique / n:.0%} of rows) -- "
                             f"this looks like a categorical identifier or dimension (e.g. an "
                             f"app/service name), not a genuine {ROLE_LABELS[role]}.",
-                ))
-            elif _is_datetime_like(s) and not pd.api.types.is_numeric_dtype(s):
-                issues.append(ColumnIssue(
-                    column=col, role=role, severity="warn",
-                    message=f"'{col}' looks like a date/time column, not a value to predict.",
                 ))
 
     ok = not any(i.severity == "block" for i in issues)
@@ -448,9 +573,11 @@ def _get_provider():
     return None
 
 
-def validate_columns(df: pd.DataFrame, roles: dict[str, list]) -> ValidationResult:
+def validate_columns(
+    df: pd.DataFrame, roles: dict[str, list], task: str = "auto"
+) -> ValidationResult:
     """Validate column-role selections; combines rule-based + LLM checks."""
-    result = _rule_based_validate(df, roles)
+    result = _rule_based_validate(df, roles, task=task)
     if not result.ok:
         return result
 

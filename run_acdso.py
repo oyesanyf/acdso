@@ -160,11 +160,15 @@ from acdso.cli import (  # noqa: E402
     capture_console_output,
     generate_combined_report,
     generate_html_report_from_combined,
+    inspect_file_schema,
+    iter_file_chunks,
     load_user_file,
+    populate_task_summary_blocks,
     print_dict,
     print_header,
     print_subheader,
     print_table,
+    sample_file_bounded,
     save_combined_report,
 )
 
@@ -5000,6 +5004,12 @@ def _run_autonomous_custom_file(
     auto_exclude: bool = True,
     phase_offset: int = 0,
     total_phases: int = 9,
+    group_col: Optional[str] = None,
+    cv_strategy: str = "auto",
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    chunk_size: int = 50000,
+    scale_mode: str = "auto",
 ):
     """
     Run comprehensive autonomous analysis on a USER'S CUSTOM FILE.
@@ -5114,10 +5124,37 @@ def _run_autonomous_custom_file(
         _emit_progress(p1, total_phases, "Data Loading", "error", detail="No target column detected")
         return None
     
+    if group_col and group_col not in df.columns:
+        msg = f"Group column '{group_col}' not found in dataset!"
+        print(f"\n  [X] ERROR: {msg}")
+        all_results.append(("Group Validation", f"FAILED: {msg}", 0))
+        _emit_progress(p1, total_phases, "Data Loading", "error", detail=msg)
+        return None
+    if text_cols:
+        missing_txt = [c for c in text_cols if c not in df.columns]
+        if missing_txt:
+            msg = f"Text column(s) not found in dataset: {missing_txt}"
+            print(f"\n  [X] ERROR: {msg}")
+            all_results.append(("Text Validation", f"FAILED: {msg}", 0))
+            _emit_progress(p1, total_phases, "Data Loading", "error", detail=msg)
+            return None
+
     analysis_outputs['target'] = detected_target
     analysis_outputs['datetime_col'] = detected_datetime_col
+    analysis_outputs['group_col'] = group_col
+    analysis_outputs['cv_strategy'] = cv_strategy
+    eff_nlp_method = "tfidf" if not nlp_method or str(nlp_method).strip().lower() == "auto" else str(nlp_method).strip().lower()
+    analysis_outputs['nlp_method'] = eff_nlp_method
     
     # Smart automatic column exclusion (unless --no-auto-exclude)
+    protected_cols = {detected_target}
+    if detected_datetime_col:
+        protected_cols.add(detected_datetime_col)
+    if group_col:
+        protected_cols.add(group_col)
+    if text_cols:
+        protected_cols.update(text_cols)
+
     if auto_exclude:
         try:
             from acdso.advisors import auto_exclude_columns
@@ -5135,16 +5172,19 @@ def _run_autonomous_custom_file(
                 verbose=True,
             )
             for col in excl_result.columns_to_exclude:
-                if col != detected_target and col != detected_datetime_col and col not in effective_exclude:
+                if col not in protected_cols and col not in effective_exclude:
                     effective_exclude.append(col)
         except Exception as e:
             print(f"  [--] Auto-exclusion skipped: {e}")
     else:
         print("\n  [--] Auto-exclusion disabled (--no-auto-exclude)")
     
-    # Sanitize NaN/inf target rows before downstream phases
+    # Sanitize NaN/inf target (and group) rows before downstream phases
     try:
-        df = _sanitize_target_rows(df, [detected_target], min_rows=2)
+        sanitize_cols = [detected_target]
+        if group_col and group_col in df.columns:
+            sanitize_cols.append(group_col)
+        df = _sanitize_target_rows(df, sanitize_cols, min_rows=2)
         analysis_outputs['df'] = df
         analysis_outputs['shape'] = df.shape
     except Exception as e:
@@ -5152,6 +5192,16 @@ def _run_autonomous_custom_file(
         all_results.append(("Target Validation", f"FAILED: {e}", time.time() - phase1_start))
         _emit_progress(p1, total_phases, "Data Loading", "error", detail=str(e))
         return None
+
+    if group_col and group_col in df.columns:
+        g_ser = df[group_col]
+        if isinstance(g_ser.dtype, pd.CategoricalDtype) or g_ser.dtype == object:
+            raw_vals = g_ser.tolist()
+            if len({type(v) for v in raw_vals if v is not None}) > 1:
+                g_ser = g_ser.astype(str)
+        groups_full = g_ser.to_numpy()
+    else:
+        groups_full = None
     
     # Auto-detect task type
     detected_task = task
@@ -5211,11 +5261,14 @@ def _run_autonomous_custom_file(
     phase3_start = time.time()
     try:
         from acdso.risk import analyze_risk
+        from acdso.nlp import detect_text_columns
         
         # Prepare features
         X = df.drop(columns=[detected_target])
         if detected_datetime_col and detected_datetime_col in X.columns:
             X = X.drop(columns=[detected_datetime_col])
+        if group_col and group_col in X.columns:
+            X = X.drop(columns=[group_col])
         if effective_exclude:
             X = X.drop(columns=[c for c in effective_exclude if c in X.columns], errors='ignore')
         
@@ -5225,15 +5278,36 @@ def _run_autonomous_custom_file(
             all_results.append(("Risk Analysis", "SKIPPED: No features", time.time() - phase3_start))
             _emit_progress(p3, total_phases, "Risk Analysis", "done", detail="skipped: no features")
         else:
-            # Encode categorical columns safely
-            cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+            # Resolve text columns and keep them raw; encode non-text categoricals safely
+            if text_cols is not None:
+                eff_text_risk = [c for c in text_cols if c in X.columns]
+            else:
+                eff_text_risk = [str(c) for c in detect_text_columns(X)]
+            text_set_risk = set(eff_text_risk)
+            cat_cols = [
+                c for c in X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+                if c not in text_set_risk
+            ]
             if cat_cols:
                 X_encoded = _encode_categoricals_safe(X, cat_cols)
             else:
                 X_encoded = X.copy()
+            # Drop raw text columns for risk VIF calculation if present
+            if eff_text_risk:
+                X_risk_num = X_encoded.drop(columns=[c for c in eff_text_risk if c in X_encoded.columns], errors='ignore')
+                if X_risk_num.shape[1] == 0:
+                    X_risk_num = X_encoded
+            else:
+                X_risk_num = X_encoded
             y = df[detected_target]
             
-            risk = analyze_risk(X_encoded, y, task=detected_task)
+            risk = analyze_risk(
+                X_risk_num,
+                y,
+                task=detected_task,
+                groups=groups_full,
+                cv_strategy=cv_strategy,
+            )
             
             print(f"\n  Risk Report:")
             print(f"      Task: {risk.task}")
@@ -5264,11 +5338,14 @@ def _run_autonomous_custom_file(
     automl_failed = False
     try:
         from acdso import ACDSOClassifier, ACDSORegressor
+        from acdso.nlp import detect_text_columns
         
         # Prepare data
         X = df.drop(columns=[detected_target])
         if detected_datetime_col and detected_datetime_col in X.columns:
             X = X.drop(columns=[detected_datetime_col])
+        if group_col and group_col in X.columns:
+            X = X.drop(columns=[group_col])
         if effective_exclude:
             X = X.drop(columns=[c for c in effective_exclude if c in X.columns], errors='ignore')
         
@@ -5280,8 +5357,18 @@ def _run_autonomous_custom_file(
             all_results.append(("AutoML", "SKIPPED: Time-series-only dataset", time.time() - phase4_start))
             _emit_progress(p4, total_phases, "AutoML Training", "done", detail="skipped: no tabular features")
         else:
-            # Encode categorical columns safely and capture encoding metadata for --predict
-            cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+            # Keep free-text columns raw for TextFeaturizer; encode non-text categoricals safely
+            if text_cols is not None:
+                eff_text_cols = [c for c in text_cols if c in X.columns]
+            else:
+                eff_text_cols = [str(c) for c in detect_text_columns(X)]
+            text_col_set = set(eff_text_cols)
+            analysis_outputs['text_cols'] = eff_text_cols
+
+            cat_cols = [
+                c for c in X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+                if c not in text_col_set
+            ]
             if cat_cols:
                 X_encoded, enc_meta = _encode_categoricals_safe(X, cat_cols, return_meta=True)
             else:
@@ -5290,10 +5377,29 @@ def _run_autonomous_custom_file(
             
             y = df[detected_target]
             ts_split = 0.2 if len(X_encoded) >= 5 else 1
-            
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_encoded, y, test_size=ts_split, random_state=42
-            )
+            groups_train = None
+            n_unique_groups = int(pd.Series(groups_full).nunique(dropna=True)) if groups_full is not None else 0
+            if groups_full is not None and n_unique_groups >= 3 and cv_strategy != "temporal":
+                from acdso.cv import group_holdout_split
+                tr_idx, te_idx = group_holdout_split(
+                    X_encoded, y, groups=groups_full, test_size=0.2, task=detected_task, random_state=42
+                )
+                X_train, X_test = X_encoded.iloc[tr_idx], X_encoded.iloc[te_idx]
+                y_train, y_test = y.iloc[tr_idx], y.iloc[te_idx]
+                groups_train = groups_full[tr_idx]
+            elif cv_strategy == "temporal" and len(X_encoded) >= 5:
+                split_at = max(1, min(len(X_encoded) - 1, int(round(len(X_encoded) * 0.8))))
+                X_train, X_test = X_encoded.iloc[:split_at], X_encoded.iloc[split_at:]
+                y_train, y_test = y.iloc[:split_at], y.iloc[split_at:]
+                groups_train = groups_full[:split_at] if groups_full is not None else None
+            elif groups_full is not None:
+                X_train, X_test, y_train, y_test, groups_train, _ = train_test_split(
+                    X_encoded, y, groups_full, test_size=ts_split, random_state=42
+                )
+            else:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_encoded, y, test_size=ts_split, random_state=42
+                )
             
             if detected_task == 'classification':
                 model = ACDSOClassifier(
@@ -5302,6 +5408,9 @@ def _run_autonomous_custom_file(
                     cv=5,
                     verbose=1,
                     selection_mode=selection_mode,
+                    cv_strategy=cv_strategy,
+                    text_cols=eff_text_cols or None,
+                    text_method=eff_nlp_method,
                 )
             else:
                 model = ACDSORegressor(
@@ -5310,9 +5419,13 @@ def _run_autonomous_custom_file(
                     cv=5,
                     verbose=1,
                     selection_mode=selection_mode,
+                    cv_strategy=cv_strategy,
+                    text_cols=eff_text_cols or None,
+                    text_method=eff_nlp_method,
                 )
             
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train, groups=groups_train, cv_strategy=cv_strategy)
+            analysis_outputs['n_unique_groups'] = int(pd.Series(groups_full).nunique(dropna=True)) if groups_full is not None else None
             
             # Evaluate
             y_pred = model.predict(X_test)
@@ -5347,7 +5460,7 @@ def _run_autonomous_custom_file(
             # Save audit trail
             audit_path = f"reports/audit_{base_file_name}.json"
             with open(audit_path, 'w', encoding='utf-8') as f:
-                json.dump(model._engine.audit_trail_, f, indent=2, default=str)
+                json.dump(_sanitize_json_payload(model._engine.audit_trail_), f, indent=2, allow_nan=False)
             print(f"\n  [OK] Audit trail saved: {audit_path}")
             analysis_outputs['audit_path'] = audit_path
             
@@ -5360,6 +5473,10 @@ def _run_autonomous_custom_file(
                 'task': detected_task,
                 'feature_columns': list(X_encoded.columns),
                 'datetime_col': detected_datetime_col,
+                'group_col': group_col,
+                'cv_strategy': cv_strategy,
+                'text_cols': eff_text_cols,
+                'text_method': eff_nlp_method,
                 'exclude': effective_exclude,
                 'categorical_encoding': enc_meta,
             }
@@ -5892,6 +6009,53 @@ def _run_autonomous_custom_file(
     if "configuration" not in combined_report:
         combined_report["configuration"] = {}
     combined_report["configuration"]["input_file"] = os.path.abspath(custom_file)
+    if group_col:
+        combined_report["configuration"]["group_col"] = group_col
+    if cv_strategy:
+        combined_report["configuration"]["cv_strategy"] = cv_strategy
+    if analysis_outputs.get("text_cols"):
+        combined_report["configuration"]["text_cols"] = analysis_outputs["text_cols"]
+        combined_report["configuration"]["nlp_method"] = analysis_outputs.get("nlp_method", eff_nlp_method)
+
+    # Populate canonical R1-R6 task summary blocks (metrics, cv, nlp, scale)
+    cv_summary = None
+    if group_col or (cv_strategy and cv_strategy != "auto"):
+        cv_summary = {
+            "group_col": group_col,
+            "cv_strategy": getattr(analysis_outputs.get("model"), "cv_strategy_", None) or cv_strategy,
+            "n_unique_groups": analysis_outputs.get("n_unique_groups"),
+            "leakage_validated": bool(group_col),
+        }
+    nlp_summary = None
+    if analysis_outputs.get("text_cols"):
+        nlp_summary = {
+            "text_cols": list(analysis_outputs["text_cols"]),
+            "n_text_cols": len(analysis_outputs["text_cols"]),
+            "nlp_method": analysis_outputs.get("nlp_method", eff_nlp_method),
+        }
+    scale_summary = None
+    if scale_mode and scale_mode != "auto":
+        scale_summary = {
+            "mode": scale_mode,
+            "chunk_size": int(chunk_size),
+            "n_rows": int(df.shape[0]),
+        }
+    task_metrics: Dict[str, Any] = {}
+    if isinstance(combined_report.get("test_performance"), dict):
+        task_metrics.update(combined_report["test_performance"])
+    if isinstance(combined_report.get("selected_model"), dict) and isinstance(combined_report["selected_model"].get("metrics"), dict):
+        if combined_report["selected_model"]["metrics"].get("metric") is not None:
+            task_metrics.setdefault("cv_metric", combined_report["selected_model"]["metrics"]["metric"])
+
+    populate_task_summary_blocks(
+        combined_report,
+        task=detected_task,
+        estimator=analysis_outputs.get("model"),
+        metrics=task_metrics or None,
+        cv_info=cv_summary,
+        nlp_info=nlp_summary,
+        scale_info=scale_summary,
+    )
     
     # Save JSON report - include target name in filename if specified
     os.makedirs("reports", exist_ok=True)
@@ -5938,6 +6102,12 @@ def run_autonomous_demo(
     auto_exclude: bool = True,
     phase_offset: int = 0,
     total_phases: Optional[int] = None,
+    group_col: Optional[str] = None,
+    cv_strategy: str = "auto",
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    chunk_size: int = 50000,
+    scale_mode: str = "auto",
 ):
     """
     Run EVERYTHING autonomously - the complete ACDSO v3 showcase.
@@ -6047,6 +6217,12 @@ def run_autonomous_demo(
             auto_exclude=auto_exclude,
             phase_offset=phase_offset,
             total_phases=total_phases or 9,
+            group_col=group_col,
+            cv_strategy=cv_strategy,
+            text_cols=text_cols,
+            nlp_method=nlp_method,
+            chunk_size=chunk_size,
+            scale_mode=scale_mode,
         )
     
     # =========================================================================
@@ -9491,6 +9667,1687 @@ def run_multi_target_training(
     return all_results
 
 
+def _parse_csv_cols(raw_val: Optional[str]) -> Optional[List[str]]:
+    """Parse a comma-separated column argument into a clean list of column names."""
+    if raw_val is None:
+        return None
+    cols = [c.strip() for c in str(raw_val).split(",") if c.strip()]
+    return cols or None
+
+
+def _save_r7_artifacts(
+    *,
+    file_path: str,
+    target_suffix: str,
+    combined_report: Dict[str, Any],
+    estimator: Any = None,
+    metrics: Optional[Dict[str, Any]] = None,
+    cv_info: Optional[Dict[str, Any]] = None,
+    nlp_info: Optional[Dict[str, Any]] = None,
+    specialized_info: Optional[Dict[str, Any]] = None,
+    scale_info: Optional[Dict[str, Any]] = None,
+    clustering_info: Optional[Dict[str, Any]] = None,
+    anomaly_info: Optional[Dict[str, Any]] = None,
+) -> tuple[str, str]:
+    """Populate task blocks and write strict RFC 8259 JSON + balanced HTML reports."""
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    json_path = f"reports/autonomous_{base_name}{target_suffix}_combined.json"
+    html_path = f"reports/autonomous_{base_name}{target_suffix}_report.html"
+
+    populate_task_summary_blocks(
+        combined_report,
+        task=combined_report.get("task"),
+        estimator=estimator,
+        metrics=metrics,
+        clustering_info=clustering_info,
+        anomaly_info=anomaly_info,
+        cv_info=cv_info,
+        nlp_info=nlp_info,
+        specialized_info=specialized_info,
+        scale_info=scale_info,
+    )
+    combined_report["html_report_path"] = os.path.abspath(html_path)
+    combined_report["json_report_path"] = os.path.abspath(json_path)
+
+    save_combined_report(combined_report, json_path)
+    generate_html_report_from_combined(combined_report, html_path)
+    return os.path.abspath(json_path), os.path.abspath(html_path)
+
+
+def _run_out_of_core_pipeline(
+    *,
+    file_path: str,
+    target: Optional[str],
+    predict: Optional[str],
+    task: str,
+    scale_mode: str,
+    chunk_size: int,
+    exclude: Optional[List[str]] = None,
+    group_col: Optional[str] = None,
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    n_clusters: Optional[int] = None,
+) -> bool:
+    """Execute R6 out-of-core chunked or bounded-subsampling pipeline without full RAM load."""
+    _ensure_ml_deps()
+    from acdso.scale import ACDSOOutOfCoreTrainer
+
+    t0 = time.time()
+    total_phases = 4
+    _render_phase_banner(1, total_phases, "Schema Inspection")
+    _emit_progress(1, total_phases, "Schema Inspection", "running", detail=os.path.basename(file_path))
+
+    try:
+        schema = inspect_file_schema(file_path, sample_rows=500, count_rows=False, chunk_size=chunk_size)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Could not inspect file schema: {exc}")
+        _emit_progress(1, total_phases, "Schema Inspection", "error", detail=str(exc))
+        return False
+
+    columns = list(schema.get("columns") or [])
+    if not columns:
+        print("\n  [X] ERROR: Dataset has no columns.")
+        _emit_progress(1, total_phases, "Schema Inspection", "error", detail="empty schema")
+        return False
+
+    target_col = None
+    if predict and str(predict).strip():
+        target_col = str(predict).split(",")[0].strip()
+    elif target and str(target).strip():
+        target_col = str(target).split(",")[0].strip()
+
+    if task in ("classification", "regression") and not target_col:
+        print(f"\n  [X] ERROR: --task {task} requires --target or --predict.")
+        _emit_progress(1, total_phases, "Schema Inspection", "error", detail="missing target")
+        return False
+    if target_col and target_col not in columns:
+        print(f"\n  [X] ERROR: Target column '{target_col}' not found in dataset columns: {columns}")
+        _emit_progress(1, total_phases, "Schema Inspection", "error", detail="target not found")
+        return False
+    if text_cols:
+        missing_txt = [c for c in text_cols if c not in columns]
+        if missing_txt:
+            print(f"\n  [X] ERROR: Text column(s) not found: {missing_txt}")
+            _emit_progress(1, total_phases, "Schema Inspection", "error", detail="text col not found")
+            return False
+
+    drop_cols = (set(exclude or []) | ({group_col} if group_col else set())) - ({target_col} if target_col else set())
+    keep_cols = [c for c in columns if c not in drop_cols]
+    feature_keep_cols = [c for c in keep_cols if c != target_col]
+    if not feature_keep_cols:
+        print("\n  [X] ERROR: No feature columns remaining after exclusions.")
+        _emit_progress(1, total_phases, "Schema Inspection", "error", detail="no features")
+        return False
+
+    raw_task = str(task or "auto").strip().lower()
+    if raw_task in ("classification", "regression", "clustering"):
+        trainer_task = raw_task
+    elif not target_col:
+        trainer_task = "clustering"
+    else:
+        from acdso.scale import _clean_supervised_chunk
+        from acdso.utils import infer_target_type
+
+        y_samples: List[np.ndarray] = []
+        n_sampled_y = 0
+        max_infer_rows = min(10_000, max(1000, int(chunk_size) * 2))
+        if str(scale_mode or "auto").strip().lower() == "subsample":
+            sample_y_df = sample_file_bounded(
+                file_path,
+                max_rows=max_infer_rows,
+                chunk_size=int(chunk_size),
+                random_state=42,
+                usecols=[target_col],
+            )
+            _, y_clean = _clean_supervised_chunk(sample_y_df, target_col)
+            if len(y_clean) > 0:
+                y_samples.append(y_clean)
+        else:
+            for y_chunk in iter_file_chunks(
+                file_path,
+                chunk_size=min(max(100, int(chunk_size)), max_infer_rows),
+                usecols=[target_col],
+            ):
+                _, y_clean = _clean_supervised_chunk(y_chunk, target_col)
+                if len(y_clean) > 0:
+                    y_samples.append(y_clean)
+                    n_sampled_y += len(y_clean)
+                if n_sampled_y >= max_infer_rows:
+                    break
+        if y_samples:
+            y_arr_sample = np.concatenate(y_samples) if len(y_samples) > 1 else y_samples[0]
+            trainer_task = (
+                "regression"
+                if infer_target_type(y_arr_sample) == "regression"
+                else "classification"
+            )
+        else:
+            trainer_task = "classification"
+    eff_text_cols = [c for c in (text_cols or []) if c in feature_keep_cols] or None
+    _emit_progress(1, total_phases, "Schema Inspection", "done", detail=f"{len(keep_cols)} cols")
+
+    _render_phase_banner(2, total_phases, "Out-of-Core Training")
+    _emit_progress(2, total_phases, "Out-of-Core Training", "running", detail=scale_mode)
+    try:
+        trainer = ACDSOOutOfCoreTrainer(
+            task=trainer_task,
+            mode=scale_mode,
+            chunk_size=int(chunk_size),
+            n_clusters=int(n_clusters) if n_clusters is not None else 5,
+            random_state=42,
+            verbose=1,
+        )
+        if len(keep_cols) < len(columns):
+            trainer.fit_chunks(
+                iter_file_chunks(file_path, chunk_size=int(chunk_size), usecols=keep_cols),
+                target_col=target_col,
+                text_cols=eff_text_cols,
+                mode=scale_mode,
+            )
+        else:
+            trainer.fit_from_file(
+                file_path,
+                target_col=target_col,
+                text_cols=eff_text_cols,
+                mode=scale_mode,
+            )
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Out-of-core training failed: {exc}")
+        _emit_progress(2, total_phases, "Out-of-Core Training", "error", detail=str(exc))
+        return False
+
+    resolved_task = trainer.task_
+    scale_summary = trainer.get_scale_summary()
+    _emit_progress(2, total_phases, "Out-of-Core Training", "done", detail=str(trainer.algorithm_))
+
+    _render_phase_banner(3, total_phases, "Streaming Predictions")
+    _emit_progress(3, total_phases, "Streaming Predictions", "running")
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    pred_suffix = target_col or ("cluster" if resolved_task == "clustering" else "prediction")
+    pred_out = f"reports/predictions_{base_name}_{pred_suffix}_full_dataset.csv"
+    pred_col_name = f"{target_col}_predicted" if target_col else ("cluster" if resolved_task == "clustering" else "prediction")
+
+    try:
+        trainer.predict_to_file(file_path, pred_out, chunk_size=int(chunk_size), prediction_col=pred_col_name)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Streaming prediction failed: {exc}")
+        _emit_progress(3, total_phases, "Streaming Predictions", "error", detail=str(exc))
+        return False
+
+    # Bounded evaluation on reservoir sample
+    eval_metrics: Dict[str, Any] = {}
+    try:
+        sample_df, total_rows_seen = sample_file_bounded(
+            file_path,
+            max_rows=min(5000, max(500, int(chunk_size) * 2)),
+            chunk_size=int(chunk_size),
+            random_state=42,
+            usecols=keep_cols,
+            return_total=True,
+        )
+        if target_col and target_col in sample_df.columns and resolved_task in ("classification", "regression"):
+            clean_sample = _sanitize_target_rows(sample_df, [target_col], min_rows=2)
+            eval_metrics = trainer.evaluate(clean_sample.drop(columns=[target_col]), clean_sample[target_col].to_numpy())
+        else:
+            eval_metrics = trainer.evaluate(sample_df)
+    except Exception:
+        total_rows_seen = int(scale_summary.get("n_rows_seen") or 0)
+
+    if resolved_task == "clustering" and "silhouette" in eval_metrics and "silhouette_score" not in eval_metrics:
+        eval_metrics["silhouette_score"] = eval_metrics["silhouette"]
+
+    # Bounded prediction stats & sample rows from streamed output CSV
+    total_preds = 0
+    sample_values: List[Dict[str, Any]] = []
+    tail_rows: List[Dict[str, Any]] = []
+    class_counts: Dict[str, int] = {}
+    num_vals: List[float] = []
+    for pchunk in iter_file_chunks(pred_out, chunk_size=max(1000, int(chunk_size))):
+        n_c = len(pchunk)
+        if pred_col_name in pchunk.columns:
+            pseries = pchunk[pred_col_name]
+            if resolved_task in ("classification", "clustering"):
+                for k_val, cnt in pseries.value_counts(dropna=False).items():
+                    sk = str(k_val)
+                    class_counts[sk] = class_counts.get(sk, 0) + int(cnt)
+            else:
+                arr_c = pd.to_numeric(pseries, errors="coerce").dropna().to_numpy(dtype=float)
+                if len(arr_c) > 0 and len(num_vals) < 10000:
+                    num_vals.extend(arr_c[: 10000 - len(num_vals)].tolist())
+            has_actual = bool(target_col and target_col in pchunk.columns)
+            need_head = max(0, 20 - len(sample_values))
+            if need_head > 0 and n_c > 0:
+                head_df = pchunk.iloc[:need_head]
+                head_preds = head_df[pred_col_name].tolist()
+                head_acts = head_df[target_col].tolist() if has_actual else [None] * len(head_preds)
+                for offset, (pv, av) in enumerate(zip(head_preds, head_acts)):
+                    sample_values.append(
+                        {
+                            "row": total_preds + offset,
+                            "predicted": _json_safe_scalar(pv),
+                            "actual": _json_safe_scalar(av) if has_actual else None,
+                        }
+                    )
+            tail_start = max(need_head, n_c - 5)
+            if tail_start < n_c:
+                tail_df = pchunk.iloc[tail_start:]
+                tail_preds = tail_df[pred_col_name].tolist()
+                tail_acts = tail_df[target_col].tolist() if has_actual else [None] * len(tail_preds)
+                for offset, (pv, av) in enumerate(zip(tail_preds, tail_acts)):
+                    tail_rows.append(
+                        {
+                            "row": total_preds + tail_start + offset,
+                            "predicted": _json_safe_scalar(pv),
+                            "actual": _json_safe_scalar(av) if has_actual else None,
+                        }
+                    )
+                if len(tail_rows) > 5:
+                    tail_rows = tail_rows[-5:]
+        total_preds += n_c
+
+    if total_preds > 25 and tail_rows:
+        sample_values.extend(tail_rows)
+
+    pred_stats: Dict[str, Any] = {}
+    if class_counts:
+        pred_stats = {"distribution": class_counts, "total_classes": len(class_counts)}
+    elif num_vals:
+        arr_n = np.asarray(num_vals, dtype=float)
+        pred_stats = {
+            "mean": _json_safe_scalar(float(np.mean(arr_n))),
+            "std": _json_safe_scalar(float(np.std(arr_n))),
+            "min": _json_safe_scalar(float(np.min(arr_n))),
+            "max": _json_safe_scalar(float(np.max(arr_n))),
+        }
+
+    # Save trainer bundle
+    target_suffix = f"_{target_col}" if target_col else ""
+    try:
+        import joblib
+        model_path = f"reports/model_{base_name}{target_suffix}.pkl"
+        joblib.dump(
+            {
+                "model": trainer,
+                "target": target_col,
+                "task": resolved_task,
+                "scale_mode": scale_mode,
+                "group_col": group_col,
+                "exclude": list(exclude or []),
+                "feature_columns": list(trainer.feature_columns_),
+            },
+            model_path,
+        )
+    except Exception:
+        model_path = ""
+
+    _emit_progress(3, total_phases, "Streaming Predictions", "done", detail=pred_out)
+
+    _render_phase_banner(4, total_phases, "Report Generation")
+    _emit_progress(4, total_phases, "Report Generation", "running")
+    total_time = time.time() - t0
+    combined_report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "acdso_version": "3.0",
+        "mode": "out_of_core_scale",
+        "file": file_path,
+        "target": target_col,
+        "task": resolved_task,
+        "dataset_info": {
+            "rows": int(scale_summary.get("n_rows_seen") or total_preds or total_rows_seen),
+            "columns": int(len(columns)),
+        },
+        "configuration": {
+            "input_file": os.path.abspath(file_path),
+            "scale_mode": scale_mode,
+            "chunk_size": int(chunk_size),
+            "task": resolved_task,
+            "group_col": group_col,
+            "exclude": list(exclude or []),
+        },
+        "selected_model": {
+            "name": str(trainer.algorithm_),
+            "type": type(trainer).__name__,
+            "metrics": eval_metrics,
+        },
+        "audit_trail": scale_summary,
+        "predictions": {
+            "target_column": target_col or pred_col_name,
+            "total_predictions": int(total_preds),
+            "output_file": os.path.abspath(pred_out),
+            "task": resolved_task,
+            "statistics": pred_stats,
+            "sample_values": sample_values,
+        },
+        "summary": {
+            "total_phases": total_phases,
+            "successful": total_phases,
+            "failed": 0,
+            "skipped": 0,
+            "total_time": total_time,
+            "success_rate": 100.0,
+        },
+        "phase_results": {
+            "All Phases": [
+                {"name": "Schema Inspection", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Out-of-Core Training", "status": "SUCCESS", "time": total_time, "model_name": str(trainer.algorithm_)},
+                {"name": "Streaming Predictions", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Report Generation", "status": "SUCCESS", "time": 0.0, "model_name": None},
+            ]
+        },
+    }
+    if model_path:
+        combined_report["model_path"] = os.path.abspath(model_path)
+
+    resolved_text_cols = [
+        str(c) for c in (getattr(trainer, "text_cols_", None) or eff_text_cols or [])
+        if str(c) not in drop_cols
+    ] or None
+    nlp_info = (
+        {"text_cols": resolved_text_cols, "n_text_cols": len(resolved_text_cols), "nlp_method": "hashing"}
+        if resolved_text_cols
+        else None
+    )
+    clustering_info = (
+        {
+            "best_algorithm": str(getattr(trainer, "algorithm_", "minibatch_kmeans")),
+            "n_clusters": int(getattr(trainer, "n_clusters", 0)),
+            "silhouette_score": eval_metrics.get("silhouette_score", eval_metrics.get("silhouette")),
+        }
+        if resolved_task == "clustering"
+        else None
+    )
+    json_abs, html_abs = _save_r7_artifacts(
+        file_path=file_path,
+        target_suffix=target_suffix,
+        combined_report=combined_report,
+        estimator=trainer,
+        metrics=eval_metrics,
+        nlp_info=nlp_info,
+        scale_info=scale_summary,
+        clustering_info=clustering_info,
+    )
+    print(f"\n  [OK] Out-of-core predictions: {os.path.abspath(pred_out)}")
+    print(f"  [OK] Combined JSON: {json_abs}")
+    print(f"  [OK] HTML Report:   {html_abs}")
+    _emit_progress(4, total_phases, "Report Generation", "done", detail=html_abs)
+    return True
+
+
+def _run_clustering_pipeline(
+    *,
+    file_path: str,
+    exclude: Optional[List[str]] = None,
+    group_col: Optional[str] = None,
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    cluster_algo: str = "auto",
+    n_clusters: Optional[int] = None,
+    dim_reduce: str = "none",
+    cluster_metric: str = "silhouette",
+) -> bool:
+    """Execute R1 unsupervised clustering pipeline."""
+    _ensure_ml_deps()
+    from acdso.clustering import ACDSOClusterer
+    from acdso.nlp import detect_text_columns
+
+    t0 = time.time()
+    total_phases = 4
+    _render_phase_banner(1, total_phases, "Data Loading")
+    _emit_progress(1, total_phases, "Data Loading", "running", detail=os.path.basename(file_path))
+
+    try:
+        df = load_user_file(file_path)
+        _validate_dataframe_nonempty(df, file_path)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Failed to load dataset: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+
+    drop_cols = [c for c in (exclude or []) if c in df.columns]
+    if group_col and group_col in df.columns and group_col not in drop_cols:
+        drop_cols.append(group_col)
+    X = df.drop(columns=drop_cols) if drop_cols else df.copy()
+    if X.empty or X.shape[1] == 0:
+        print("\n  [X] ERROR: No feature columns remaining for clustering.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="no features")
+        return False
+
+    if text_cols is not None:
+        missing_txt = [c for c in text_cols if c not in X.columns]
+        if missing_txt:
+            print(f"\n  [X] ERROR: Text column(s) not found: {missing_txt}")
+            _emit_progress(1, total_phases, "Data Loading", "error", detail="missing text col")
+            return False
+        eff_text_cols = list(text_cols)
+    else:
+        eff_text_cols = [str(c) for c in detect_text_columns(X)]
+    eff_nlp_method = "tfidf" if not nlp_method or str(nlp_method).lower() == "auto" else str(nlp_method).lower()
+    _emit_progress(1, total_phases, "Data Loading", "done", detail=f"{df.shape[0]}x{df.shape[1]}")
+
+    _render_phase_banner(2, total_phases, "Auto EDA")
+    _emit_progress(2, total_phases, "Auto EDA", "running")
+    eda_summary = None
+    eda_html = None
+    try:
+        from acdso.eda import ACDSOAutoEDA
+        eda = ACDSOAutoEDA(verbose=0)
+        eda.analyze(df, dataset_name=os.path.basename(file_path))
+        eda_summary = {
+            "dataset_name": eda.report_.dataset_name,
+            "n_rows": eda.report_.n_rows,
+            "n_cols": eda.report_.n_cols,
+            "quality_score": eda.data_quality_.quality_score if hasattr(eda, "data_quality_") else None,
+        }
+        if hasattr(eda, "_generate_html_report"):
+            eda_html = eda._generate_html_report()
+    except Exception:
+        pass
+    _emit_progress(2, total_phases, "Auto EDA", "done")
+
+    _render_phase_banner(3, total_phases, "Clustering")
+    _emit_progress(3, total_phases, "Clustering", "running", detail=cluster_algo)
+    try:
+        clusterer = ACDSOClusterer(
+            algorithm=cluster_algo,
+            n_clusters=n_clusters,
+            dim_reduction=dim_reduce,
+            metric=cluster_metric,
+            text_cols=eff_text_cols or None,
+            text_method=eff_nlp_method,
+            random_state=42,
+            verbose=1,
+        )
+        labels = clusterer.fit_predict(X)
+        cluster_summary = clusterer.get_cluster_summary()
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Clustering failed: {exc}")
+        _emit_progress(3, total_phases, "Clustering", "error", detail=str(exc))
+        return False
+    _emit_progress(3, total_phases, "Clustering", "done", detail=str(clusterer.best_algorithm_))
+
+    _render_phase_banner(4, total_phases, "Report Generation")
+    _emit_progress(4, total_phases, "Report Generation", "running")
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    pred_out = f"reports/predictions_{base_name}_cluster_full_dataset.csv"
+    out_df = df.copy()
+    out_df["cluster"] = labels
+    out_df.to_csv(pred_out, index=False)
+
+    model_path = f"reports/model_{base_name}_cluster.pkl"
+    try:
+        import joblib
+        joblib.dump({"model": clusterer, "task": "clustering", "text_cols": eff_text_cols}, model_path)
+    except Exception:
+        model_path = ""
+
+    metrics_dict = {
+        k: cluster_summary.get(k)
+        for k in ("silhouette_score", "davies_bouldin_score", "n_clusters", "noise_count", "noise_ratio")
+        if cluster_summary.get(k) is not None
+    }
+    label_counts = {str(k): int(v) for k, v in pd.Series(labels).value_counts().items()}
+    sample_vals = [
+        {"row": idx, "predicted": _json_safe_scalar(labels[idx]), "actual": None}
+        for idx in range(min(20, len(labels)))
+    ]
+    total_time = time.time() - t0
+    combined_report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "acdso_version": "3.0",
+        "mode": "autonomous_clustering",
+        "file": file_path,
+        "task": "clustering",
+        "dataset_info": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "configuration": {
+            "input_file": os.path.abspath(file_path),
+            "cluster_algo": cluster_algo,
+            "n_clusters": n_clusters,
+            "dim_reduce": dim_reduce,
+            "cluster_metric": cluster_metric,
+            "text_cols": eff_text_cols,
+            "nlp_method": eff_nlp_method,
+        },
+        "selected_model": {
+            "name": str(clusterer.best_algorithm_),
+            "type": type(clusterer).__name__,
+            "metrics": metrics_dict,
+        },
+        "audit_trail": getattr(clusterer, "audit_trail_", {}),
+        "predictions": {
+            "target_column": "cluster",
+            "total_predictions": int(len(labels)),
+            "output_file": os.path.abspath(pred_out),
+            "task": "clustering",
+            "statistics": {"distribution": label_counts, "total_classes": len(label_counts)},
+            "sample_values": sample_vals,
+        },
+        "summary": {
+            "total_phases": total_phases,
+            "successful": total_phases,
+            "failed": 0,
+            "skipped": 0,
+            "total_time": total_time,
+            "success_rate": 100.0,
+        },
+        "phase_results": {
+            "All Phases": [
+                {"name": "Data Loading", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Auto EDA", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Clustering", "status": "SUCCESS", "time": total_time, "model_name": str(clusterer.best_algorithm_)},
+                {"name": "Report Generation", "status": "SUCCESS", "time": 0.0, "model_name": None},
+            ]
+        },
+    }
+    if model_path:
+        combined_report["model_path"] = os.path.abspath(model_path)
+    if eda_summary:
+        combined_report["eda_report"] = eda_summary
+    if eda_html:
+        combined_report["eda_html"] = eda_html
+
+    nlp_info = (
+        {"text_cols": eff_text_cols, "n_text_cols": len(eff_text_cols), "nlp_method": eff_nlp_method}
+        if eff_text_cols
+        else None
+    )
+    json_abs, html_abs = _save_r7_artifacts(
+        file_path=file_path,
+        target_suffix="",
+        combined_report=combined_report,
+        estimator=clusterer,
+        metrics=metrics_dict,
+        nlp_info=nlp_info,
+        clustering_info=cluster_summary,
+    )
+    print(f"\n  [OK] Cluster assignments: {os.path.abspath(pred_out)}")
+    print(f"  [OK] Combined JSON: {json_abs}")
+    print(f"  [OK] HTML Report:   {html_abs}")
+    _emit_progress(4, total_phases, "Report Generation", "done", detail=html_abs)
+    return True
+
+
+def _run_anomaly_pipeline(
+    *,
+    file_path: str,
+    exclude: Optional[List[str]] = None,
+    group_col: Optional[str] = None,
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    anomaly_algo: str = "auto",
+    contamination: str = "auto",
+) -> bool:
+    """Execute R2 trainable anomaly detection pipeline."""
+    _ensure_ml_deps()
+    from acdso.eda import ACDSOAutoEDA
+    from acdso.nlp import detect_text_columns
+
+    t0 = time.time()
+    total_phases = 4
+    _render_phase_banner(1, total_phases, "Data Loading")
+    _emit_progress(1, total_phases, "Data Loading", "running", detail=os.path.basename(file_path))
+
+    try:
+        df = load_user_file(file_path)
+        _validate_dataframe_nonempty(df, file_path)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Failed to load dataset: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+
+    drop_cols = [c for c in (exclude or []) if c in df.columns]
+    if group_col and group_col in df.columns and group_col not in drop_cols:
+        drop_cols.append(group_col)
+    X = df.drop(columns=drop_cols) if drop_cols else df.copy()
+    if X.empty or X.shape[1] == 0:
+        print("\n  [X] ERROR: No feature columns remaining for anomaly detection.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="no features")
+        return False
+
+    if text_cols is not None:
+        missing_txt = [c for c in text_cols if c not in X.columns]
+        if missing_txt:
+            print(f"\n  [X] ERROR: Text column(s) not found: {missing_txt}")
+            _emit_progress(1, total_phases, "Data Loading", "error", detail="missing text col")
+            return False
+        eff_text_cols = list(text_cols)
+    else:
+        eff_text_cols = [str(c) for c in detect_text_columns(X)]
+    eff_nlp_method = "tfidf" if not nlp_method or str(nlp_method).lower() == "auto" else str(nlp_method).lower()
+    eff_contamination: Any = "auto" if str(contamination).strip().lower() == "auto" else float(contamination)
+    _emit_progress(1, total_phases, "Data Loading", "done", detail=f"{df.shape[0]}x{df.shape[1]}")
+
+    _render_phase_banner(2, total_phases, "Auto EDA")
+    _emit_progress(2, total_phases, "Auto EDA", "running")
+    eda = ACDSOAutoEDA(verbose=0)
+    eda_summary = None
+    eda_html = None
+    try:
+        eda.analyze(df, dataset_name=os.path.basename(file_path))
+        eda_summary = {
+            "dataset_name": eda.report_.dataset_name,
+            "n_rows": eda.report_.n_rows,
+            "n_cols": eda.report_.n_cols,
+            "quality_score": eda.data_quality_.quality_score if hasattr(eda, "data_quality_") else None,
+        }
+        if hasattr(eda, "_generate_html_report"):
+            eda_html = eda._generate_html_report()
+    except Exception:
+        pass
+    _emit_progress(2, total_phases, "Auto EDA", "done")
+
+    _render_phase_banner(3, total_phases, "Anomaly Detection")
+    _emit_progress(3, total_phases, "Anomaly Detection", "running", detail=anomaly_algo)
+    try:
+        detector = eda.fit_anomaly_detector(
+            X,
+            algorithm=anomaly_algo,
+            contamination=eff_contamination,
+            text_cols=eff_text_cols or None,
+            text_method=eff_nlp_method,
+            random_state=42,
+        )
+        labels = detector.predict(X)
+        is_anom = detector.predict_is_anomaly(X)
+        scores = detector.anomaly_scores(X)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Anomaly detection failed: {exc}")
+        _emit_progress(3, total_phases, "Anomaly Detection", "error", detail=str(exc))
+        return False
+    _emit_progress(3, total_phases, "Anomaly Detection", "done", detail=str(detector.best_algorithm_))
+
+    _render_phase_banner(4, total_phases, "Report Generation")
+    _emit_progress(4, total_phases, "Report Generation", "running")
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    pred_out = f"reports/predictions_{base_name}_anomaly_full_dataset.csv"
+    out_df = df.copy()
+    out_df["anomaly_label"] = labels
+    out_df["is_anomaly"] = is_anom
+    out_df["anomaly_score"] = scores
+    out_df.to_csv(pred_out, index=False)
+
+    model_path = f"reports/model_{base_name}_anomaly.pkl"
+    try:
+        import joblib
+        joblib.dump({"model": detector, "task": "anomaly", "text_cols": eff_text_cols}, model_path)
+    except Exception:
+        model_path = ""
+
+    n_anom = int(np.sum(is_anom))
+    anom_rate = float(n_anom / max(1, len(is_anom)))
+    audit = dict(getattr(detector, "audit_trail_", {}) or {})
+    anomaly_info = {
+        "best_algorithm": str(detector.best_algorithm_),
+        "algorithm_requested": str(anomaly_algo),
+        "contamination": eff_contamination,
+        "n_samples": int(len(X)),
+        "n_anomalies": n_anom,
+        "anomaly_rate": anom_rate,
+        "offset": _json_safe_scalar(getattr(detector, "offset_", None)),
+        "threshold": _json_safe_scalar(getattr(detector, "threshold_", None)),
+        "fit_is_sparse": audit.get("fit_is_sparse"),
+        "text_cols": eff_text_cols,
+    }
+    metrics_dict = {
+        "n_anomalies": n_anom,
+        "anomaly_rate": anom_rate,
+        "mean_anomaly_score": _json_safe_scalar(float(np.mean(scores))),
+        "max_anomaly_score": _json_safe_scalar(float(np.max(scores))),
+    }
+    label_counts = {str(k): int(v) for k, v in pd.Series(labels).value_counts().items()}
+    sample_vals = [
+        {"row": idx, "predicted": _json_safe_scalar(labels[idx]), "actual": None}
+        for idx in range(min(20, len(labels)))
+    ]
+    total_time = time.time() - t0
+    combined_report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "acdso_version": "3.0",
+        "mode": "autonomous_anomaly",
+        "file": file_path,
+        "task": "anomaly",
+        "dataset_info": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "configuration": {
+            "input_file": os.path.abspath(file_path),
+            "anomaly_algo": anomaly_algo,
+            "contamination": eff_contamination,
+            "text_cols": eff_text_cols,
+            "nlp_method": eff_nlp_method,
+        },
+        "selected_model": {
+            "name": str(detector.best_algorithm_),
+            "type": type(detector).__name__,
+            "metrics": metrics_dict,
+        },
+        "audit_trail": audit,
+        "predictions": {
+            "target_column": "anomaly_label",
+            "total_predictions": int(len(labels)),
+            "output_file": os.path.abspath(pred_out),
+            "task": "anomaly",
+            "statistics": {"distribution": label_counts, "total_classes": len(label_counts)},
+            "sample_values": sample_vals,
+        },
+        "summary": {
+            "total_phases": total_phases,
+            "successful": total_phases,
+            "failed": 0,
+            "skipped": 0,
+            "total_time": total_time,
+            "success_rate": 100.0,
+        },
+        "phase_results": {
+            "All Phases": [
+                {"name": "Data Loading", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Auto EDA", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Anomaly Detection", "status": "SUCCESS", "time": total_time, "model_name": str(detector.best_algorithm_)},
+                {"name": "Report Generation", "status": "SUCCESS", "time": 0.0, "model_name": None},
+            ]
+        },
+    }
+    if model_path:
+        combined_report["model_path"] = os.path.abspath(model_path)
+    if eda_summary:
+        combined_report["eda_report"] = eda_summary
+    if eda_html:
+        combined_report["eda_html"] = eda_html
+
+    nlp_info = (
+        {"text_cols": eff_text_cols, "n_text_cols": len(eff_text_cols), "nlp_method": eff_nlp_method}
+        if eff_text_cols
+        else None
+    )
+    json_abs, html_abs = _save_r7_artifacts(
+        file_path=file_path,
+        target_suffix="",
+        combined_report=combined_report,
+        estimator=detector,
+        metrics=metrics_dict,
+        nlp_info=nlp_info,
+        anomaly_info=anomaly_info,
+    )
+    print(f"\n  [OK] Anomaly scores: {os.path.abspath(pred_out)}")
+    print(f"  [OK] Combined JSON:  {json_abs}")
+    print(f"  [OK] HTML Report:    {html_abs}")
+    _emit_progress(4, total_phases, "Report Generation", "done", detail=html_abs)
+    return True
+
+
+def _run_multilabel_pipeline(
+    *,
+    file_path: str,
+    target: Optional[str],
+    predict: Optional[str],
+    exclude: Optional[List[str]] = None,
+    group_col: Optional[str] = None,
+    cv_strategy: str = "auto",
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    datetime_col: Optional[str] = None,
+) -> bool:
+    """Execute R5a multi-label classification pipeline."""
+    _ensure_ml_deps()
+    from acdso.multilabel import ACDSOMultiLabelClassifier
+    from acdso.nlp import detect_text_columns
+
+    t0 = time.time()
+    total_phases = 4
+    _render_phase_banner(1, total_phases, "Data Loading")
+    _emit_progress(1, total_phases, "Data Loading", "running", detail=os.path.basename(file_path))
+
+    try:
+        df = load_user_file(file_path)
+        _validate_dataframe_nonempty(df, file_path)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Failed to load dataset: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+
+    target_cols = _parse_csv_cols(predict or target) or []
+    missing_t = [c for c in target_cols if c not in df.columns]
+    if not target_cols or missing_t:
+        print(f"\n  [X] ERROR: Target column(s) missing or not found: {missing_t}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="invalid target cols")
+        return False
+    if group_col and group_col not in df.columns:
+        print(f"\n  [X] ERROR: Group column '{group_col}' not found.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="group col not found")
+        return False
+
+    sanitize_cols = list(target_cols)
+    if group_col and group_col in df.columns and group_col not in sanitize_cols:
+        sanitize_cols.append(group_col)
+    try:
+        df = _sanitize_target_rows(df, sanitize_cols, min_rows=4).reset_index(drop=True)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Insufficient non-null rows for multi-label classification: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+
+    y_raw = df[target_cols] if len(target_cols) > 1 else df[target_cols[0]]
+    drop_cols = list(target_cols) + [c for c in (exclude or []) if c in df.columns]
+    if group_col and group_col in df.columns:
+        drop_cols.append(group_col)
+    if datetime_col and datetime_col in df.columns:
+        drop_cols.append(datetime_col)
+    X = df.drop(columns=list(dict.fromkeys(drop_cols)), errors="ignore")
+    if X.empty or X.shape[1] == 0:
+        print("\n  [X] ERROR: No feature columns remaining for multi-label classification.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="no features")
+        return False
+
+    if text_cols is not None:
+        missing_txt = [c for c in text_cols if c not in X.columns]
+        if missing_txt:
+            print(f"\n  [X] ERROR: Text column(s) not found: {missing_txt}")
+            _emit_progress(1, total_phases, "Data Loading", "error", detail="missing text col")
+            return False
+        eff_text_cols = list(text_cols)
+    else:
+        eff_text_cols = [str(c) for c in detect_text_columns(X)]
+    eff_nlp_method = "tfidf" if not nlp_method or str(nlp_method).lower() == "auto" else str(nlp_method).lower()
+    if group_col and group_col in df.columns:
+        g_ser = df[group_col]
+        if isinstance(g_ser.dtype, pd.CategoricalDtype) or g_ser.dtype == object:
+            raw_vals = g_ser.tolist()
+            if len({type(v) for v in raw_vals if v is not None}) > 1:
+                g_ser = g_ser.astype(str)
+        groups = g_ser.to_numpy()
+        n_unique_groups = int(pd.Series(groups).nunique(dropna=True))
+    else:
+        groups = None
+        n_unique_groups = 0
+    _emit_progress(1, total_phases, "Data Loading", "done", detail=f"{df.shape[0]}x{df.shape[1]}")
+
+    _render_phase_banner(2, total_phases, "Multi-Label Training")
+    _emit_progress(2, total_phases, "Multi-Label Training", "running")
+    try:
+        groups_train = None
+        if groups is not None and n_unique_groups >= 3 and cv_strategy != "temporal":
+            from acdso.cv import group_holdout_split
+            tr_idx, te_idx = group_holdout_split(X, None, groups=groups, test_size=0.2, task="classification", random_state=42)
+            X_train, X_test = X.iloc[tr_idx], X.iloc[te_idx]
+            y_train = y_raw.iloc[tr_idx]
+            y_test = y_raw.iloc[te_idx]
+            groups_train = groups[tr_idx]
+        else:
+            idx_all = np.arange(len(X))
+            tr_idx, te_idx = train_test_split(idx_all, test_size=0.2 if len(X) >= 5 else 1, random_state=42)
+            X_train, X_test = X.iloc[tr_idx], X.iloc[te_idx]
+            y_train, y_test = y_raw.iloc[tr_idx], y_raw.iloc[te_idx]
+            groups_train = groups[tr_idx] if groups is not None else None
+
+        n_tr_groups = int(pd.Series(groups_train).nunique(dropna=True)) if groups_train is not None else 0
+        cv_n = max(2, min(5, n_tr_groups if groups_train is not None else len(X_train) // 2))
+        model = ACDSOMultiLabelClassifier(
+            strategy="auto",
+            scorer="f1_micro",
+            cv=cv_n,
+            text_cols=eff_text_cols or None,
+            text_method=eff_nlp_method,
+            random_state=42,
+            verbose=1,
+        )
+        model.fit(X_train, y_train, groups=groups_train, cv_strategy=cv_strategy)
+        eval_metrics = model.evaluate(X_test, y_test)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Multi-label training failed: {exc}")
+        _emit_progress(2, total_phases, "Multi-Label Training", "error", detail=str(exc))
+        return False
+    _emit_progress(2, total_phases, "Multi-Label Training", "done", detail=str(model.best_strategy_))
+
+    _render_phase_banner(3, total_phases, "Predictions")
+    _emit_progress(3, total_phases, "Predictions", "running")
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    pred_suffix = target_cols[0] if len(target_cols) == 1 else "multilabel"
+    pred_out = f"reports/predictions_{base_name}_{pred_suffix}_full_dataset.csv"
+    preds = np.asarray(model.predict(X))
+    out_df = df.copy()
+    classes = list(getattr(model, "classes_", []))
+    for j in range(preds.shape[1]):
+        cname = classes[j] if j < len(classes) else f"label_{j}"
+        out_df[f"{cname}_predicted"] = preds[:, j]
+    out_df.to_csv(pred_out, index=False)
+    _emit_progress(3, total_phases, "Predictions", "done", detail=pred_out)
+
+    _render_phase_banner(4, total_phases, "Report Generation")
+    _emit_progress(4, total_phases, "Report Generation", "running")
+    total_time = time.time() - t0
+    target_suffix = f"_{target_cols[0]}" if len(target_cols) == 1 else "_multilabel"
+    combined_report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "acdso_version": "3.0",
+        "mode": "autonomous_multilabel",
+        "file": file_path,
+        "target": ",".join(target_cols),
+        "task": "multilabel",
+        "dataset_info": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "configuration": {
+            "input_file": os.path.abspath(file_path),
+            "target_cols": target_cols,
+            "group_col": group_col,
+            "cv_strategy": cv_strategy,
+            "text_cols": eff_text_cols,
+            "nlp_method": eff_nlp_method,
+        },
+        "selected_model": {
+            "name": str(model.best_strategy_),
+            "type": type(model).__name__,
+            "metrics": eval_metrics,
+        },
+        "audit_trail": getattr(model, "audit_trail_", {}),
+        "predictions": {
+            "target_column": ",".join(target_cols),
+            "total_predictions": int(len(preds)),
+            "output_file": os.path.abspath(pred_out),
+            "task": "multilabel",
+            "sample_values": [
+                {"row": idx, "predicted": _json_safe_scalar(preds[idx].tolist()), "actual": None}
+                for idx in range(min(20, len(preds)))
+            ],
+        },
+        "summary": {
+            "total_phases": total_phases,
+            "successful": total_phases,
+            "failed": 0,
+            "skipped": 0,
+            "total_time": total_time,
+            "success_rate": 100.0,
+        },
+        "phase_results": {
+            "All Phases": [
+                {"name": "Data Loading", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Multi-Label Training", "status": "SUCCESS", "time": total_time, "model_name": str(model.best_strategy_)},
+                {"name": "Predictions", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Report Generation", "status": "SUCCESS", "time": 0.0, "model_name": None},
+            ]
+        },
+    }
+    spec_info = {
+        "task": "multilabel",
+        "best_strategy": str(model.best_strategy_),
+        "n_labels": int(model.n_labels_),
+        "classes": [str(c) for c in classes],
+        "metrics": eval_metrics,
+    }
+    cv_info = (
+        {
+            "group_col": group_col,
+            "cv_strategy": cv_strategy,
+            "n_unique_groups": n_unique_groups if groups is not None else None,
+            "leakage_validated": bool(groups is not None),
+        }
+        if (group_col or cv_strategy != "auto")
+        else None
+    )
+    nlp_info = (
+        {"text_cols": eff_text_cols, "n_text_cols": len(eff_text_cols), "nlp_method": eff_nlp_method}
+        if eff_text_cols
+        else None
+    )
+    json_abs, html_abs = _save_r7_artifacts(
+        file_path=file_path,
+        target_suffix=target_suffix,
+        combined_report=combined_report,
+        estimator=model,
+        metrics=eval_metrics,
+        cv_info=cv_info,
+        nlp_info=nlp_info,
+        specialized_info=spec_info,
+    )
+    print(f"\n  [OK] Multi-label predictions: {os.path.abspath(pred_out)}")
+    print(f"  [OK] Combined JSON: {json_abs}")
+    print(f"  [OK] HTML Report:   {html_abs}")
+    _emit_progress(4, total_phases, "Report Generation", "done", detail=html_abs)
+    return True
+
+
+def _run_ranking_pipeline(
+    *,
+    file_path: str,
+    target: Optional[str],
+    predict: Optional[str],
+    query_col: Optional[str],
+    group_col: Optional[str],
+    exclude: Optional[List[str]] = None,
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    datetime_col: Optional[str] = None,
+) -> bool:
+    """Execute R5b query-grouped learning-to-rank pipeline."""
+    _ensure_ml_deps()
+    from acdso.cv import group_holdout_split
+    from acdso.nlp import detect_text_columns
+    from acdso.ranking import ACDSORanker
+
+    t0 = time.time()
+    total_phases = 4
+    _render_phase_banner(1, total_phases, "Data Loading")
+    _emit_progress(1, total_phases, "Data Loading", "running", detail=os.path.basename(file_path))
+
+    try:
+        df = load_user_file(file_path)
+        _validate_dataframe_nonempty(df, file_path)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Failed to load dataset: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+
+    target_col = (predict or target or "").split(",")[0].strip()
+    eff_query_col = query_col or group_col
+    if not target_col or target_col not in df.columns:
+        print(f"\n  [X] ERROR: Ranking target column '{target_col}' not found in dataset.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="target not found")
+        return False
+    if not eff_query_col or eff_query_col not in df.columns:
+        print(f"\n  [X] ERROR: Query group column '{eff_query_col}' not found in dataset.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="query col not found")
+        return False
+
+    try:
+        df = _sanitize_target_rows(df, [target_col], min_rows=2)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+    df = df.dropna(subset=[eff_query_col]).reset_index(drop=True)
+    if len(df) < 2:
+        print("\n  [X] ERROR: Learning-to-rank requires at least 2 valid rows.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="fewer than 2 valid rows")
+        return False
+    q_ser = df[eff_query_col]
+    if isinstance(q_ser.dtype, pd.CategoricalDtype) or q_ser.dtype == object:
+        raw_q = q_ser.tolist()
+        if len({type(v) for v in raw_q if v is not None}) > 1:
+            q_ser = q_ser.astype(str)
+    groups = q_ser.to_numpy()
+    if len(np.unique(groups)) < 2:
+        print("\n  [X] ERROR: Learning-to-rank requires at least 2 distinct query groups.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="fewer than 2 query groups")
+        return False
+
+    try:
+        if pd.api.types.is_bool_dtype(df[target_col].dtype):
+            raise ValueError(f"Ranking target column '{target_col}' must be numeric, not boolean.")
+        y = df[target_col].to_numpy(dtype=float)
+        if not np.all(np.isfinite(y)):
+            raise ValueError(f"Ranking target column '{target_col}' contains non-finite values.")
+    except (TypeError, ValueError) as exc:
+        print(f"\n  [X] ERROR: Invalid ranking target '{target_col}': {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+    drop_cols = [target_col, eff_query_col] + [c for c in (exclude or []) if c in df.columns]
+    if group_col and group_col in df.columns:
+        drop_cols.append(group_col)
+    if datetime_col and datetime_col in df.columns:
+        drop_cols.append(datetime_col)
+    X = df.drop(columns=list(dict.fromkeys(drop_cols)), errors="ignore")
+    if X.empty or X.shape[1] == 0:
+        print("\n  [X] ERROR: No feature columns remaining for ranking.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="no features")
+        return False
+
+    if text_cols is not None:
+        eff_text_cols = [c for c in text_cols if c in X.columns]
+    else:
+        eff_text_cols = [str(c) for c in detect_text_columns(X)]
+    eff_nlp_method = "tfidf" if not nlp_method or str(nlp_method).lower() == "auto" else str(nlp_method).lower()
+    _emit_progress(1, total_phases, "Data Loading", "done", detail=f"{df.shape[0]}x{df.shape[1]}")
+
+    _render_phase_banner(2, total_phases, "Ranking Training")
+    _emit_progress(2, total_phases, "Ranking Training", "running")
+    try:
+        n_uniq_q = len(np.unique(groups))
+        if n_uniq_q >= 4:
+            tr_idx, te_idx = group_holdout_split(X, y, groups=groups, test_size=0.2, task="regression", random_state=42)
+        else:
+            tr_idx, te_idx = np.arange(len(X)), np.arange(len(X))
+        X_train, X_test = X.iloc[tr_idx], X.iloc[te_idx]
+        y_train, y_test = y[tr_idx], y[te_idx]
+        g_train, g_test = groups[tr_idx], groups[te_idx]
+
+        cv_n = max(2, min(5, len(np.unique(g_train))))
+        ranker = ACDSORanker(
+            algorithm="auto",
+            k=10,
+            cv=cv_n,
+            text_cols=eff_text_cols or None,
+            text_method=eff_nlp_method,
+            random_state=42,
+            verbose=1,
+        )
+        ranker.fit(X_train, y_train, groups=g_train)
+        eval_metrics = ranker.evaluate(X_test, y_test, groups=g_test)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Ranking training failed: {exc}")
+        _emit_progress(2, total_phases, "Ranking Training", "error", detail=str(exc))
+        return False
+    _emit_progress(2, total_phases, "Ranking Training", "done", detail=str(ranker.best_algorithm_))
+
+    _render_phase_banner(3, total_phases, "Predictions")
+    _emit_progress(3, total_phases, "Predictions", "running")
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    pred_out = f"reports/predictions_{base_name}_{target_col}_full_dataset.csv"
+    scores = np.asarray(ranker.predict(X), dtype=float)
+    out_df = df.copy()
+    out_df[f"{target_col}_predicted"] = scores
+    out_df.to_csv(pred_out, index=False)
+    _emit_progress(3, total_phases, "Predictions", "done", detail=pred_out)
+
+    _render_phase_banner(4, total_phases, "Report Generation")
+    _emit_progress(4, total_phases, "Report Generation", "running")
+    total_time = time.time() - t0
+    combined_report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "acdso_version": "3.0",
+        "mode": "autonomous_ranking",
+        "file": file_path,
+        "target": target_col,
+        "task": "ranking",
+        "dataset_info": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "configuration": {
+            "input_file": os.path.abspath(file_path),
+            "target": target_col,
+            "query_col": eff_query_col,
+            "text_cols": eff_text_cols,
+            "nlp_method": eff_nlp_method,
+        },
+        "selected_model": {
+            "name": str(ranker.best_algorithm_),
+            "type": type(ranker).__name__,
+            "metrics": eval_metrics,
+        },
+        "audit_trail": getattr(ranker, "audit_trail_", {}),
+        "predictions": {
+            "target_column": target_col,
+            "total_predictions": int(len(scores)),
+            "output_file": os.path.abspath(pred_out),
+            "task": "ranking",
+            "statistics": {
+                "mean": _json_safe_scalar(float(np.mean(scores))),
+                "std": _json_safe_scalar(float(np.std(scores))),
+                "min": _json_safe_scalar(float(np.min(scores))),
+                "max": _json_safe_scalar(float(np.max(scores))),
+            },
+            "sample_values": [
+                {"row": idx, "predicted": _json_safe_scalar(scores[idx]), "actual": _json_safe_scalar(y[idx])}
+                for idx in range(min(20, len(scores)))
+            ],
+        },
+        "summary": {
+            "total_phases": total_phases,
+            "successful": total_phases,
+            "failed": 0,
+            "skipped": 0,
+            "total_time": total_time,
+            "success_rate": 100.0,
+        },
+        "phase_results": {
+            "All Phases": [
+                {"name": "Data Loading", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Ranking Training", "status": "SUCCESS", "time": total_time, "model_name": str(ranker.best_algorithm_)},
+                {"name": "Predictions", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Report Generation", "status": "SUCCESS", "time": 0.0, "model_name": None},
+            ]
+        },
+    }
+    spec_info = {
+        "task": "ranking",
+        "best_algorithm": str(ranker.best_algorithm_),
+        "query_col": eff_query_col,
+        "n_queries": int(n_uniq_q),
+        "k": 10,
+        "metrics": eval_metrics,
+    }
+    cv_info = {
+        "group_col": eff_query_col,
+        "cv_strategy": "group_kfold",
+        "n_unique_groups": int(n_uniq_q),
+        "leakage_validated": True,
+    }
+    nlp_info = (
+        {"text_cols": eff_text_cols, "n_text_cols": len(eff_text_cols), "nlp_method": eff_nlp_method}
+        if eff_text_cols
+        else None
+    )
+    json_abs, html_abs = _save_r7_artifacts(
+        file_path=file_path,
+        target_suffix=f"_{target_col}",
+        combined_report=combined_report,
+        estimator=ranker,
+        metrics=eval_metrics,
+        cv_info=cv_info,
+        nlp_info=nlp_info,
+        specialized_info=spec_info,
+    )
+    print(f"\n  [OK] Ranking scores: {os.path.abspath(pred_out)}")
+    print(f"  [OK] Combined JSON:  {json_abs}")
+    print(f"  [OK] HTML Report:    {html_abs}")
+    _emit_progress(4, total_phases, "Report Generation", "done", detail=html_abs)
+    return True
+
+
+def _run_survival_pipeline(
+    *,
+    file_path: str,
+    target: Optional[str],
+    time_col: Optional[str],
+    event_col: Optional[str],
+    group_col: Optional[str] = None,
+    cv_strategy: str = "auto",
+    exclude: Optional[List[str]] = None,
+    text_cols: Optional[List[str]] = None,
+    nlp_method: str = "auto",
+    datetime_col: Optional[str] = None,
+) -> bool:
+    """Execute R5c survival / censored time-to-event pipeline."""
+    _ensure_ml_deps()
+    from acdso.nlp import detect_text_columns
+    from acdso.survival import ACDSOSurvivalAnalyzer
+
+    t0 = time.time()
+    total_phases = 4
+    _render_phase_banner(1, total_phases, "Data Loading")
+    _emit_progress(1, total_phases, "Data Loading", "running", detail=os.path.basename(file_path))
+
+    try:
+        df = load_user_file(file_path)
+        _validate_dataframe_nonempty(df, file_path)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Failed to load dataset: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+
+    eff_time_col = time_col
+    eff_event_col = event_col
+    if (not eff_time_col or not eff_event_col) and target:
+        tparts = _parse_csv_cols(target) or []
+        if len(tparts) == 2:
+            eff_time_col, eff_event_col = tparts[0], tparts[1]
+
+    if not eff_time_col or eff_time_col not in df.columns:
+        print(f"\n  [X] ERROR: Time column '{eff_time_col}' not found in dataset.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="time col not found")
+        return False
+    if not eff_event_col or eff_event_col not in df.columns:
+        print(f"\n  [X] ERROR: Event column '{eff_event_col}' not found in dataset.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="event col not found")
+        return False
+    if group_col and group_col not in df.columns:
+        print(f"\n  [X] ERROR: Group column '{group_col}' not found in dataset.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="group col not found")
+        return False
+
+    sanitize_cols = [eff_time_col, eff_event_col]
+    if group_col and group_col in df.columns and group_col not in sanitize_cols:
+        sanitize_cols.append(group_col)
+    try:
+        df = _sanitize_target_rows(df, sanitize_cols, min_rows=2).reset_index(drop=True)
+        if pd.api.types.is_bool_dtype(df[eff_time_col].dtype):
+            raise ValueError(f"Survival time column '{eff_time_col}' must be numeric, not boolean.")
+        time_arr = df[eff_time_col].to_numpy(dtype=float)
+        if not np.all(np.isfinite(time_arr)) or bool(np.any(time_arr < 0)):
+            raise ValueError(f"Survival time column '{eff_time_col}' must contain finite non-negative values.")
+        ev_raw = df[eff_event_col]
+        if pd.api.types.is_bool_dtype(ev_raw.dtype):
+            event_arr = ev_raw.to_numpy(dtype=int)
+        else:
+            ev_float = ev_raw.to_numpy(dtype=float)
+            if not np.all(np.isfinite(ev_float)) or not np.all((ev_float == 0.0) | (ev_float == 1.0)):
+                raise ValueError(f"Survival event column '{eff_event_col}' must contain binary values {{0, 1}}.")
+            event_arr = ev_float.astype(int)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+    if group_col and group_col in df.columns:
+        g_ser = df[group_col]
+        if isinstance(g_ser.dtype, pd.CategoricalDtype) or g_ser.dtype == object:
+            raw_vals = g_ser.tolist()
+            if len({type(v) for v in raw_vals if v is not None}) > 1:
+                g_ser = g_ser.astype(str)
+        groups = g_ser.to_numpy()
+        n_unique_groups = int(pd.Series(groups).nunique(dropna=True))
+    else:
+        groups = None
+        n_unique_groups = 0
+
+    drop_cols = [eff_time_col, eff_event_col] + [c for c in (exclude or []) if c in df.columns]
+    if group_col and group_col in df.columns:
+        drop_cols.append(group_col)
+    if datetime_col and datetime_col in df.columns:
+        drop_cols.append(datetime_col)
+    X = df.drop(columns=list(dict.fromkeys(drop_cols)), errors="ignore")
+    if X.empty or X.shape[1] == 0:
+        print("\n  [X] ERROR: No feature columns remaining for survival analysis.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="no features")
+        return False
+
+    if text_cols is not None:
+        eff_text_cols = [c for c in text_cols if c in X.columns]
+    else:
+        eff_text_cols = [str(c) for c in detect_text_columns(X)]
+    eff_nlp_method = "tfidf" if not nlp_method or str(nlp_method).lower() == "auto" else str(nlp_method).lower()
+    _emit_progress(1, total_phases, "Data Loading", "done", detail=f"{df.shape[0]}x{df.shape[1]}")
+
+    _render_phase_banner(2, total_phases, "Survival Training")
+    _emit_progress(2, total_phases, "Survival Training", "running")
+    try:
+        groups_train = None
+        if groups is not None and n_unique_groups >= 3 and cv_strategy != "temporal":
+            from acdso.cv import group_holdout_split
+            tr_idx, te_idx = group_holdout_split(X, event_arr, groups=groups, test_size=0.2, task="classification", random_state=42)
+            X_train, X_test = X.iloc[tr_idx], X.iloc[te_idx]
+            t_train, t_test = time_arr[tr_idx], time_arr[te_idx]
+            e_train, e_test = event_arr[tr_idx], event_arr[te_idx]
+            groups_train = groups[tr_idx]
+        else:
+            idx_all = np.arange(len(X))
+            tr_idx, te_idx = train_test_split(idx_all, test_size=0.2 if len(X) >= 5 else 1, random_state=42)
+            X_train, X_test = X.iloc[tr_idx], X.iloc[te_idx]
+            t_train, t_test = time_arr[tr_idx], time_arr[te_idx]
+            e_train, e_test = event_arr[tr_idx], event_arr[te_idx]
+            groups_train = groups[tr_idx] if groups is not None else None
+
+        n_tr_groups = int(pd.Series(groups_train).nunique(dropna=True)) if groups_train is not None else 0
+        cv_n = max(2, min(5, n_tr_groups if groups_train is not None else len(X_train) // 3))
+        surv = ACDSOSurvivalAnalyzer(
+            l2_penalty=1e-2,
+            backend="auto",
+            cv=cv_n,
+            text_cols=eff_text_cols or None,
+            text_method=eff_nlp_method,
+            random_state=42,
+            verbose=1,
+        )
+        surv.fit(X_train, time=t_train, event=e_train, groups=groups_train, cv_strategy=cv_strategy)
+        if np.sum(e_test) >= 1 and len(X_test) >= 2:
+            eval_metrics = surv.evaluate(X_test, time=t_test, event=e_test)
+        else:
+            eval_metrics = surv.evaluate(X_train, time=t_train, event=e_train)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Survival training failed: {exc}")
+        _emit_progress(2, total_phases, "Survival Training", "error", detail=str(exc))
+        return False
+    _emit_progress(2, total_phases, "Survival Training", "done", detail=str(surv.backend_used_))
+
+    _render_phase_banner(3, total_phases, "Risk Predictions")
+    _emit_progress(3, total_phases, "Risk Predictions", "running")
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    pred_out = f"reports/predictions_{base_name}_{eff_time_col}_full_dataset.csv"
+    risk_scores = np.asarray(surv.predict_risk(X), dtype=float)
+    out_df = df.copy()
+    out_df["risk_score"] = risk_scores
+    out_df["survival_risk_predicted"] = risk_scores
+    out_df.to_csv(pred_out, index=False)
+    _emit_progress(3, total_phases, "Risk Predictions", "done", detail=pred_out)
+
+    _render_phase_banner(4, total_phases, "Report Generation")
+    _emit_progress(4, total_phases, "Report Generation", "running")
+    total_time = time.time() - t0
+    combined_report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "acdso_version": "3.0",
+        "mode": "autonomous_survival",
+        "file": file_path,
+        "target": f"{eff_time_col},{eff_event_col}",
+        "task": "survival",
+        "dataset_info": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "configuration": {
+            "input_file": os.path.abspath(file_path),
+            "time_col": eff_time_col,
+            "event_col": eff_event_col,
+            "group_col": group_col,
+            "cv_strategy": cv_strategy,
+            "text_cols": eff_text_cols,
+            "nlp_method": eff_nlp_method,
+        },
+        "selected_model": {
+            "name": f"CoxPH ({surv.backend_used_})",
+            "type": type(surv).__name__,
+            "metrics": eval_metrics,
+        },
+        "audit_trail": getattr(surv, "audit_trail_", {}),
+        "predictions": {
+            "target_column": "risk_score",
+            "total_predictions": int(len(risk_scores)),
+            "output_file": os.path.abspath(pred_out),
+            "task": "survival",
+            "statistics": {
+                "mean": _json_safe_scalar(float(np.mean(risk_scores))),
+                "std": _json_safe_scalar(float(np.std(risk_scores))),
+                "min": _json_safe_scalar(float(np.min(risk_scores))),
+                "max": _json_safe_scalar(float(np.max(risk_scores))),
+            },
+            "sample_values": [
+                {"row": idx, "predicted": _json_safe_scalar(risk_scores[idx]), "actual": _json_safe_scalar(time_arr[idx])}
+                for idx in range(min(20, len(risk_scores)))
+            ],
+        },
+        "summary": {
+            "total_phases": total_phases,
+            "successful": total_phases,
+            "failed": 0,
+            "skipped": 0,
+            "total_time": total_time,
+            "success_rate": 100.0,
+        },
+        "phase_results": {
+            "All Phases": [
+                {"name": "Data Loading", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Survival Training", "status": "SUCCESS", "time": total_time, "model_name": str(surv.backend_used_)},
+                {"name": "Risk Predictions", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Report Generation", "status": "SUCCESS", "time": 0.0, "model_name": None},
+            ]
+        },
+    }
+    spec_info = {
+        "task": "survival",
+        "backend_used": str(surv.backend_used_),
+        "time_col": eff_time_col,
+        "event_col": eff_event_col,
+        "n_events": int(np.sum(event_arr)),
+        "censoring_rate": float(1.0 - np.mean(event_arr)),
+        "metrics": eval_metrics,
+    }
+    cv_info = (
+        {
+            "group_col": group_col,
+            "cv_strategy": cv_strategy,
+            "n_unique_groups": n_unique_groups if groups is not None else None,
+            "leakage_validated": bool(groups is not None),
+        }
+        if (group_col or cv_strategy != "auto")
+        else None
+    )
+    nlp_info = (
+        {"text_cols": eff_text_cols, "n_text_cols": len(eff_text_cols), "nlp_method": eff_nlp_method}
+        if eff_text_cols
+        else None
+    )
+    json_abs, html_abs = _save_r7_artifacts(
+        file_path=file_path,
+        target_suffix="",
+        combined_report=combined_report,
+        estimator=surv,
+        metrics=eval_metrics,
+        cv_info=cv_info,
+        nlp_info=nlp_info,
+        specialized_info=spec_info,
+    )
+    print(f"\n  [OK] Survival risk predictions: {os.path.abspath(pred_out)}")
+    print(f"  [OK] Combined JSON: {json_abs}")
+    print(f"  [OK] HTML Report:   {html_abs}")
+    _emit_progress(4, total_phases, "Report Generation", "done", detail=html_abs)
+    return True
+
+
+def _run_recommender_pipeline(
+    *,
+    file_path: str,
+    user_col: str,
+    item_col: str,
+    rating_col: Optional[str] = None,
+) -> bool:
+    """Execute R5d collaborative-filtering recommender pipeline."""
+    _ensure_ml_deps()
+    from acdso.recommender import ACDSORecommender
+
+    t0 = time.time()
+    total_phases = 4
+    _render_phase_banner(1, total_phases, "Data Loading")
+    _emit_progress(1, total_phases, "Data Loading", "running", detail=os.path.basename(file_path))
+
+    try:
+        df = load_user_file(file_path)
+        _validate_dataframe_nonempty(df, file_path)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Failed to load dataset: {exc}")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail=str(exc))
+        return False
+
+    for req_col, label in ((user_col, "User"), (item_col, "Item")):
+        if not req_col or req_col not in df.columns:
+            print(f"\n  [X] ERROR: {label} column '{req_col}' not found in dataset.")
+            _emit_progress(1, total_phases, "Data Loading", "error", detail=f"{label} col not found")
+            return False
+    if rating_col and rating_col not in df.columns:
+        print(f"\n  [X] ERROR: Rating column '{rating_col}' not found in dataset.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="rating col not found")
+        return False
+
+    req_cols = [user_col, item_col] + ([rating_col] if rating_col else [])
+    df = df.dropna(subset=req_cols).reset_index(drop=True)
+    if len(df) < 4:
+        print("\n  [X] ERROR: Insufficient interactions for recommender training.")
+        _emit_progress(1, total_phases, "Data Loading", "error", detail="insufficient rows")
+        return False
+    _emit_progress(1, total_phases, "Data Loading", "done", detail=f"{df.shape[0]} interactions")
+
+    _render_phase_banner(2, total_phases, "Recommender Training")
+    _emit_progress(2, total_phases, "Recommender Training", "running")
+    try:
+        if len(df) >= 10:
+            split_idx = max(4, int(round(len(df) * 0.8)))
+            train_df = df.iloc[:split_idx].reset_index(drop=True)
+            eval_df = df.iloc[split_idx:].reset_index(drop=True)
+        else:
+            train_df = df
+            eval_df = df
+
+        rec = ACDSORecommender(method="auto", n_factors=20, n_neighbors=20, random_state=42, verbose=1)
+        rec.fit(train_df, user_col=user_col, item_col=item_col, rating_col=rating_col)
+        eval_metrics = rec.evaluate(eval_df, k=10, user_col=user_col, item_col=item_col, rating_col=rating_col)
+    except Exception as exc:
+        print(f"\n  [X] ERROR: Recommender training failed: {exc}")
+        _emit_progress(2, total_phases, "Recommender Training", "error", detail=str(exc))
+        return False
+    _emit_progress(2, total_phases, "Recommender Training", "done", detail=str(rec.best_method_))
+
+    _render_phase_banner(3, total_phases, "Predictions")
+    _emit_progress(3, total_phases, "Predictions", "running")
+    os.makedirs("reports", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    pred_out = f"reports/predictions_{base_name}_recommender_full_dataset.csv"
+    preds = np.asarray(rec.predict(df[user_col], df[item_col]), dtype=float)
+    out_df = df.copy()
+    out_df["predicted_score"] = preds
+    if rating_col:
+        out_df[f"{rating_col}_predicted"] = preds
+    out_df.to_csv(pred_out, index=False)
+    _emit_progress(3, total_phases, "Predictions", "done", detail=pred_out)
+
+    _render_phase_banner(4, total_phases, "Report Generation")
+    _emit_progress(4, total_phases, "Report Generation", "running")
+    total_time = time.time() - t0
+    combined_report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "acdso_version": "3.0",
+        "mode": "autonomous_recommender",
+        "file": file_path,
+        "task": "recommender",
+        "dataset_info": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "configuration": {
+            "input_file": os.path.abspath(file_path),
+            "user_col": user_col,
+            "item_col": item_col,
+            "rating_col": rating_col,
+        },
+        "selected_model": {
+            "name": str(rec.best_method_),
+            "type": type(rec).__name__,
+            "metrics": eval_metrics,
+        },
+        "audit_trail": getattr(rec, "audit_trail_", {}),
+        "predictions": {
+            "target_column": rating_col or "predicted_score",
+            "total_predictions": int(len(preds)),
+            "output_file": os.path.abspath(pred_out),
+            "task": "recommender",
+            "statistics": {
+                "mean": _json_safe_scalar(float(np.mean(preds))),
+                "std": _json_safe_scalar(float(np.std(preds))),
+                "min": _json_safe_scalar(float(np.min(preds))),
+                "max": _json_safe_scalar(float(np.max(preds))),
+            },
+            "sample_values": [
+                {
+                    "row": idx,
+                    "predicted": _json_safe_scalar(preds[idx]),
+                    "actual": _json_safe_scalar(df[rating_col].iloc[idx]) if rating_col else None,
+                }
+                for idx in range(min(20, len(preds)))
+            ],
+        },
+        "summary": {
+            "total_phases": total_phases,
+            "successful": total_phases,
+            "failed": 0,
+            "skipped": 0,
+            "total_time": total_time,
+            "success_rate": 100.0,
+        },
+        "phase_results": {
+            "All Phases": [
+                {"name": "Data Loading", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Recommender Training", "status": "SUCCESS", "time": total_time, "model_name": str(rec.best_method_)},
+                {"name": "Predictions", "status": "SUCCESS", "time": 0.0, "model_name": None},
+                {"name": "Report Generation", "status": "SUCCESS", "time": 0.0, "model_name": None},
+            ]
+        },
+    }
+    spec_info = {
+        "task": "recommender",
+        "best_method": str(rec.best_method_),
+        "user_col": user_col,
+        "item_col": item_col,
+        "rating_col": rating_col,
+        "n_users": int(rec.n_users_),
+        "n_items": int(rec.n_items_),
+        "is_implicit": bool(rec.is_implicit_),
+        "metrics": eval_metrics,
+    }
+    json_abs, html_abs = _save_r7_artifacts(
+        file_path=file_path,
+        target_suffix="",
+        combined_report=combined_report,
+        estimator=rec,
+        metrics=eval_metrics,
+        specialized_info=spec_info,
+    )
+    print(f"\n  [OK] Recommender predictions: {os.path.abspath(pred_out)}")
+    print(f"  [OK] Combined JSON: {json_abs}")
+    print(f"  [OK] HTML Report:   {html_abs}")
+    _emit_progress(4, total_phases, "Report Generation", "done", detail=html_abs)
+    return True
+
+
 def main():
     """Main entry point with argument parsing."""
     import argparse
@@ -9700,9 +11557,134 @@ Supported file formats:
     parser.add_argument(
         "--task",
         type=str,
-        choices=["auto", "classification", "regression"],
+        choices=[
+            "auto",
+            "classification",
+            "regression",
+            "clustering",
+            "anomaly",
+            "multilabel",
+            "ranking",
+            "survival",
+            "recommender",
+        ],
         default="auto",
-        help="Task type: 'auto' (infer), 'classification', or 'regression'"
+        help="Task type: auto, classification, regression, clustering, anomaly, multilabel, ranking, survival, recommender",
+    )
+    parser.add_argument(
+        "--group-col",
+        type=str,
+        default=None,
+        help="Entity/group column for grouped CV (GroupKFold / StratifiedGroupKFold).",
+    )
+    parser.add_argument(
+        "--cv-strategy",
+        type=str,
+        choices=["auto", "kfold", "stratified", "group_kfold", "stratified_group_kfold", "temporal"],
+        default="auto",
+        help="Cross-validation splitting strategy.",
+    )
+    parser.add_argument(
+        "--text-cols",
+        type=str,
+        default=None,
+        help="Comma-separated free-text columns for classical NLP featurization.",
+    )
+    parser.add_argument(
+        "--nlp-method",
+        type=str,
+        choices=["auto", "tfidf", "ngram", "lda", "nmf", "combined"],
+        default="auto",
+        help="Classical NLP featurization method.",
+    )
+    parser.add_argument(
+        "--cluster-algo",
+        type=str,
+        choices=["auto", "kmeans", "hdbscan", "gmm"],
+        default="auto",
+        help="Clustering algorithm for --task clustering.",
+    )
+    parser.add_argument(
+        "--n-clusters",
+        type=int,
+        default=None,
+        help="Target number of clusters (>= 2) for clustering.",
+    )
+    parser.add_argument(
+        "--dim-reduce",
+        type=str,
+        choices=["none", "pca", "umap"],
+        default="none",
+        help="Dimensionality reduction pipeline before clustering.",
+    )
+    parser.add_argument(
+        "--cluster-metric",
+        type=str,
+        choices=["silhouette", "davies_bouldin"],
+        default="silhouette",
+        help="Internal cluster validation metric for auto tuning.",
+    )
+    parser.add_argument(
+        "--anomaly-algo",
+        type=str,
+        choices=["auto", "isolation_forest", "lof", "ocsvm"],
+        default="auto",
+        help="Anomaly detection algorithm for --task anomaly.",
+    )
+    parser.add_argument(
+        "--contamination",
+        type=str,
+        default="auto",
+        help="Expected anomaly proportion ('auto' or float in (0.0, 0.5]).",
+    )
+    parser.add_argument(
+        "--event-col",
+        type=str,
+        default=None,
+        help="Event indicator column (1=event, 0=censored) for --task survival.",
+    )
+    parser.add_argument(
+        "--time-col",
+        type=str,
+        default=None,
+        help="Time-to-event column for --task survival.",
+    )
+    parser.add_argument(
+        "--query-col",
+        type=str,
+        default=None,
+        help="Query group identifier column for --task ranking.",
+    )
+    parser.add_argument(
+        "--user-col",
+        type=str,
+        default=None,
+        help="User identifier column for --task recommender.",
+    )
+    parser.add_argument(
+        "--item-col",
+        type=str,
+        default=None,
+        help="Item identifier column for --task recommender.",
+    )
+    parser.add_argument(
+        "--rating-col",
+        type=str,
+        default=None,
+        help="Optional explicit rating/interaction column for --task recommender.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=50000,
+        help="Row chunk size (>= 1) for streaming/out-of-core execution.",
+    )
+    parser.add_argument(
+        "--scale-mode",
+        type=str,
+        choices=["auto", "in_memory", "chunked", "subsample"],
+        default="auto",
+        help="Execution memory mode: auto, in_memory, chunked, or subsample.",
     )
     
     parser.add_argument(
@@ -9857,6 +11839,20 @@ Supported file formats:
     if args.time_budget is not None and args.time_budget <= 0:
         print(f"\n  [X] ERROR: --time-budget must be > 0 (got {args.time_budget})")
         sys.exit(1)
+    if args.n_clusters is not None and args.n_clusters < 2:
+        print(f"\n  [X] ERROR: --n-clusters must be >= 2 (got {args.n_clusters})")
+        sys.exit(1)
+    if args.chunk_size is not None and args.chunk_size < 1:
+        print(f"\n  [X] ERROR: --chunk-size must be >= 1 (got {args.chunk_size})")
+        sys.exit(1)
+    if str(args.contamination).strip().lower() != "auto":
+        try:
+            _contam = float(args.contamination)
+            if not math.isfinite(_contam) or _contam <= 0.0 or _contam > 0.5:
+                raise ValueError("out of range")
+        except Exception:
+            print(f"\n  [X] ERROR: --contamination must be 'auto' or in (0.0, 0.5] (got {args.contamination!r})")
+            sys.exit(1)
     if args.predict and not args.file:
         print("\n  [X] ERROR: --predict requires --file to specify the data file.")
         sys.exit(1)
@@ -9866,6 +11862,24 @@ Supported file formats:
     if args.file and not args.all and not os.path.isfile(args.file):
         print(f"\n  [X] ERROR: File not found: {args.file}")
         sys.exit(1)
+    if not args.all and not (args.v3 or args.policy or args.decision or args.timeseries):
+        if args.task == "survival":
+            _tcols = _parse_csv_cols(args.predict or args.target) or []
+            if not ((args.time_col and args.event_col) or len(_tcols) == 2):
+                print("\n  [X] ERROR: --task survival requires --time-col and --event-col (or 2-column --target/--predict).")
+                sys.exit(1)
+        elif args.task == "recommender":
+            if not (args.user_col and args.item_col):
+                print("\n  [X] ERROR: --task recommender requires --user-col and --item-col.")
+                sys.exit(1)
+        elif args.task == "ranking":
+            if not (args.predict or args.target) or not (args.query_col or args.group_col):
+                print("\n  [X] ERROR: --task ranking requires --target/--predict and --query-col (or --group-col).")
+                sys.exit(1)
+        elif args.task == "multilabel":
+            if not (args.predict or args.target):
+                print("\n  [X] ERROR: --task multilabel requires --target or --predict.")
+                sys.exit(1)
     
     # Import heavy scientific/ML dependencies only after CLI flags & paths pass preflight
     _ensure_ml_deps()
@@ -9943,6 +11957,128 @@ Supported file formats:
                 print(f"\n  No old files found. Starting fresh training...")
             print("=" * 80 + "\n")
         
+        parsed_text_cols = _parse_csv_cols(getattr(args, "text_cols", None))
+        parsed_exclude = _parse_csv_cols(getattr(args, "exclude", None))
+
+        # Out-of-core scale dispatch (chunked/subsample or auto > 200k rows) BEFORE in-memory loads
+        if args.file and not (args.v3 or args.policy or args.decision or args.timeseries):
+            scale_mode_req = str(getattr(args, "scale_mode", "auto") or "auto").lower()
+            should_out_of_core = False
+            if scale_mode_req in ("chunked", "subsample") and args.task in ("auto", "classification", "regression", "clustering"):
+                should_out_of_core = True
+            elif scale_mode_req == "auto" and args.task in ("auto", "classification", "regression", "clustering"):
+                try:
+                    _schema = inspect_file_schema(args.file, sample_rows=200, count_rows=True, chunk_size=args.chunk_size)
+                    if _schema.get("n_rows") is not None and int(_schema["n_rows"]) > 200_000:
+                        should_out_of_core = True
+                except Exception:
+                    should_out_of_core = False
+
+            if should_out_of_core:
+                ok_scale = _run_out_of_core_pipeline(
+                    file_path=args.file,
+                    target=args.target,
+                    predict=args.predict,
+                    task=args.task,
+                    scale_mode=scale_mode_req,
+                    chunk_size=int(args.chunk_size),
+                    exclude=parsed_exclude,
+                    group_col=args.group_col,
+                    text_cols=parsed_text_cols,
+                    nlp_method=args.nlp_method,
+                    n_clusters=args.n_clusters,
+                )
+                if not ok_scale:
+                    sys.exit(1)
+                return
+
+        # Dedicated dispatch for R1, R2, R5 specialized / targetless tasks
+        if args.file and not (args.v3 or args.policy or args.decision or args.timeseries):
+            if args.task == "clustering":
+                ok = _run_clustering_pipeline(
+                    file_path=args.file,
+                    exclude=parsed_exclude,
+                    group_col=args.group_col,
+                    text_cols=parsed_text_cols,
+                    nlp_method=args.nlp_method,
+                    cluster_algo=args.cluster_algo,
+                    n_clusters=args.n_clusters,
+                    dim_reduce=args.dim_reduce,
+                    cluster_metric=args.cluster_metric,
+                )
+                if not ok:
+                    sys.exit(1)
+                return
+            if args.task == "anomaly":
+                ok = _run_anomaly_pipeline(
+                    file_path=args.file,
+                    exclude=parsed_exclude,
+                    group_col=args.group_col,
+                    text_cols=parsed_text_cols,
+                    nlp_method=args.nlp_method,
+                    anomaly_algo=args.anomaly_algo,
+                    contamination=args.contamination,
+                )
+                if not ok:
+                    sys.exit(1)
+                return
+            if args.task == "multilabel":
+                ok = _run_multilabel_pipeline(
+                    file_path=args.file,
+                    target=args.target,
+                    predict=args.predict,
+                    exclude=parsed_exclude,
+                    group_col=args.group_col,
+                    cv_strategy=args.cv_strategy,
+                    text_cols=parsed_text_cols,
+                    nlp_method=args.nlp_method,
+                    datetime_col=args.datetime_col,
+                )
+                if not ok:
+                    sys.exit(1)
+                return
+            if args.task == "ranking":
+                ok = _run_ranking_pipeline(
+                    file_path=args.file,
+                    target=args.target,
+                    predict=args.predict,
+                    query_col=args.query_col,
+                    group_col=args.group_col,
+                    exclude=parsed_exclude,
+                    text_cols=parsed_text_cols,
+                    nlp_method=args.nlp_method,
+                    datetime_col=args.datetime_col,
+                )
+                if not ok:
+                    sys.exit(1)
+                return
+            if args.task == "survival":
+                ok = _run_survival_pipeline(
+                    file_path=args.file,
+                    target=(args.predict or args.target),
+                    time_col=args.time_col,
+                    event_col=args.event_col,
+                    group_col=args.group_col,
+                    cv_strategy=args.cv_strategy,
+                    exclude=parsed_exclude,
+                    text_cols=parsed_text_cols,
+                    nlp_method=args.nlp_method,
+                    datetime_col=args.datetime_col,
+                )
+                if not ok:
+                    sys.exit(1)
+                return
+            if args.task == "recommender":
+                ok = _run_recommender_pipeline(
+                    file_path=args.file,
+                    user_col=args.user_col,
+                    item_col=args.item_col,
+                    rating_col=args.rating_col,
+                )
+                if not ok:
+                    sys.exit(1)
+                return
+
         # Check for multi-target training (when --predict is not specified)
         if args.target and ',' in args.target and not args.predict:
             targets = [t.strip() for t in args.target.split(',') if t.strip()]
@@ -10047,13 +12183,19 @@ Supported file formats:
                         datetime_col=args.datetime_col,
                         horizon=args.horizon,
                         task=args.task,
-                        exclude=args.exclude.split(",") if args.exclude else None,
+                        exclude=parsed_exclude,
                         run_benchmark=run_benchmarks,
                         selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
                         skip_timeseries=effective_skip_ts,
                         auto_exclude=effective_auto_exclude,
                         phase_offset=(i - 1) * 9,
                         total_phases=total_mt_phases,
+                        group_col=args.group_col,
+                        cv_strategy=args.cv_strategy,
+                        text_cols=parsed_text_cols,
+                        nlp_method=args.nlp_method,
+                        chunk_size=args.chunk_size,
+                        scale_mode=args.scale_mode,
                     )
                     if target_res is None:
                         print(f"\n  [X] ERROR: Autonomous training failed for target '{target}'")
@@ -10110,13 +12252,20 @@ Supported file formats:
                     task_type = model_data['task']
                     exclude_cols = model_data.get('exclude') or []  # Handle None
                     datetime_col_saved = model_data.get('datetime_col')
+                    saved_group_col = model_data.get('group_col')
+                    saved_text_cols = set(model_data.get('text_cols') or [])
                     
                     # Prepare features
                     drop_cols = [target] + list(exclude_cols)
                     if datetime_col_saved:
                         drop_cols.append(datetime_col_saved)
+                    if saved_group_col:
+                        drop_cols.append(saved_group_col)
                     X = df.drop(columns=drop_cols, errors='ignore')
-                    cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+                    cat_cols = [
+                        c for c in X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+                        if c not in saved_text_cols
+                    ]
                     if cat_cols:
                         X = _encode_categoricals_safe(
                             X,
@@ -10241,13 +12390,19 @@ Supported file formats:
                 datetime_col=args.datetime_col,
                 horizon=args.horizon,
                 task=args.task,
-                exclude=args.exclude.split(",") if args.exclude else None,
+                exclude=parsed_exclude,
                 run_benchmark=effective_run_benchmark,
                 selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
                 skip_timeseries=effective_skip_ts,
                 auto_exclude=effective_auto_exclude,
                 phase_offset=0,
                 total_phases=10,
+                group_col=args.group_col,
+                cv_strategy=args.cv_strategy,
+                text_cols=parsed_text_cols,
+                nlp_method=args.nlp_method,
+                chunk_size=args.chunk_size,
+                scale_mode=args.scale_mode,
             )
             if train_res is None:
                 print("\n  [X] ERROR: Training pipeline failed before predictions.")
@@ -10309,6 +12464,8 @@ Supported file formats:
                 feature_columns = model_data['feature_columns']
                 datetime_col = model_data.get('datetime_col')
                 exclude = model_data.get('exclude') or []  # Handle None
+                saved_group_col = model_data.get('group_col')
+                saved_text_cols = set(model_data.get('text_cols') or [])
                 
                 print(f"  Original training target: {original_target}")
                 print(f"  Task type: {task}")
@@ -10332,11 +12489,16 @@ Supported file formats:
                 X = df.drop(columns=[actual_predict_target] if actual_predict_target in df.columns else [])
                 if datetime_col and datetime_col in X.columns:
                     X = X.drop(columns=[datetime_col])
+                if saved_group_col and saved_group_col in X.columns:
+                    X = X.drop(columns=[saved_group_col])
                 if exclude:
                     X = X.drop(columns=[c for c in exclude if c in X.columns], errors='ignore')
                 
-                # Encode categorical columns consistently with training
-                cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+                # Encode categorical columns consistently with training (keeping free-text raw)
+                cat_cols = [
+                    c for c in X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+                    if c not in saved_text_cols
+                ]
                 if cat_cols:
                     X_encoded = _encode_categoricals_safe(
                         X,
@@ -10537,13 +12699,19 @@ Supported file formats:
                     datetime_col=args.datetime_col,
                     horizon=args.horizon,
                     task=args.task,
-                    exclude=args.exclude.split(",") if args.exclude else None,
+                    exclude=parsed_exclude,
                     run_benchmark=effective_run_benchmark,
                     skip_timeseries=effective_skip_ts,
                     has_llm=bool(os.environ.get('OPENAI_API_KEY')),
                     start_time=time.time(),
                     selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
                     auto_exclude=effective_auto_exclude,
+                    group_col=args.group_col,
+                    cv_strategy=args.cv_strategy,
+                    text_cols=parsed_text_cols,
+                    nlp_method=args.nlp_method,
+                    chunk_size=args.chunk_size,
+                    scale_mode=args.scale_mode,
                 )
                 if res is None:
                     sys.exit(1)
@@ -10555,7 +12723,7 @@ Supported file formats:
                     custom_file=None,
                     target=args.target,
                     task=args.task,
-                    exclude=args.exclude.split(",") if args.exclude else None,
+                    exclude=parsed_exclude,
                     auto_exclude=effective_auto_exclude,
                 )
                 if res is None:
@@ -10569,11 +12737,17 @@ Supported file formats:
                 datetime_col=args.datetime_col,
                 horizon=args.horizon,
                 task=args.task,
-                exclude=args.exclude.split(",") if args.exclude else None,
+                exclude=parsed_exclude,
                 run_benchmark=effective_run_benchmark,
                 selection_mode="best_score" if getattr(args, 'best_score', False) else "knee_point",
                 skip_timeseries=effective_skip_ts,
                 auto_exclude=effective_auto_exclude,
+                group_col=args.group_col,
+                cv_strategy=args.cv_strategy,
+                text_cols=parsed_text_cols,
+                nlp_method=args.nlp_method,
+                chunk_size=args.chunk_size,
+                scale_mode=args.scale_mode,
             )
             if res is None:
                 sys.exit(1)

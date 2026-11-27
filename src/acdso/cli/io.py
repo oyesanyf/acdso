@@ -6,7 +6,7 @@ import json
 import os
 import re
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -352,3 +352,470 @@ def _encode_categoricals_safe(
 
     meta = {"low_card_cols": low_card, "high_card_freqs": high_card_freqs}
     return (X, meta) if return_meta else X
+
+
+def _read_csv_sample_with_fallback(
+    filepath: str,
+    sep: str = ",",
+    nrows: Optional[int] = None,
+    usecols: Optional[List[str]] = None,
+) -> "pd.DataFrame":
+    """Read up to ``nrows`` rows of a delimited text file with encoding fallbacks."""
+    import pandas as pd
+
+    last_decode_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(
+                filepath,
+                sep=sep,
+                nrows=nrows,
+                usecols=usecols,
+                encoding=enc,
+            )
+        except UnicodeDecodeError as e:
+            last_decode_err = e
+        except pd.errors.EmptyDataError as e:
+            raise ValueError(f"Dataset file is empty (no columns/rows): {filepath}") from e
+    raise ValueError(f"Unable to decode CSV file '{filepath}': {last_decode_err}")
+
+
+def _project_usecols(df: "pd.DataFrame", usecols: Optional[List[str]], filepath: str) -> "pd.DataFrame":
+    """Validate and project requested columns onto a DataFrame."""
+    if usecols is None:
+        return df
+    missing = [c for c in usecols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Columns {missing} not found in '{filepath}'.")
+    return df[usecols]
+
+
+def iter_file_chunks(
+    filepath: Union[str, os.PathLike[str]],
+    chunk_size: int = 50_000,
+    usecols: Optional[List[str]] = None,
+) -> Iterator["pd.DataFrame"]:
+    """Stream a tabular file in bounded DataFrame chunks without loading the full file into RAM.
+
+    Supports CSV, TSV, TXT, JSONL/NDJSON, JSON, Parquet (via pyarrow when installed),
+    Feather, Excel (.xlsx/.xls), and Pickle files.
+    """
+    path = os.fspath(filepath) if filepath is not None else ""
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"Data file not found: {path}")
+    if isinstance(chunk_size, bool) or int(chunk_size) < 1:
+        raise ValueError(f"chunk_size must be a positive integer, got {chunk_size!r}.")
+    eff_chunk_size = int(chunk_size)
+    cols_req = list(usecols) if usecols is not None else None
+    ext = os.path.splitext(path)[1].lower()
+
+    def _chunk_generator() -> Iterator["pd.DataFrame"]:
+        import pandas as pd
+
+        if ext in (".csv", ".tsv", ".txt") or ext not in (
+            ".jsonl",
+            ".ndjson",
+            ".json",
+            ".parquet",
+            ".feather",
+            ".xlsx",
+            ".xls",
+            ".pkl",
+            ".pickle",
+        ):
+            sep = "\t" if ext == ".tsv" else ","
+            last_decode_err: Optional[Exception] = None
+            for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+                yielded_any = False
+                reader = None
+                try:
+                    reader = pd.read_csv(
+                        path,
+                        sep=sep,
+                        chunksize=eff_chunk_size,
+                        usecols=cols_req,
+                        encoding=enc,
+                    )
+                    for chunk in reader:
+                        if len(chunk) > 0:
+                            yielded_any = True
+                            yield chunk
+                    return
+                except UnicodeDecodeError as e:
+                    if yielded_any:
+                        raise ValueError(
+                            f"Unable to decode CSV file '{path}' mid-stream ({enc}): {e}"
+                        ) from e
+                    last_decode_err = e
+                except pd.errors.EmptyDataError as e:
+                    raise ValueError(f"Dataset file is empty (no columns/rows): {path}") from e
+                finally:
+                    close_fn = getattr(reader, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+            raise ValueError(f"Unable to decode CSV file '{path}': {last_decode_err}")
+
+        if ext in (".jsonl", ".ndjson"):
+            if os.path.getsize(path) == 0:
+                raise ValueError(f"Dataset file is empty (no columns/rows): {path}")
+            reader = pd.read_json(path, lines=True, chunksize=eff_chunk_size)
+            try:
+                for chunk in reader:
+                    if len(chunk) > 0:
+                        yield _project_usecols(chunk, cols_req, path)
+            finally:
+                close_fn = getattr(reader, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            return
+
+        if ext == ".json":
+            if os.path.getsize(path) == 0:
+                raise ValueError(f"Dataset file is empty (no columns/rows): {path}")
+            try:
+                df_full = load_user_file(path)
+            except ValueError:
+                reader = pd.read_json(path, lines=True, chunksize=eff_chunk_size)
+                try:
+                    for chunk in reader:
+                        if len(chunk) > 0:
+                            yield _project_usecols(chunk, cols_req, path)
+                finally:
+                    close_fn = getattr(reader, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                return
+            df_full = _project_usecols(df_full, cols_req, path)
+            n_total = len(df_full)
+            for start in range(0, n_total, eff_chunk_size):
+                chunk = df_full.iloc[start : start + eff_chunk_size].copy()
+                if len(chunk) > 0:
+                    yield chunk
+            return
+
+        if ext == ".parquet":
+            try:
+                import pyarrow.parquet as pq
+
+                pf = pq.ParquetFile(path)
+                if cols_req is not None:
+                    schema_cols = set(pf.schema_arrow.names)
+                    missing = [c for c in cols_req if c not in schema_cols]
+                    if missing:
+                        raise ValueError(f"Columns {missing} not found in '{path}'.")
+                for batch in pf.iter_batches(batch_size=eff_chunk_size, columns=cols_req):
+                    chunk = batch.to_pandas()
+                    if len(chunk) > 0:
+                        yield chunk
+                return
+            except ImportError:
+                df_full = _project_usecols(load_user_file(path), cols_req, path)
+                n_total = len(df_full)
+                for start in range(0, n_total, eff_chunk_size):
+                    chunk = df_full.iloc[start : start + eff_chunk_size].copy()
+                    if len(chunk) > 0:
+                        yield chunk
+                return
+
+        if ext == ".feather":
+            try:
+                df_full = pd.read_feather(path, columns=cols_req)
+            except ImportError as e:
+                raise ImportError(
+                    f"Cannot read '.feather' file '{path}': missing optional dependency ({e}). "
+                    "Install 'pyarrow'."
+                ) from e
+            n_total = len(df_full)
+            for start in range(0, n_total, eff_chunk_size):
+                chunk = df_full.iloc[start : start + eff_chunk_size].copy()
+                if len(chunk) > 0:
+                    yield chunk
+            return
+
+        df_full = _project_usecols(load_user_file(path), cols_req, path)
+        n_total = len(df_full)
+        for start in range(0, n_total, eff_chunk_size):
+            chunk = df_full.iloc[start : start + eff_chunk_size].copy()
+            if len(chunk) > 0:
+                yield chunk
+
+    return _chunk_generator()
+
+
+def _widen_chunk_dtype(cur_dtype: Any, new_dtype: Any) -> Any:
+    """Compute a safe common dtype across heterogeneous chunks without lossy truncation."""
+    import numpy as np
+    import pandas as pd
+
+    if cur_dtype == new_dtype:
+        return cur_dtype
+    is_cur_bool = pd.api.types.is_bool_dtype(cur_dtype)
+    is_new_bool = pd.api.types.is_bool_dtype(new_dtype)
+    if is_cur_bool or is_new_bool:
+        return cur_dtype if (is_cur_bool and is_new_bool) else np.dtype(object)
+    if pd.api.types.is_numeric_dtype(cur_dtype) and pd.api.types.is_numeric_dtype(new_dtype):
+        if isinstance(cur_dtype, pd.api.extensions.ExtensionDtype) or isinstance(new_dtype, pd.api.extensions.ExtensionDtype):
+            if pd.api.types.is_float_dtype(cur_dtype) or pd.api.types.is_float_dtype(new_dtype):
+                return np.dtype(np.float64)
+            return np.dtype(np.float64)
+        try:
+            return np.result_type(cur_dtype, new_dtype)
+        except (TypeError, ValueError):
+            return np.dtype(object)
+    return np.dtype(object)
+
+
+def sample_file_bounded(
+    filepath: Union[str, os.PathLike[str]],
+    max_rows: int = 100_000,
+    chunk_size: int = 50_000,
+    random_state: Optional[int] = 42,
+    usecols: Optional[List[str]] = None,
+    return_total: bool = False,
+) -> Union["pd.DataFrame", Tuple["pd.DataFrame", int]]:
+    """Draw a deterministic bounded reservoir sample from a file via single-pass streaming.
+
+    Implements Vitter's Algorithm R over chunks from ``iter_file_chunks`` so memory
+    stays O(max_rows + chunk_size) regardless of total file row count.
+    """
+    import numpy as np
+    import pandas as pd
+
+    path = os.fspath(filepath) if filepath is not None else ""
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"Data file not found: {path}")
+    if isinstance(max_rows, bool) or int(max_rows) < 1:
+        raise ValueError(f"max_rows must be a positive integer, got {max_rows!r}.")
+    if isinstance(chunk_size, bool) or int(chunk_size) < 1:
+        raise ValueError(f"chunk_size must be a positive integer, got {chunk_size!r}.")
+
+    limit = int(max_rows)
+    eff_chunk_size = int(chunk_size)
+    cols_req = list(usecols) if usecols is not None else None
+    rng = np.random.RandomState(random_state)
+
+    total_rows = 0
+    columns: Optional[List[Any]] = None
+    dtypes_map: Dict[Any, Any] = {}
+    buffered_chunks: List[pd.DataFrame] = []
+    reservoir: Optional[List[Tuple[Any, ...]]] = None
+
+    for chunk in iter_file_chunks(path, chunk_size=eff_chunk_size, usecols=cols_req):
+        n_chunk = len(chunk)
+        if n_chunk == 0:
+            continue
+        if columns is None:
+            columns = list(chunk.columns)
+            dtypes_map = {col: chunk[col].dtype for col in columns}
+        else:
+            new_cols = [col for col in chunk.columns if col not in dtypes_map]
+            if new_cols:
+                columns.extend(new_cols)
+                for col in new_cols:
+                    c_dtype = chunk[col].dtype
+                    if pd.api.types.is_bool_dtype(c_dtype):
+                        dtypes_map[col] = np.dtype(object)
+                    elif pd.api.types.is_integer_dtype(c_dtype):
+                        dtypes_map[col] = np.dtype(np.float64)
+                    else:
+                        dtypes_map[col] = c_dtype
+                if reservoir is not None:
+                    pad = (None,) * len(new_cols)
+                    reservoir = [row + pad for row in reservoir]
+            for col in columns:
+                if col in chunk.columns:
+                    if chunk[col].dtype != dtypes_map[col]:
+                        dtypes_map[col] = _widen_chunk_dtype(dtypes_map[col], chunk[col].dtype)
+                else:
+                    if pd.api.types.is_bool_dtype(dtypes_map[col]):
+                        dtypes_map[col] = np.dtype(object)
+                    elif pd.api.types.is_integer_dtype(dtypes_map[col]):
+                        dtypes_map[col] = np.dtype(np.float64)
+            if list(chunk.columns) != columns:
+                chunk = chunk.reindex(columns=columns)
+
+        if reservoir is None:
+            if total_rows + n_chunk <= limit:
+                buffered_chunks.append(chunk)
+                total_rows += n_chunk
+                continue
+            # Transition from chunk buffer to fixed-capacity Algorithm R reservoir
+            reservoir = []
+            for buf in buffered_chunks:
+                if list(buf.columns) != columns:
+                    buf = buf.reindex(columns=columns)
+                reservoir.extend(buf.itertuples(index=False, name=None))
+            buffered_chunks.clear()
+
+            need = limit - len(reservoir)
+            if need > 0:
+                head_df = chunk.iloc[:need]
+                reservoir.extend(head_df.itertuples(index=False, name=None))
+                total_rows += need
+                rem_df = chunk.iloc[need:]
+            else:
+                rem_df = chunk
+        else:
+            rem_df = chunk
+
+        n_rem = len(rem_df)
+        if n_rem > 0:
+            # Exact Algorithm R: for 0-based stream position i >= limit,
+            # sample j uniformly from [0, i] and replace reservoir[j] if j < limit.
+            upper_bounds = np.arange(total_rows + 1, total_rows + n_rem + 1, dtype=np.int64)
+            j_draws = rng.randint(0, upper_bounds, dtype=np.int64)
+            hits = np.flatnonzero(j_draws < limit)
+            if hits.size > 0:
+                rows_list = list(rem_df.itertuples(index=False, name=None))
+                for pos in hits.tolist():
+                    reservoir[int(j_draws[pos])] = rows_list[pos]
+            total_rows += n_rem
+
+    if total_rows == 0:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".csv", ".tsv", ".txt") or ext not in (
+            ".jsonl",
+            ".ndjson",
+            ".json",
+            ".parquet",
+            ".feather",
+            ".xlsx",
+            ".xls",
+            ".pkl",
+            ".pickle",
+        ):
+            sep = "\t" if ext == ".tsv" else ","
+            empty_df = _read_csv_sample_with_fallback(path, sep=sep, nrows=0, usecols=cols_req)
+        else:
+            schema = inspect_file_schema(path, sample_rows=1, count_rows=False)
+            hdr_cols = cols_req if cols_req is not None else schema["columns"]
+            empty_df = pd.DataFrame(columns=hdr_cols)
+        return (empty_df, 0) if return_total else empty_df
+
+    if reservoir is None:
+        if len(buffered_chunks) == 1:
+            result_df = buffered_chunks[0].reset_index(drop=True)
+        else:
+            aligned_chunks = [
+                buf.reindex(columns=columns) if list(buf.columns) != columns else buf
+                for buf in buffered_chunks
+            ]
+            result_df = pd.concat(aligned_chunks, ignore_index=True)
+        return (result_df, total_rows) if return_total else result_df
+
+    result_df = pd.DataFrame.from_records(reservoir, columns=columns)
+    for col, dtype in dtypes_map.items():
+        if col in result_df.columns and result_df[col].dtype != dtype:
+            if pd.api.types.is_integer_dtype(dtype) and (
+                pd.api.types.is_float_dtype(result_df[col].dtype)
+                or result_df[col].dtype == object
+            ):
+                continue
+            try:
+                result_df[col] = result_df[col].astype(dtype)
+            except (TypeError, ValueError):
+                pass
+    return (result_df, total_rows) if return_total else result_df
+
+
+def inspect_file_schema(
+    filepath: Union[str, os.PathLike[str]],
+    sample_rows: int = 1000,
+    count_rows: bool = True,
+    chunk_size: int = 50_000,
+) -> Dict[str, Any]:
+    """Inspect column names, inferred dtypes, and optional exact row count cleanly."""
+    import pandas as pd
+
+    path = os.fspath(filepath) if filepath is not None else ""
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"Data file not found: {path}")
+    if isinstance(sample_rows, bool) or int(sample_rows) < 1:
+        raise ValueError(f"sample_rows must be a positive integer, got {sample_rows!r}.")
+    if isinstance(chunk_size, bool) or int(chunk_size) < 1:
+        raise ValueError(f"chunk_size must be a positive integer, got {chunk_size!r}.")
+
+    eff_sample = int(sample_rows)
+    eff_chunk = int(chunk_size)
+    ext = os.path.splitext(path)[1].lower()
+    fmt = ext.lstrip(".") or "csv"
+    file_size_bytes = int(os.path.getsize(path))
+
+    n_rows: Optional[int] = None
+    sample_df: Optional[pd.DataFrame] = None
+
+    if ext == ".parquet":
+        try:
+            import pyarrow.parquet as pq
+
+            pf = pq.ParquetFile(path)
+            if count_rows:
+                n_rows = int(pf.metadata.num_rows)
+            for batch in pf.iter_batches(batch_size=eff_sample):
+                sample_df = batch.to_pandas()
+                break
+            if sample_df is None:
+                sample_df = pf.schema_arrow.empty_table().to_pandas()
+        except ImportError:
+            pass
+
+    if sample_df is None:
+        if ext in (".csv", ".tsv", ".txt") or ext not in (
+            ".jsonl",
+            ".ndjson",
+            ".json",
+            ".parquet",
+            ".feather",
+            ".xlsx",
+            ".xls",
+            ".pkl",
+            ".pickle",
+        ):
+            sep = "\t" if ext == ".tsv" else ","
+            sample_df = _read_csv_sample_with_fallback(path, sep=sep, nrows=eff_sample)
+        else:
+            chunk_gen = iter_file_chunks(path, chunk_size=eff_sample)
+            try:
+                for chunk in chunk_gen:
+                    sample_df = chunk
+                    break
+            finally:
+                close_gen = getattr(chunk_gen, "close", None)
+                if callable(close_gen):
+                    close_gen()
+            if sample_df is None:
+                sample_df = load_user_file(path)
+
+    cols = [str(c) for c in sample_df.columns]
+    if count_rows and n_rows is None:
+        if len(sample_df) == 0:
+            n_rows = 0
+        elif len(cols) > 0 and ext in (".csv", ".tsv", ".txt"):
+            count_col = [sample_df.columns[0]]
+            n_rows = sum(len(c) for c in iter_file_chunks(path, chunk_size=eff_chunk, usecols=count_col))
+        else:
+            n_rows = sum(len(c) for c in iter_file_chunks(path, chunk_size=eff_chunk))
+
+    dtypes_dict: Dict[str, str] = {}
+    numeric_cols: List[str] = []
+    categorical_cols: List[str] = []
+    for raw_col in sample_df.columns:
+        col_name = str(raw_col)
+        s = sample_df[raw_col]
+        dtypes_dict[col_name] = str(s.dtype)
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            numeric_cols.append(col_name)
+        else:
+            categorical_cols.append(col_name)
+
+    return {
+        "filepath": path,
+        "format": fmt,
+        "file_size_bytes": file_size_bytes,
+        "columns": cols,
+        "n_columns": int(len(cols)),
+        "n_rows": int(n_rows) if n_rows is not None else None,
+        "dtypes": dtypes_dict,
+        "numeric_columns": numeric_cols,
+        "categorical_columns": categorical_cols,
+    }

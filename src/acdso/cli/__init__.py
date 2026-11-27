@@ -24,7 +24,10 @@ from acdso.cli.io import (
     _read_xlsx_stdlib,
     _sanitize_target_rows,
     _validate_dataframe_nonempty,
+    inspect_file_schema,
+    iter_file_chunks,
     load_user_file,
+    sample_file_bounded,
 )
 from acdso.cli.reporting import (
     _esc,
@@ -36,6 +39,7 @@ from acdso.cli.reporting import (
     _sanitize_json_payload,
     generate_combined_report,
     generate_html_report_from_combined,
+    populate_task_summary_blocks,
     save_combined_report,
 )
 
@@ -64,10 +68,14 @@ __all__ = [
     "capture_console_output",
     "generate_combined_report",
     "generate_html_report_from_combined",
+    "inspect_file_schema",
+    "iter_file_chunks",
     "load_user_file",
+    "populate_task_summary_blocks",
     "print_dict",
     "print_header",
     "print_subheader",
     "print_table",
+    "sample_file_bounded",
     "save_combined_report",
 ]

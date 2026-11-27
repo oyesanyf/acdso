@@ -8,7 +8,7 @@ and column handling used throughout ACDSO.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Union
 
 import numpy as np
 import pandas as pd
@@ -150,6 +150,14 @@ class _NumericSanitizer(BaseEstimator, TransformerMixin):
             arr[~np.isfinite(arr)] = np.nan
         return arr
 
+    def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        if input_features is not None:
+            return np.asarray(input_features, dtype=object)
+        if hasattr(self, "feature_names_in_"):
+            return np.asarray(self.feature_names_in_, dtype=object)
+        n = getattr(self, "n_features_in_", 0)
+        return np.asarray([f"x{i}" for i in range(n)], dtype=object)
+
 
 class _CategoricalSanitizer(BaseEstimator, TransformerMixin):
     """Sanitize categorical/string/nullable columns to object array with np.nan for missing."""
@@ -164,16 +172,46 @@ class _CategoricalSanitizer(BaseEstimator, TransformerMixin):
             cols = []
             for i in range(X.shape[1]):
                 s = X.iloc[:, i]
-                if pd.api.types.is_datetime64_any_dtype(s.dtype):
-                    col_obj = s.astype(str).where(s.notna(), np.nan).to_numpy(dtype=object)
-                else:
+                if pd.api.types.is_numeric_dtype(s.dtype) and not pd.api.types.is_bool_dtype(s.dtype):
                     col_obj = s.astype(object).where(s.notna(), np.nan).to_numpy(dtype=object)
+                else:
+                    col_obj = s.astype(str).where(s.notna(), np.nan).to_numpy(dtype=object)
                 cols.append(col_obj)
             return np.column_stack(cols)
         arr = np.asarray(sanitize_features(X), dtype=object)
         if arr.ndim == 1:
             arr = arr.reshape(-1, 1)
+        if arr.size > 0 and arr.dtype == object:
+            flat = arr.ravel()
+            types_seen = {
+                type(v)
+                for v in flat
+                if v is not None
+                and v is not pd.NA
+                and not (isinstance(v, (float, np.floating)) and not np.isfinite(float(v)))
+            }
+            if len(types_seen) > 1 or any(not issubclass(t, (int, float, np.number, str)) for t in types_seen):
+                fixed = np.empty(flat.shape, dtype=object)
+                for idx, v in enumerate(flat):
+                    if (
+                        v is None
+                        or v is pd.NA
+                        or v is pd.NaT
+                        or (isinstance(v, (float, np.floating)) and not np.isfinite(float(v)))
+                    ):
+                        fixed[idx] = np.nan
+                    else:
+                        fixed[idx] = str(v)
+                arr = fixed.reshape(arr.shape)
         return arr
+
+    def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        if input_features is not None:
+            return np.asarray(input_features, dtype=object)
+        if hasattr(self, "feature_names_in_"):
+            return np.asarray(self.feature_names_in_, dtype=object)
+        n = getattr(self, "n_features_in_", 0)
+        return np.asarray([f"x{i}" for i in range(n)], dtype=object)
 
 
 def infer_target_type(y: Any) -> str:
@@ -226,24 +264,41 @@ def infer_target_type(y: Any) -> str:
     return "multiclass"
 
 
-def split_columns(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+def split_columns(
+    df: pd.DataFrame,
+    detect_text: bool = False,
+) -> Union[Tuple[List[str], List[str]], Tuple[List[str], List[str], List[str]]]:
     """
-    Split DataFrame columns into numeric and categorical columns.
+    Split DataFrame columns into numeric, categorical, and optional free-text columns.
 
     Parameters
     ----------
     df : pd.DataFrame
         Input DataFrame.
+    detect_text : bool, default=False
+        When True, detects unstructured free-text columns and returns a 3-tuple
+        ``(numeric_columns, categorical_columns, text_columns)`` with text columns
+        excluded from categorical columns. When False (default), returns the
+        backwards-compatible 2-tuple ``(numeric_columns, categorical_columns)``.
 
     Returns
     -------
-    Tuple[List[str], List[str]]
-        Tuple of (numeric_columns, categorical_columns).
+    tuple
+        ``(numeric_columns, categorical_columns)`` when ``detect_text=False``, or
+        ``(numeric_columns, categorical_columns, text_columns)`` when ``detect_text=True``.
     """
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     num_set = set(num_cols)
-    cat_cols = [c for c in df.columns if c not in num_set]
-    return num_cols, cat_cols
+    if not detect_text:
+        cat_cols = [c for c in df.columns if c not in num_set]
+        return num_cols, cat_cols
+
+    from acdso.nlp import detect_text_columns
+
+    text_cols = detect_text_columns(df, exclude_cols=num_cols)
+    excluded = num_set | set(text_cols)
+    cat_cols = [c for c in df.columns if c not in excluded]
+    return num_cols, cat_cols, text_cols
 
 
 def compute_missing_ratio(df: pd.DataFrame) -> float:
@@ -268,13 +323,18 @@ def build_preprocessor(
     numeric_cols: List[str],
     categorical_cols: List[str],
     sparse_threshold: float = 0.3,
+    text_cols: Optional[List[str]] = None,
+    text_method: str = "tfidf",
+    ngram_range: Tuple[int, int] = (1, 2),
+    n_topics: int = 10,
 ) -> ColumnTransformer:
     """
-    Build a preprocessing ColumnTransformer for numeric and categorical columns.
+    Build a preprocessing ColumnTransformer for numeric, categorical, and text columns.
 
     The preprocessor applies:
     - Numeric: Median imputation + StandardScaler (without centering for sparse compatibility)
     - Categorical: Mode imputation + OneHotEncoder
+    - Text (when ``text_cols`` is non-empty): Classical NLP featurization via ``TextFeaturizer``
 
     Parameters
     ----------
@@ -284,6 +344,14 @@ def build_preprocessor(
         List of categorical column names.
     sparse_threshold : float, default=0.3
         Threshold for sparse matrix output (0.0-1.0).
+    text_cols : List[str], optional
+        Optional list of free-text column names.
+    text_method : str, default="tfidf"
+        Text featurization method (``"tfidf"``, ``"ngram"``, ``"lda"``, ``"nmf"``, ``"combined"``).
+    ngram_range : tuple of (int, int), default=(1, 2)
+        N-gram range passed to ``TextFeaturizer``.
+    n_topics : int, default=10
+        Topic count passed to ``TextFeaturizer`` for topic-modeling modes.
 
     Returns
     -------
@@ -302,11 +370,28 @@ def build_preprocessor(
         ("onehot", OneHotEncoder(handle_unknown="ignore")),
     ])
 
+    transformers: List[Tuple[str, Any, List[str]]] = [
+        ("num", num_pipe, numeric_cols),
+        ("cat", cat_pipe, categorical_cols),
+    ]
+
+    if text_cols:
+        from acdso.nlp import TextFeaturizer
+
+        transformers.append(
+            (
+                "text",
+                TextFeaturizer(
+                    method=text_method,
+                    ngram_range=ngram_range,
+                    n_topics=n_topics,
+                ),
+                list(text_cols),
+            )
+        )
+
     return ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, numeric_cols),
-            ("cat", cat_pipe, categorical_cols),
-        ],
+        transformers=transformers,
         remainder="drop",
         sparse_threshold=sparse_threshold,
     )

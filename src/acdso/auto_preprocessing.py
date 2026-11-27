@@ -100,6 +100,7 @@ class PreprocessingPlan:
     outlier_columns: List[str]
     missing_columns: List[str]
     correlated_groups: Dict[int, List[str]]
+    text_columns: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -113,6 +114,7 @@ class PreprocessingPlan:
             "outlier_columns": self.outlier_columns,
             "missing_columns": self.missing_columns,
             "correlated_groups": self.correlated_groups,
+            "text_columns": self.text_columns,
         }
     
     def print_summary(self) -> None:
@@ -123,7 +125,8 @@ class PreprocessingPlan:
         
         print(f"\n  Columns: {len(self.numeric_columns)} numeric, "
               f"{len(self.categorical_columns)} categorical, "
-              f"{len(self.datetime_columns)} datetime")
+              f"{len(self.datetime_columns)} datetime, "
+              f"{len(self.text_columns)} text")
         
         if self.drop_columns:
             print(f"\n  DROP ({len(self.drop_columns)}): {', '.join(self.drop_columns[:5])}"
@@ -144,6 +147,10 @@ class PreprocessingPlan:
         if self.target_encode_columns:
             print(f"  TARGET ENCODE ({len(self.target_encode_columns)}): {', '.join(self.target_encode_columns[:5])}"
                   + (f" +{len(self.target_encode_columns)-5} more" if len(self.target_encode_columns) > 5 else ""))
+        
+        if self.text_columns:
+            print(f"  FEATURIZE TEXT ({len(self.text_columns)}): {', '.join(self.text_columns[:5])}"
+                  + (f" +{len(self.text_columns)-5} more" if len(self.text_columns) > 5 else ""))
         
         print(f"\n  Total actions: {len(self.actions)}")
         print("=" * 70)
@@ -265,6 +272,13 @@ class TargetEncoder(BaseEstimator, TransformerMixin):
 
         return result
 
+    def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        if input_features is not None:
+            return np.asarray(input_features, dtype=object)
+        if self.encodings_:
+            return np.asarray([str(k) for k in self.encodings_.keys()], dtype=object)
+        return np.asarray([], dtype=object)
+
 
 class SkewnessTransformer(BaseEstimator, TransformerMixin):
     """
@@ -351,6 +365,11 @@ class SkewnessTransformer(BaseEstimator, TransformerMixin):
 
         return result
 
+    def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        if input_features is not None:
+            return np.asarray(input_features, dtype=object)
+        return np.asarray([], dtype=object)
+
 
 class OutlierClipper(BaseEstimator, TransformerMixin):
     """
@@ -400,6 +419,11 @@ class OutlierClipper(BaseEstimator, TransformerMixin):
             if i < n_cols:
                 result[:, i] = np.clip(result[:, i], lower, upper)
         return result
+
+    def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        if input_features is not None:
+            return np.asarray(input_features, dtype=object)
+        return np.asarray([f"x{i}" for i in range(len(self.bounds_))], dtype=object)
 
 
 class AutoPreprocessor(BaseEstimator, TransformerMixin):
@@ -473,6 +497,12 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         missing_threshold: float = 0.5,
         correlation_threshold: float = 0.95,
         verbose: int = 0,
+        handle_text: bool = True,
+        text_method: str = "tfidf",
+        text_ngram_range: Tuple[int, int] = (1, 2),
+        text_n_topics: int = 10,
+        text_max_features: int = 500,
+        text_cols: Optional[List[str]] = None,
     ):
         self.handle_missing = handle_missing
         self.handle_outliers = handle_outliers
@@ -485,6 +515,12 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         self.missing_threshold = missing_threshold
         self.correlation_threshold = correlation_threshold
         self.verbose = verbose
+        self.handle_text = handle_text
+        self.text_method = text_method
+        self.text_ngram_range = text_ngram_range
+        self.text_n_topics = text_n_topics
+        self.text_max_features = text_max_features
+        self.text_cols = text_cols
         
         # Fitted attributes
         self.plan_: Optional[PreprocessingPlan] = None
@@ -540,6 +576,51 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         datetime_cols = X.select_dtypes(include=['datetime64']).columns.tolist()
         return numeric_cols, categorical_cols, datetime_cols
 
+    def _resolve_text_columns(
+        self,
+        X: pd.DataFrame,
+        numeric_cols: List[str],
+        categorical_cols: List[str],
+        datetime_cols: List[str],
+    ) -> Tuple[List[str], List[str], List[str], List[str]]:
+        """Resolve free-text columns and remove them from other column buckets."""
+        if not self.handle_text:
+            return numeric_cols, categorical_cols, datetime_cols, []
+
+        if self.text_cols is not None:
+            col_set = set(X.columns)
+            text_cols = list(dict.fromkeys(c for c in self.text_cols if c in col_set))
+        else:
+            from acdso.nlp import detect_text_columns
+
+            bool_cols = X.select_dtypes(include=['bool', 'boolean']).columns.tolist()
+            text_cols = detect_text_columns(
+                X,
+                exclude_cols=numeric_cols + datetime_cols + bool_cols,
+            )
+
+        if not text_cols:
+            return numeric_cols, categorical_cols, datetime_cols, []
+
+        text_set = set(text_cols)
+        return (
+            [c for c in numeric_cols if c not in text_set],
+            [c for c in categorical_cols if c not in text_set],
+            [c for c in datetime_cols if c not in text_set],
+            text_cols,
+        )
+
+    def _compute_missing_pcts(self, X: pd.DataFrame, numeric_cols: List[str]) -> pd.Series:
+        """Compute per-column missing ratio, treating non-finite numeric values (+/-inf) as missing."""
+        missing_pcts = X.isna().mean()
+        if len(X) == 0:
+            return missing_pcts
+        for col in numeric_cols:
+            if col in X.columns:
+                arr = pd.to_numeric(X[col], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+                missing_pcts[col] = float(np.mean(~np.isfinite(arr)))
+        return missing_pcts
+
     def _detect_issues(
         self,
         X: pd.DataFrame,
@@ -553,10 +634,13 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         drop_cols: List[str] = []
         correlated_groups: Dict[int, List[str]] = {}
 
-        numeric_cols, categorical_cols, _ = self._analyze_columns(X)
+        numeric_cols, categorical_cols, datetime_cols = self._analyze_columns(X)
+        numeric_cols, categorical_cols, datetime_cols, _ = self._resolve_text_columns(
+            X, numeric_cols, categorical_cols, datetime_cols
+        )
 
         if missing_pcts is None:
-            missing_pcts = X.isna().mean()
+            missing_pcts = self._compute_missing_pcts(X, numeric_cols)
         for col, missing_pct in missing_pcts.items():
             if missing_pct > 0:
                 if missing_pct > self.missing_threshold:
@@ -567,7 +651,8 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         drop_set = set(drop_cols)
         active_num = [c for c in numeric_cols if c not in drop_set]
         if active_num and len(X) > 0:
-            X_num_arr = X[active_num].astype(float, copy=False).to_numpy(dtype=float, copy=False)
+            X_num_raw = X[active_num].astype(float, copy=False).to_numpy(dtype=float, copy=False)
+            X_num_arr = np.where(np.isfinite(X_num_raw), X_num_raw, np.nan)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 skews = np.asarray(
@@ -668,7 +753,11 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
     ) -> PreprocessingPlan:
         """Create preprocessing plan based on data analysis."""
         numeric_cols, categorical_cols, datetime_cols = self._analyze_columns(X)
-        missing_pcts = X.isna().mean()
+        numeric_cols, categorical_cols, datetime_cols, text_cols = self._resolve_text_columns(
+            X, numeric_cols, categorical_cols, datetime_cols
+        )
+        text_set = set(text_cols)
+        missing_pcts = self._compute_missing_pcts(X, numeric_cols)
         missing_cols, skewed_cols, outlier_cols, drop_cols, correlated_groups = self._detect_issues(
             X, y, missing_pcts=missing_pcts
         )
@@ -692,7 +781,7 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
         for col in missing_cols:
             if col in drop_set:
                 continue
-            strategy = "median" if col in numeric_cols else "most_frequent"
+            strategy = "median" if col in numeric_cols else ("fill_empty" if col in text_set else "most_frequent")
             actions.append(PreprocessingAction(
                 column=col,
                 action="impute",
@@ -743,6 +832,21 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
                     reason=f"Categorical with {n_unique} categories",
                     priority="high",
                 ))
+
+        active_text_cols = [c for c in text_cols if c not in drop_set]
+        for col in active_text_cols:
+            actions.append(PreprocessingAction(
+                column=col,
+                action="featurize_text",
+                reason=f"Free-text column featurized ({self.text_method})",
+                priority="high",
+                params={
+                    "method": self.text_method,
+                    "ngram_range": tuple(self.text_ngram_range),
+                    "n_topics": self.text_n_topics,
+                    "max_features": self.text_max_features,
+                },
+            ))
         
         # Sort by priority
         priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -759,6 +863,7 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
             outlier_columns=outlier_cols,
             missing_columns=missing_cols,
             correlated_groups=correlated_groups,
+            text_columns=active_text_cols,
         )
     
     def _build_transformer(
@@ -824,6 +929,18 @@ class AutoPreprocessor(BaseEstimator, TransformerMixin):
                     ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
                 ]
             transformers.append(("target_encoded", Pipeline(target_steps), plan.target_encode_columns))
+
+        # Classical NLP free-text featurization pipeline
+        if plan.text_columns and self.handle_text:
+            from acdso.nlp import TextFeaturizer
+
+            text_featurizer = TextFeaturizer(
+                method=self.text_method,
+                ngram_range=tuple(self.text_ngram_range),
+                max_features=self.text_max_features,
+                n_topics=self.text_n_topics,
+            )
+            transformers.append(("text", text_featurizer, plan.text_columns))
         
         # Build transformer
         transformer = ColumnTransformer(
@@ -941,6 +1058,7 @@ def create_eda_preprocessor(
     df: pd.DataFrame,
     target_column: str = None,
     verbose: int = 1,
+    **kwargs: Any,
 ) -> Tuple[AutoPreprocessor, Any]:
     """
     Convenience function: Run EDA and create informed preprocessor.
@@ -978,7 +1096,7 @@ def create_eda_preprocessor(
     report = eda.analyze(X)
     
     # Create preprocessor from EDA
-    preprocessor = AutoPreprocessor.from_eda(eda, verbose=verbose)
+    preprocessor = AutoPreprocessor.from_eda(eda, verbose=verbose, **kwargs)
     
     return preprocessor, report
 

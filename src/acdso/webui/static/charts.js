@@ -8,9 +8,14 @@
     ));
   }
 
-  function fmtNum(v, digits) {
-    if (v == null || v === '') return 'n/a';
+  function toFiniteNum(v) {
+    if (v == null || typeof v === 'boolean' || String(v).trim() === '') return NaN;
     const n = Number(v);
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  function fmtNum(v, digits) {
+    const n = toFiniteNum(v);
     return Number.isFinite(n) ? n.toFixed(digits) : 'n/a';
   }
 
@@ -102,9 +107,9 @@
     const paretoNames = new Set((paretoFront || []).map((p) => (typeof p === 'string' ? p : (p.model_name || p.name || ''))));
     const pts = (candidates || []).map((c, idx) => {
       const name = c.model_name || c.name || ('Model_' + idx);
-      const yVal = Number(c.metric);
+      const yVal = toFiniteNum(c.metric);
       const rawX = c[axis.key] != null ? c[axis.key] : (axis.key === 'latency_ms_per_row' ? c.latency_ms : 0);
-      const xVal = Number(rawX);
+      const xVal = toFiniteNum(rawX);
       return {
         idx,
         name,
@@ -204,14 +209,14 @@
       list = raw.map((item) => {
         if (!item || typeof item !== 'object') return null;
         const name = item.feature_name || item.feature || item.name || '';
-        const val = Number(item.importance_mean != null ? item.importance_mean : (item.importance != null ? item.importance : item.score));
+        const val = toFiniteNum(item.importance_mean != null ? item.importance_mean : (item.importance != null ? item.importance : item.score));
         return name && Number.isFinite(val) ? { name: String(name), value: val } : null;
       }).filter(Boolean);
     } else if (typeof raw === 'object') {
       const inner = raw.feature_importances || raw.importances || raw.top_features;
       if (Array.isArray(inner)) return normalizeImportanceItems(inner);
       list = Object.entries(raw)
-        .map(([k, v]) => ({ name: String(k), value: Number(v) }))
+        .map(([k, v]) => ({ name: String(k), value: toFiniteNum(v) }))
         .filter((x) => Number.isFinite(x.value));
     }
     return list.sort((a, b) => Math.abs(b.value) - Math.abs(a.value)).slice(0, 12);
@@ -247,7 +252,7 @@
     const samples = pred.sample_values.filter((r) => r && r.predicted != null && r.actual != null);
     if (samples.length < 2) return '';
 
-    const numericPairs = samples.map((r) => ({ a: Number(r.actual), p: Number(r.predicted), row: r.row }))
+    const numericPairs = samples.map((r) => ({ a: toFiniteNum(r.actual), p: toFiniteNum(r.predicted), row: r.row }))
       .filter((x) => Number.isFinite(x.a) && Number.isFinite(x.p));
 
     const isReg = (task === 'regression') || (numericPairs.length === samples.length && new Set(numericPairs.map((x) => x.a)).size > 5);
@@ -322,7 +327,7 @@
 
   /* ── 5. Side-by-Side Experiment Run Comparison ──────────────────────── */
   function fmtDelta(val, digits, higherIsBetter) {
-    if (val == null || !Number.isFinite(Number(val))) return '<span class="delta-flat">&mdash;</span>';
+    if (val == null || typeof val === 'boolean' || String(val).trim() === '' || !Number.isFinite(Number(val))) return '<span class="delta-flat">&mdash;</span>';
     const n = Number(val);
     if (Math.abs(n) < 1e-9) return '<span class="delta-flat">baseline</span>';
     const sign = n > 0 ? '+' : '';
@@ -335,7 +340,7 @@
     if (items.length < 2) return '<div class="hint">Select 2 to 4 JSON reports to compare.</div>';
 
     // Score bar SVG
-    const scores = items.map((r) => Number(r.metric));
+    const scores = items.map((r) => toFiniteNum(r.metric));
     const finiteScores = scores.filter(Number.isFinite);
     let chartHtml = '';
     if (finiteScores.length) {
@@ -345,7 +350,7 @@
       const maxS = Math.max(...finiteScores.map((s) => Math.max(0, s)), 1e-6);
       const bars = items.map((r, i) => {
         const y = padT + i * rowH;
-        const sc = Number(r.metric);
+        const sc = toFiniteNum(r.metric);
         const w = Number.isFinite(sc) ? Math.max(2, (Math.max(0, sc) / maxS) * barW) : 0;
         const shortName = String(r.path || '').replace(/^autonomous_/, '').replace(/_combined\.json$/, '');
         const lbl = shortName.length > 24 ? shortName.slice(0, 23) + '…' : shortName;
@@ -359,8 +364,9 @@
 
     const rows = items.map((r, i) => {
       const d = r.deltas || {};
+      const taskBadge = r.task ? ' <span class="badge">' + esc(r.task) + '</span>' : '';
       return '<tr>' +
-        '<td><strong>' + esc(r.path) + '</strong>' + (i === 0 ? ' <span class="badge badge-num">baseline</span>' : '') + '</td>' +
+        '<td><strong>' + esc(r.path) + '</strong>' + taskBadge + (i === 0 ? ' <span class="badge badge-num">baseline</span>' : '') + '</td>' +
         '<td>' + esc(Array.isArray(r.target) ? r.target.join(',') : (r.target || 'n/a')) + '</td>' +
         '<td>' + esc(r.selected_model || 'None') + '</td>' +
         '<td>' + fmtNum(r.metric, 4) + ' (' + fmtDelta(d.metric, 4, true) + ')</td>' +
@@ -376,7 +382,84 @@
       '<tbody>' + rows + '</tbody></table></div>';
   }
 
-  /* ── 6. Accessible Sortable Tables (Intl.Collator + moveBefore) ─────── */
+  /* ── 6. R1-R6 Task Summary Blocks & Distribution Chart ─────────────── */
+  function fmtTaskValue(v) {
+    if (v == null || v === '') return 'n/a';
+    if (typeof v === 'boolean') return v ? 'true' : 'false';
+    if (typeof v === 'number') {
+      if (!Number.isFinite(v)) return 'n/a';
+      return Number.isInteger(v) ? String(v) : v.toFixed(4);
+    }
+    if (Array.isArray(v)) {
+      return v.map((item) => esc(String(item == null ? '' : item))).join(', ') || '[]';
+    }
+    if (typeof v === 'object') {
+      return Object.entries(v)
+        .map(([k, val]) => esc(k) + ': ' + fmtTaskValue(val))
+        .join(' · ');
+    }
+    return esc(String(v));
+  }
+
+  function renderTaskBlockCard(title, obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return '';
+    const entries = Object.entries(obj).filter(([, v]) => v !== undefined && v !== null);
+    if (!entries.length) return '';
+    const rows = entries.map(([k, v]) => {
+      const renderedVal = (typeof v === 'object' && !Array.isArray(v))
+        ? fmtTaskValue(v)
+        : (Array.isArray(v) ? fmtTaskValue(v) : fmtTaskValue(v));
+      return '<tr><th>' + esc(k) + '</th><td>' + renderedVal + '</td></tr>';
+    }).join('');
+    return '<div class="task-block"><h3>' + esc(title) + '</h3>' +
+      '<div class="scroll-x"><table><tbody>' + rows + '</tbody></table></div></div>';
+  }
+
+  function renderTaskSummaryBlocksHtml(d) {
+    if (!d || typeof d !== 'object') return '';
+    const sections = [
+      ['Task Metrics', d.metrics],
+      ['Clustering Summary', d.clustering],
+      ['Anomaly Summary', d.anomaly],
+      ['Cross-Validation', d.cv],
+      ['NLP Featurization', d.nlp],
+      ['Specialized Task', d.specialized],
+      ['Out-of-Core Scale', d.scale],
+    ];
+    const cards = sections
+      .map(([title, block]) => renderTaskBlockCard(title, block))
+      .filter(Boolean);
+    if (!cards.length) return '';
+    return '<div class="task-summary-grid">' + cards.join('') + '</div>';
+  }
+
+  function renderDistributionHtml(dist, task) {
+    if (!dist || typeof dist !== 'object' || Array.isArray(dist)) return '';
+    const entries = Object.entries(dist)
+      .map(([k, v]) => ({ label: String(k), count: toFiniteNum(v) }))
+      .filter((x) => Number.isFinite(x.count) && x.count >= 0)
+      .slice(0, 12);
+    if (!entries.length) return '';
+    const maxC = Math.max(...entries.map((x) => x.count), 1);
+    const W = 600, rowH = 22, padL = 130, padR = 54, padT = 10, padB = 10;
+    const H = padT + padB + entries.length * rowH;
+    const barW = W - padL - padR;
+    const bars = entries.map((item, i) => {
+      const y = padT + i * rowH;
+      const w = Math.max(2, (item.count / maxC) * barW);
+      const lbl = item.label.length > 18 ? item.label.slice(0, 17) + '…' : item.label;
+      const color = (task === 'anomaly' && (item.label === '-1' || /anomaly|outlier/i.test(item.label)))
+        ? '#ff7b7b'
+        : '#5b9dff';
+      return '<text x="' + (padL - 8) + '" y="' + (y + 14) + '" fill="#e6e9ef" font-size="11" text-anchor="end">' + esc(lbl) + '</text>' +
+        '<rect x="' + padL + '" y="' + (y + 3) + '" width="' + w.toFixed(1) + '" height="14" rx="3" fill="' + color + '"><title>' + esc(item.label + ': ' + item.count) + '</title></rect>' +
+        '<text x="' + (padL + w + 6).toFixed(1) + '" y="' + (y + 14) + '" fill="#98a1b3" font-size="10">' + esc(String(item.count)) + '</text>';
+    }).join('');
+    return '<div style="margin:10px 0"><div class="hint" style="margin:0 0 6px"><strong>Predicted Label Distribution</strong></div>' +
+      '<div class="chart-wrap"><svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Prediction distribution chart">' + bars + '</svg></div></div>';
+  }
+
+  /* ── 7. Accessible Sortable Tables (Intl.Collator + moveBefore) ─────── */
   const _collator = typeof Intl !== 'undefined' && Intl.Collator
     ? new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
     : { compare: (a, b) => (a < b ? -1 : a > b ? 1 : 0) };
@@ -450,6 +533,8 @@
     renderFeatureImportanceHtml,
     renderPredictionDiagnosticsHtml,
     renderRunComparisonHtml,
+    renderTaskSummaryBlocksHtml,
+    renderDistributionHtml,
     enhanceSortableTable,
     sortTableByHeader,
   };

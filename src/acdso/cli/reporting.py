@@ -30,6 +30,44 @@ def _esc(val: Any) -> str:
     return _html.escape("" if val is None else str(val), quote=True)
 
 
+def _fmt_num(val: Any, fmt: str = ".4f", default: str = "N/A") -> str:
+    """Safely format finite numeric scalars (never matching bool or NaN/Inf)."""
+    if val is None or isinstance(val, bool):
+        return _esc(val) if isinstance(val, bool) else default
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        return format(fval, fmt) if math.isfinite(fval) else default
+    if hasattr(val, "item") and not isinstance(val, (str, bytes, bytearray)):
+        try:
+            item_val = val.item()
+            if isinstance(item_val, bool):
+                return _esc(item_val)
+            if isinstance(item_val, (int, float)):
+                fval = float(item_val)
+                return format(fval, fmt) if math.isfinite(fval) else default
+        except Exception:
+            pass
+    return _esc(val)
+
+
+def _fmt_int(val: Any, default: str = "N/A") -> str:
+    """Safely format integer counts with thousands separators."""
+    if val is None or isinstance(val, bool):
+        return _esc(val) if isinstance(val, bool) else default
+    if hasattr(val, "item") and not isinstance(val, (str, bytes, bytearray)):
+        try:
+            val = val.item()
+        except Exception:
+            pass
+    if isinstance(val, bool):
+        return _esc(val)
+    if isinstance(val, int):
+        return f"{val:,}"
+    if isinstance(val, float):
+        return f"{int(val):,}" if math.isfinite(val) else default
+    return _esc(val)
+
+
 def _json_safe_scalar(val: Any) -> Any:
     """Convert scalar values to RFC 8259-compliant JSON primitives (NaN/inf -> None)."""
     import numpy as np
@@ -53,12 +91,21 @@ def _json_safe_scalar(val: Any) -> Any:
 
 def _sanitize_json_payload(obj: Any) -> Any:
     """Recursively sanitize nested payloads for strict RFC 8259 JSON (allow_nan=False)."""
+    if obj is None or isinstance(obj, (bool, str)):
+        return obj
     if isinstance(obj, dict):
         return {str(k): _sanitize_json_payload(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize_json_payload(v) for v in obj]
-    if isinstance(obj, str) or obj is None:
-        return obj
+    if isinstance(obj, (set, frozenset)):
+        return [_sanitize_json_payload(v) for v in sorted(obj, key=str)]
+    if hasattr(obj, "tolist") and not isinstance(obj, (str, bytes, bytearray)):
+        try:
+            return _sanitize_json_payload(obj.tolist())
+        except Exception:
+            pass
+    if isinstance(obj, os.PathLike):
+        return os.fspath(obj)
     return _json_safe_scalar(obj)
 
 
@@ -82,42 +129,207 @@ def _sanitize_embedded_html(raw_html: str) -> str:
 
 
 
+def _infer_estimator_task(estimator: Any, explicit_task: Optional[str] = None) -> Optional[str]:
+    """Infer canonical ACDSO task name from an estimator without eager ML imports."""
+    if explicit_task and str(explicit_task).strip() and str(explicit_task).strip().lower() != "auto":
+        return str(explicit_task).strip().lower()
+    if estimator is None:
+        return None
+    cls_name = type(estimator).__name__
+    if cls_name == "ACDSOClusterer":
+        return "clustering"
+    if cls_name == "ACDSOAnomalyDetector":
+        return "anomaly"
+    if cls_name == "ACDSOMultiLabelClassifier":
+        return "multilabel"
+    if cls_name == "ACDSORanker":
+        return "ranking"
+    if cls_name == "ACDSOSurvivalAnalyzer":
+        return "survival"
+    if cls_name == "ACDSORecommender":
+        return "recommender"
+    if cls_name == "ACDSOOutOfCoreTrainer":
+        t = getattr(estimator, "task_", None) or getattr(estimator, "task", None)
+        return str(t).lower() if t else "classification"
+    if cls_name == "ACDSOClassifier":
+        return "classification"
+    if cls_name == "ACDSORegressor":
+        return "regression"
+    if hasattr(estimator, "predict_proba"):
+        return "classification"
+    if hasattr(estimator, "predict"):
+        return "regression"
+    return None
+
+
+def populate_task_summary_blocks(
+    report: Dict[str, Any],
+    *,
+    task: Optional[str] = None,
+    estimator: Any = None,
+    metrics: Optional[Dict[str, Any]] = None,
+    clustering_info: Optional[Dict[str, Any]] = None,
+    anomaly_info: Optional[Dict[str, Any]] = None,
+    cv_info: Optional[Dict[str, Any]] = None,
+    nlp_info: Optional[Dict[str, Any]] = None,
+    specialized_info: Optional[Dict[str, Any]] = None,
+    scale_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Populate canonical R1-R6 task and summary blocks on a combined report dict."""
+    resolved_task = _infer_estimator_task(estimator, explicit_task=task or report.get("task"))
+    if resolved_task:
+        report["task"] = resolved_task
+
+    audit = getattr(estimator, "audit_trail_", None) if estimator is not None else None
+    if isinstance(audit, dict) and "audit_trail" not in report:
+        report["audit_trail"] = audit
+    audit_dict = report.get("audit_trail") if isinstance(report.get("audit_trail"), dict) else {}
+
+    cls_name = type(estimator).__name__ if estimator is not None else ""
+
+    # Clustering (R1)
+    if clustering_info:
+        report["clustering"] = dict(clustering_info)
+    elif cls_name == "ACDSOClusterer" and hasattr(estimator, "get_cluster_summary"):
+        try:
+            report["clustering"] = dict(estimator.get_cluster_summary())
+        except Exception:
+            pass
+
+    # Anomaly (R2)
+    if anomaly_info:
+        report["anomaly"] = dict(anomaly_info)
+    elif cls_name == "ACDSOAnomalyDetector":
+        anom_block = {
+            "best_algorithm": getattr(estimator, "best_algorithm_", None) or audit_dict.get("best_algorithm"),
+            "algorithm_requested": audit_dict.get("algorithm_requested", getattr(estimator, "algorithm", None)),
+            "contamination": audit_dict.get("contamination", getattr(estimator, "contamination", None)),
+            "n_samples": audit_dict.get("n_samples"),
+            "offset": getattr(estimator, "offset_", audit_dict.get("offset")),
+            "threshold": getattr(estimator, "threshold_", audit_dict.get("threshold")),
+            "fit_is_sparse": audit_dict.get("fit_is_sparse"),
+            "text_cols": audit_dict.get("text_cols") or getattr(estimator, "text_cols_", None),
+        }
+        report["anomaly"] = {k: v for k, v in anom_block.items() if v is not None}
+
+    # CV / Grouping (R3)
+    if cv_info:
+        report["cv"] = dict(cv_info)
+    else:
+        cv_strat = audit_dict.get("cv_strategy") or getattr(estimator, "cv_strategy_", None)
+        if cv_strat or audit_dict.get("groups_provided"):
+            report["cv"] = {
+                k: v
+                for k, v in {
+                    "cv_strategy": cv_strat,
+                    "groups_provided": audit_dict.get("groups_provided"),
+                    "n_unique_groups": audit_dict.get("n_groups", audit_dict.get("n_unique_groups")),
+                }.items()
+                if v is not None
+            }
+
+    # NLP / Free-text (R4)
+    if nlp_info:
+        report["nlp"] = dict(nlp_info)
+    else:
+        tcols = audit_dict.get("text_cols") or getattr(estimator, "text_cols_", None)
+        tmeth = audit_dict.get("text_method") or getattr(estimator, "text_method", None)
+        if tcols:
+            report["nlp"] = {
+                "text_cols": list(tcols),
+                "n_text_cols": len(tcols),
+                "nlp_method": tmeth or "tfidf",
+            }
+
+    # Scale (R6)
+    if scale_info:
+        report["scale"] = dict(scale_info)
+    elif cls_name == "ACDSOOutOfCoreTrainer" and hasattr(estimator, "get_scale_summary"):
+        try:
+            report["scale"] = dict(estimator.get_scale_summary())
+        except Exception:
+            pass
+    elif isinstance(audit_dict.get("scale_guard"), dict):
+        report["scale"] = dict(audit_dict["scale_guard"])
+
+    # Specialized Supervised (R5)
+    if specialized_info:
+        report["specialized"] = dict(specialized_info)
+    elif cls_name in ("ACDSOMultiLabelClassifier", "ACDSORanker", "ACDSOSurvivalAnalyzer", "ACDSORecommender"):
+        spec: Dict[str, Any] = {"task": resolved_task}
+        for attr, key in (
+            ("best_strategy_", "best_strategy"),
+            ("best_algorithm_", "best_algorithm"),
+            ("best_method_", "best_method"),
+            ("backend_used_", "backend_used"),
+            ("n_labels_", "n_labels"),
+            ("n_users_", "n_users"),
+            ("n_items_", "n_items"),
+            ("user_col_", "user_col"),
+            ("item_col_", "item_col"),
+            ("rating_col_", "rating_col"),
+            ("is_implicit_", "is_implicit"),
+            ("k", "k"),
+        ):
+            val = getattr(estimator, attr, None)
+            if val is not None:
+                spec[key] = val
+        report["specialized"] = spec
+
+    # Metrics summary block
+    merged_metrics: Dict[str, Any] = {}
+    if isinstance(report.get("metrics"), dict):
+        merged_metrics.update(report["metrics"])
+    if isinstance(report.get("test_performance"), dict):
+        for k, v in report["test_performance"].items():
+            if k != "error" and v is not None:
+                merged_metrics[k] = v
+    if isinstance(report.get("clustering"), dict):
+        for k in ("silhouette_score", "davies_bouldin_score", "n_clusters", "noise_count", "noise_ratio"):
+            if report["clustering"].get(k) is not None:
+                merged_metrics.setdefault(k, report["clustering"][k])
+    if isinstance(report.get("anomaly"), dict):
+        for k in ("n_anomalies", "anomaly_rate", "offset", "threshold"):
+            if report["anomaly"].get(k) is not None:
+                merged_metrics.setdefault(k, report["anomaly"][k])
+    if isinstance(metrics, dict):
+        for k, v in metrics.items():
+            if v is not None:
+                merged_metrics[k] = v
+    if merged_metrics:
+        report["metrics"] = merged_metrics
+
+    return report
+
+
 def generate_combined_report(
     estimator: Any,
     console_output: str,
     test_predictions: Optional[Any] = None,
     test_targets: Optional[Any] = None,
     additional_info: Optional[Dict[str, Any]] = None,
+    *,
+    task: Optional[str] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+    cv_info: Optional[Dict[str, Any]] = None,
+    nlp_info: Optional[Dict[str, Any]] = None,
+    specialized_info: Optional[Dict[str, Any]] = None,
+    scale_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Generate a comprehensive combined report that includes everything shown in console
     plus all structured data from ACDSO.
-    
-    Parameters
-    ----------
-    estimator : ACDSOClassifier or ACDSORegressor
-        Fitted ACDSO estimator.
-    console_output : str
-        Captured console output text.
-    test_predictions : array-like, optional
-        Test set predictions for additional metrics.
-    test_targets : array-like, optional
-        Test set true targets for additional metrics.
-    additional_info : dict, optional
-        Additional information to include in the report.
-    
-    Returns
-    -------
-    dict
-        Combined report with all information.
     """
     np, pd, accuracy_score, f1_score, r2_score, mean_squared_error, mean_absolute_error = _load_metrics_deps()
-    report = {
+    resolved_task = _infer_estimator_task(estimator, explicit_task=task)
+    report: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "acdso_version": "3.0",
         "console_output": console_output,
     }
-    
+    if resolved_task:
+        report["task"] = resolved_task
+
     # Add estimator configuration
     if hasattr(estimator, 'scorer'):
         report["configuration"] = {
@@ -132,44 +344,90 @@ def generate_combined_report(
             "max_latency_ms_per_row": getattr(estimator, 'max_latency_ms_per_row', None),
             "enable_feature_selection": getattr(estimator, 'enable_feature_selection', None),
         }
-    
+
     # Add risk report
     if hasattr(estimator, 'risk_report_') and estimator.risk_report_ is not None:
         report["risk_report"] = estimator.risk_report_
-    
+
     # Add audit trail (contains all evaluation details)
-    if hasattr(estimator, 'audit_trail_') and estimator.audit_trail_ is not None:
-        report["audit_trail"] = estimator.audit_trail_
-    
+    audit_dict = getattr(estimator, 'audit_trail_', None)
+    if isinstance(audit_dict, dict):
+        report["audit_trail"] = audit_dict
+    else:
+        audit_dict = {}
+
     # Add Pareto front
     if hasattr(estimator, 'pareto_front_') and estimator.pareto_front_ is not None:
         report["pareto_front"] = estimator.pareto_front_
-    
+
     # Add selected model information
     if hasattr(estimator, 'best_estimator_') and estimator.best_estimator_ is not None:
+        selected_info = audit_dict.get('selected') or audit_dict.get('selected_candidate') or {}
+        if not isinstance(selected_info, dict):
+            selected_info = {}
+        sel_name = (
+            selected_info.get('name')
+            or selected_info.get('algorithm')
+            or selected_info.get('strategy')
+            or selected_info.get('method')
+            or getattr(estimator, 'best_algorithm_', None)
+            or getattr(estimator, 'best_strategy_', None)
+            or getattr(estimator, 'best_method_', None)
+            or type(estimator.best_estimator_).__name__
+        )
         report["selected_model"] = {
-            "name": estimator.audit_trail_.get('selected', {}).get('name', 'Unknown') if hasattr(estimator, 'audit_trail_') and estimator.audit_trail_ else 'Unknown',
+            "name": sel_name,
             "type": type(estimator.best_estimator_).__name__,
             "pipeline_steps": [step[0] for step in estimator.best_estimator_.steps] if hasattr(estimator.best_estimator_, 'steps') else None,
         }
-        
-        # Add detailed metrics from audit trail
-        if hasattr(estimator, 'audit_trail_') and estimator.audit_trail_:
-            selected_info = estimator.audit_trail_.get('selected', {})
-            report["selected_model"]["metrics"] = {
-                "metric": selected_info.get('metric'),
-                "train_time_s": selected_info.get('train_time_s'),
-                "peak_mem_mb": selected_info.get('peak_mem_mb'),
-                "latency_ms_per_row": selected_info.get('latency_ms_per_row'),
-                "risk_penalty": selected_info.get('risk_penalty'),
-                "stress_worst_drop": selected_info.get('stress_worst_drop'),
-            }
-    
-    # Add test set performance if provided
-    if test_predictions is not None and test_targets is not None:
+        if selected_info:
+            sel_metrics: Dict[str, Any] = {}
+            for mkey in (
+                "metric",
+                "silhouette_score",
+                "davies_bouldin_score",
+                "objective",
+                "cv_objective",
+                "cv_ndcg_at_k",
+                "cv_c_index",
+                "rmse",
+                "mae",
+                "score",
+                "train_time_s",
+                "peak_mem_mb",
+                "latency_ms_per_row",
+                "risk_penalty",
+                "stress_worst_drop",
+            ):
+                if mkey in selected_info and selected_info.get(mkey) is not None:
+                    sel_metrics[mkey] = selected_info.get(mkey)
+            if sel_metrics:
+                report["selected_model"]["metrics"] = sel_metrics
+    elif estimator is not None and type(estimator).__name__ in (
+        "ACDSOClusterer",
+        "ACDSOAnomalyDetector",
+        "ACDSOSurvivalAnalyzer",
+        "ACDSORecommender",
+        "ACDSOOutOfCoreTrainer",
+    ):
+        sel_name = (
+            getattr(estimator, "best_algorithm_", None)
+            or getattr(estimator, "best_method_", None)
+            or getattr(estimator, "algorithm_", None)
+            or getattr(estimator, "backend_used_", None)
+            or type(estimator).__name__
+        )
+        report["selected_model"] = {
+            "name": str(sel_name),
+            "type": type(estimator).__name__,
+        }
+        if isinstance(metrics, dict) and metrics:
+            report["selected_model"]["metrics"] = dict(metrics)
+
+    # Add test set performance if provided for standard supervised classification/regression
+    if test_predictions is not None and test_targets is not None and resolved_task in (None, "classification", "regression"):
         try:
-            if hasattr(estimator, 'predict_proba'):
-                # Classification
+            if resolved_task == "classification" or (resolved_task is None and hasattr(estimator, 'predict_proba')):
                 test_acc = accuracy_score(test_targets, test_predictions)
                 test_f1 = f1_score(test_targets, test_predictions, average='weighted')
                 report["test_performance"] = {
@@ -177,7 +435,6 @@ def generate_combined_report(
                     "f1_weighted": float(test_f1),
                 }
             else:
-                # Regression
                 test_r2 = r2_score(test_targets, test_predictions)
                 test_mse = mean_squared_error(test_targets, test_predictions)
                 test_mae = mean_absolute_error(test_targets, test_predictions)
@@ -189,11 +446,20 @@ def generate_combined_report(
                 }
         except Exception as e:
             report["test_performance"] = {"error": str(e)}
-    
-    # Add additional information if provided
+
     if additional_info:
         report["additional_info"] = additional_info
-    
+
+    populate_task_summary_blocks(
+        report,
+        task=resolved_task,
+        estimator=estimator,
+        metrics=metrics,
+        cv_info=cv_info,
+        nlp_info=nlp_info,
+        specialized_info=specialized_info,
+        scale_info=scale_info,
+    )
     return report
 
 
@@ -249,6 +515,70 @@ def _file_link_cell(path: str) -> str:
     )
 
 
+def _render_kv_table_card(title: str, subtitle: str, mapping: Dict[str, Any]) -> str:
+    """Render an XSS-escaped HTML card containing a balanced key-value table."""
+    if not isinstance(mapping, dict) or not mapping:
+        return ""
+    rows: List[str] = []
+    sub_tables: List[str] = []
+    for key, val in mapping.items():
+        if val is None:
+            continue
+        if isinstance(val, dict) and val:
+            sub_rows = [
+                f"                <tr><th>{_esc(sk)}</th><td>{_fmt_num(sv) if (isinstance(sv, (int, float)) and not isinstance(sv, bool)) or (hasattr(sv, 'item') and not isinstance(sv, (str, bytes, bytearray))) else _esc(sv)}</td></tr>\n"
+                for sk, sv in val.items()
+                if sv is not None
+            ]
+            if sub_rows:
+                sub_tables.append(
+                    f"            <h3>{_esc(str(key).replace('_', ' ').title())}</h3>\n"
+                    f"            <table>\n{''.join(sub_rows)}            </table>\n"
+                )
+            continue
+        if isinstance(val, (list, tuple)):
+            if len(val) == 0:
+                continue
+            if all(not isinstance(item, (dict, list, tuple)) for item in val):
+                val_html = _esc(", ".join(str(item) for item in val))
+            else:
+                val_html = _esc(json.dumps(_sanitize_json_payload(val)))
+        elif isinstance(val, bool):
+            val_html = _esc(val)
+        elif isinstance(val, int):
+            val_html = _fmt_int(val)
+        elif hasattr(val, "item") and not isinstance(val, (str, bytes, bytearray)):
+            try:
+                unwrapped = val.item()
+            except Exception:
+                unwrapped = val
+            if isinstance(unwrapped, bool):
+                val_html = _esc(unwrapped)
+            elif isinstance(unwrapped, int):
+                val_html = _fmt_int(unwrapped)
+            else:
+                val_html = _fmt_num(unwrapped)
+        elif isinstance(val, float):
+            val_html = _fmt_num(val)
+        else:
+            val_html = _esc(val)
+        rows.append(f"                <tr><th>{_esc(key)}</th><td>{val_html}</td></tr>\n")
+
+    if not rows and not sub_tables:
+        return ""
+    out = f"""
+        <div class="card">
+            <h2>{_esc(title)}</h2>
+            <p class="info-text">{_esc(subtitle)}</p>
+"""
+    if rows:
+        out += "            <table>\n" + "".join(rows) + "            </table>\n"
+    if sub_tables:
+        out += "".join(sub_tables)
+    out += "        </div>\n"
+    return out
+
+
 def generate_html_report_from_combined(report: Dict[str, Any], output_path: str = None) -> str:
     """
     Generate a comprehensive HTML report from combined report data.
@@ -284,8 +614,10 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
     
     # Extract data
     mode = report.get('mode', 'demo')
+    task_label = report.get('task')
     timestamp = report.get('timestamp', 'N/A')
     acdso_version = report.get('acdso_version', '3.0')
+    task_subtitle = f'\n            <div class="subtitle">Task: {_esc(task_label)}</div>' if task_label else ''
     
     # Build HTML content
     html = f"""<!DOCTYPE html>
@@ -438,13 +770,13 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
     <div class="container">
         <div class="header">
             <h1>ACDSO {_esc(acdso_version)} Report</h1>
-            <div class="subtitle">Mode: {_esc(str(mode).title())}</div>
+            <div class="subtitle">Mode: {_esc(str(mode).title())}</div>{task_subtitle}
             <div class="subtitle">Generated: {_esc(timestamp)}</div>
         </div>
 """
-    
+
     # Add configuration section
-    if 'configuration' in report:
+    if isinstance(report.get('configuration'), dict) and report['configuration']:
         config = report['configuration']
         html += """
         <div class="card">
@@ -455,9 +787,9 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             if value is not None:
                 html += f"                <tr><th>{_esc(key)}</th><td>{_esc(value)}</td></tr>\n"
         html += "            </table>\n        </div>\n"
-    
+
     # Add selected model information
-    if 'selected_model' in report:
+    if isinstance(report.get('selected_model'), dict) and report['selected_model']:
         model = report['selected_model']
         html += f"""
         <div class="card">
@@ -469,15 +801,12 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         if 'pipeline_steps' in model and model['pipeline_steps']:
             steps_html = ' → '.join(_esc(s) for s in model['pipeline_steps'])
             html += f"                <tr><th>Pipeline Steps</th><td>{steps_html}</td></tr>\n"
-        if 'metrics' in model:
+        if isinstance(model.get('metrics'), dict) and model['metrics']:
             metrics = model['metrics']
             html += "                <tr><th colspan='2'><h3>Metrics</h3></th></tr>\n"
             for key, value in metrics.items():
                 if value is not None:
-                    if isinstance(value, float):
-                        html += f"                <tr><th>{_esc(key)}</th><td>{value:.4f}</td></tr>\n"
-                    else:
-                        html += f"                <tr><th>{_esc(key)}</th><td>{_esc(value)}</td></tr>\n"
+                    html += f"                <tr><th>{_esc(key)}</th><td>{_fmt_num(value)}</td></tr>\n"
         html += "            </table>\n"
         # Display actual execution code
         code_info = model.get('code_info', {})
@@ -491,9 +820,23 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             <pre style="background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px;"><code>{_esc(code)}</code></pre>
 """
         html += "        </div>\n"
-    
+
+    # Add R1-R6 task summary cards (metrics, clustering, anomaly, cv, nlp, specialized, scale)
+    for block_key, block_title, block_desc in (
+        ("metrics", "Task Metrics", "Primary evaluation metrics for the executed task."),
+        ("clustering", "Clustering Summary", "Unsupervised segmentation, cluster counts, and internal validation scores."),
+        ("anomaly", "Anomaly Detection Summary", "Trainable anomaly estimator configuration, thresholds, and detection rate."),
+        ("cv", "Cross-Validation & Grouping", "Entity-grouped or temporal cross-validation configuration and split validation."),
+        ("nlp", "NLP & Free-Text Featurization", "Classical text column detection and featurization settings."),
+        ("specialized", "Specialized Formulation Details", "Configuration and evaluation metrics for specialized supervised tasks."),
+        ("scale", "Out-of-Core & Scale Summary", "Chunked streaming / subsampling execution metrics and resource budget."),
+    ):
+        block_val = report.get(block_key)
+        if isinstance(block_val, dict) and block_val:
+            html += _render_kv_table_card(block_title, block_desc, block_val)
+
     # Add phase results with model names (for autonomous mode)
-    if 'phase_results' in report:
+    if isinstance(report.get('phase_results'), dict) and report['phase_results']:
         html += """
         <div class="card">
             <h2>Phase Results with Selected Models</h2>
@@ -509,17 +852,30 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                         model_name = item.get('model_name', 'N/A')
                         time_val = item.get('time', 0) or 0
                         status_class = 'success' if 'SUCCESS' in str(status) else 'error'
-                        time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
+                        time_str = _fmt_num(time_val, ".2f")
                         html += f"                <tr><td>{_esc(name)}</td><td class='{status_class}'>{_esc(status)}</td><td class='model-name'>{_esc(model_name)}</td><td>{time_str}</td></tr>\n"
                 html += "            </table>\n"
         html += "        </div>\n"
-    
+
     # Add audit trail with all candidates evaluated (ACDSO)
-    if 'audit_trail' in report and report['audit_trail']:
+    if isinstance(report.get('audit_trail'), dict) and report['audit_trail']:
         audit = report['audit_trail']
-        candidates = audit.get('candidates_evaluated', [])
-        if candidates:
-            html += """
+        candidates = audit.get('candidates_evaluated') or audit.get('candidates') or []
+        if isinstance(candidates, list) and candidates:
+            has_supervised_cols = any(
+                isinstance(c, dict) and ('metric' in c or 'train_time_s' in c)
+                for c in candidates
+            )
+            selected_raw = audit.get('selected') or audit.get('selected_candidate') or {}
+            selected = selected_raw if isinstance(selected_raw, dict) else {"name": str(selected_raw)}
+            sel_name = (
+                selected.get('name')
+                or selected.get('algorithm')
+                or selected.get('strategy')
+                or selected.get('method')
+            )
+            if has_supervised_cols:
+                html += """
         <div class="card">
             <h2>All Models Evaluated by ACDSO</h2>
             <p class="info-text">Complete list of all models tested during optimization with their scores and metrics.</p>
@@ -540,34 +896,37 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 </thead>
                 <tbody>
 """
-            for i, candidate in enumerate(candidates, 1):
-                name = candidate.get('name', 'Unknown')
-                metric = candidate.get('metric', 0) or 0
-                cv_std = candidate.get('cv_score_std', 0) or 0
-                train_time = candidate.get('train_time_s', 0) or 0
-                memory = candidate.get('peak_mem_mb', 0) or 0
-                latency = candidate.get('latency_ms_per_row', 0) or 0
-                risk_penalty = candidate.get('risk_penalty', 0) or 0
-                stress_drop = candidate.get('stress_worst_drop', None)
-                
-                # Check if this is the selected model
-                selected = audit.get('selected', {})
-                is_selected = selected.get('name') == name
-                row_class = 'selected-model' if is_selected else ''
-                status = '✓ Selected' if is_selected else 'Evaluated'
-                
-                stress_str = f"{stress_drop:.4f}" if isinstance(stress_drop, (int, float)) else (_esc(stress_drop) if stress_drop is not None else "N/A")
-                
-                # Format values safely
-                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
-                cv_std_str = f"{cv_std:.4f}" if isinstance(cv_std, (int, float)) else _esc(cv_std)
-                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
-                
-                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
-                risk_str = f"{risk_penalty:.4f}" if isinstance(risk_penalty, (int, float)) else _esc(risk_penalty)
-                
-                html += f"""                    <tr class="{row_class}">
+                for i, candidate in enumerate(candidates, 1):
+                    if not isinstance(candidate, dict):
+                        continue
+                    name = (
+                        candidate.get('name')
+                        or candidate.get('algorithm')
+                        or candidate.get('strategy')
+                        or candidate.get('method')
+                        or 'Unknown'
+                    )
+                    metric = candidate.get('metric', candidate.get('score'))
+                    cv_std = candidate.get('cv_score_std', 0) or 0
+                    train_time = candidate.get('train_time_s', 0) or 0
+                    memory = candidate.get('peak_mem_mb', 0) or 0
+                    latency = candidate.get('latency_ms_per_row', 0) or 0
+                    risk_penalty = candidate.get('risk_penalty', 0) or 0
+                    stress_drop = candidate.get('stress_worst_drop', None)
+
+                    is_selected = sel_name is not None and sel_name == name
+                    row_class = 'selected-model' if is_selected else ''
+                    status = '✓ Selected' if is_selected else 'Evaluated'
+
+                    stress_str = _fmt_num(stress_drop, ".4f") if stress_drop is not None else "N/A"
+                    metric_str = _fmt_num(metric, ".4f")
+                    cv_std_str = _fmt_num(cv_std, ".4f")
+                    train_time_str = _fmt_num(train_time, ".2f")
+                    memory_str = _fmt_num(memory, ".1f")
+                    latency_str = _fmt_num(latency, ".3f")
+                    risk_str = _fmt_num(risk_penalty, ".4f")
+
+                    html += f"""                    <tr class="{row_class}">
                         <td>{i}</td>
                         <td class="model-name">{_esc(name)}</td>
                         <td>{metric_str}</td>
@@ -580,16 +939,78 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                         <td>{status}</td>
                     </tr>
 """
-            html += """                </tbody>
+                html += """                </tbody>
             </table>
         </div>
 """
-    
+            else:
+                html += """
+        <div class="card">
+            <h2>Candidates Evaluated</h2>
+            <p class="info-text">Candidate configurations evaluated during model selection.</p>
+            <table class="models-table">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Candidate</th>
+                        <th>Primary Score</th>
+                        <th>Details</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+                for i, candidate in enumerate(candidates, 1):
+                    if not isinstance(candidate, dict):
+                        continue
+                    cname = (
+                        candidate.get('name')
+                        or candidate.get('algorithm')
+                        or candidate.get('strategy')
+                        or candidate.get('method')
+                        or f'Candidate {i}'
+                    )
+                    score_val = None
+                    for skey in (
+                        'silhouette_score',
+                        'cv_ndcg_at_k',
+                        'cv_c_index',
+                        'cv_objective',
+                        'objective',
+                        'rmse',
+                        'mae',
+                        'score',
+                        'metric',
+                    ):
+                        if candidate.get(skey) is not None:
+                            score_val = candidate.get(skey)
+                            break
+                    details = ", ".join(
+                        f"{k}={_fmt_num(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v}"
+                        for k, v in candidate.items()
+                        if k not in ('name', 'algorithm', 'strategy', 'method') and v is not None
+                    )
+                    is_selected = bool(candidate.get('selected')) or (sel_name is not None and sel_name == cname)
+                    row_class = 'selected-model' if is_selected else ''
+                    status = '✓ Selected' if is_selected else 'Evaluated'
+                    html += f"""                    <tr class="{row_class}">
+                        <td>{i}</td>
+                        <td class="model-name">{_esc(cname)}</td>
+                        <td>{_fmt_num(score_val)}</td>
+                        <td>{_esc(details or 'N/A')}</td>
+                        <td>{status}</td>
+                    </tr>
+"""
+                html += """                </tbody>
+            </table>
+        </div>
+"""
+
     # Add Pareto front models
-    if 'audit_trail' in report and report['audit_trail']:
+    if isinstance(report.get('audit_trail'), dict) and report['audit_trail']:
         audit = report['audit_trail']
-        pareto_front = audit.get('pareto_front', [])
-        if pareto_front:
+        pareto_front = audit.get('pareto_front') or []
+        if isinstance(pareto_front, list) and pareto_front:
             html += """
         <div class="card">
             <h2>Pareto Front Models (Optimal Trade-offs)</h2>
@@ -608,18 +1029,20 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 <tbody>
 """
             for model in pareto_front:
-                name = model.get('name', 'Unknown')
+                if not isinstance(model, dict):
+                    continue
+                name = model.get('name', model.get('model_name', 'Unknown'))
                 metric = model.get('metric', 0) or 0
                 train_time = model.get('train_time_s', 0) or 0
                 memory = model.get('peak_mem_mb', 0) or 0
                 latency = model.get('latency_ms_per_row', 0) or 0
                 risk_penalty = model.get('risk_penalty', 0) or 0
-                
-                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
-                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
-                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
-                risk_str = f"{risk_penalty:.4f}" if isinstance(risk_penalty, (int, float)) else _esc(risk_penalty)
+
+                metric_str = _fmt_num(metric, ".4f")
+                train_time_str = _fmt_num(train_time, ".2f")
+                memory_str = _fmt_num(memory, ".1f")
+                latency_str = _fmt_num(latency, ".3f")
+                risk_str = _fmt_num(risk_penalty, ".4f")
                 html += f"""                    <tr>
                         <td class="model-name">{_esc(name)}</td>
                         <td>{metric_str}</td>
@@ -651,10 +1074,10 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
             time_val = result.get('fit_time_s', 0) or 0
             latency = result.get('latency_ms_per_row', 0) or 0
             model_name = result.get('model_name', 'N/A')
-            score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _esc(score)
-            f1_str = f"{f1:.4f}" if isinstance(f1, (int, float)) else (_esc(f1) if f1 is not None else "N/A")
-            time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
-            latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
+            score_str = _fmt_num(score, ".4f")
+            f1_str = _fmt_num(f1, ".4f") if f1 is not None else "N/A"
+            time_str = _fmt_num(time_val, ".2f")
+            latency_str = _fmt_num(latency, ".3f")
             html += f"                <tr><td>{_esc(system)}</td><td>{_esc(dataset)}</td><td>{score_str}</td><td>{f1_str}</td><td>{time_str}</td><td>{latency_str}</td><td class='model-name'>{_esc(model_name)}</td></tr>\n"
         html += "            </table>\n"
         
@@ -762,8 +1185,8 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 fit_time = row.get('Fit Time (s)', row.get('fit_time', 'N/A'))
                 family = row.get('Family', row.get('family', 'N/A'))
                 # Format numeric values, keep strings as-is
-                score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else _esc(score_val)
-                time_str = f"{fit_time:.2f}s" if isinstance(fit_time, (int, float)) else _esc(fit_time)
+                score_str = _fmt_num(score_val, ".4f")
+                time_str = f"{_fmt_num(fit_time, '.2f')}s" if (isinstance(fit_time, (int, float)) and not isinstance(fit_time, bool) and math.isfinite(float(fit_time))) else _esc(fit_time)
                 html += f"                <tr><td>{i}</td><td class='model-name'>{_esc(model_name)}</td><td>{score_str}</td><td>{time_str}</td><td>{_esc(family)}</td></tr>\n"
             html += "            </table>\n"
         html += "        </div>\n"
@@ -791,7 +1214,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         html += "        </div>\n"
     
     # Add predictions section if available
-    if 'predictions' in report:
+    if isinstance(report.get('predictions'), dict) and report['predictions']:
         pred = report['predictions']
         html += """
         <div class="card">
@@ -811,17 +1234,17 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         )
         
         # Add statistics
-        if 'statistics' in pred:
+        if isinstance(pred.get('statistics'), dict) and pred['statistics']:
             stats = pred['statistics']
             html += "            <h3>Prediction Statistics</h3>\n            <table>\n"
             if 'mean' in stats and stats['mean'] is not None:
-                html += f"                <tr><th>Mean</th><td>{stats['mean']:.4f}</td></tr>\n"
+                html += f"                <tr><th>Mean</th><td>{_fmt_num(stats['mean'])}</td></tr>\n"
             if 'std' in stats and stats['std'] is not None:
-                html += f"                <tr><th>Std Dev</th><td>{stats['std']:.4f}</td></tr>\n"
+                html += f"                <tr><th>Std Dev</th><td>{_fmt_num(stats['std'])}</td></tr>\n"
             if 'min' in stats and stats['min'] is not None:
-                html += f"                <tr><th>Min</th><td>{stats['min']:.4f}</td></tr>\n"
+                html += f"                <tr><th>Min</th><td>{_fmt_num(stats['min'])}</td></tr>\n"
             if 'max' in stats and stats['max'] is not None:
-                html += f"                <tr><th>Max</th><td>{stats['max']:.4f}</td></tr>\n"
+                html += f"                <tr><th>Max</th><td>{_fmt_num(stats['max'])}</td></tr>\n"
             if 'distribution' in stats and stats['distribution']:
                 html += "                <tr><th>Distribution</th><td>\n"
                 for class_val, count in stats['distribution'].items():
@@ -843,8 +1266,8 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
                 pred_val = sample.get('predicted', 'N/A')
                 actual_val = sample.get('actual', 'N/A')
                 # Format values
-                pred_str = f"{pred_val:.4f}" if isinstance(pred_val, (int, float)) else _esc(pred_val)
-                actual_str = f"{actual_val:.4f}" if isinstance(actual_val, (int, float)) and actual_val is not None else (_esc(actual_val) if actual_val is not None else "N/A")
+                pred_str = _fmt_num(pred_val, ".4f")
+                actual_str = _fmt_num(actual_val, ".4f") if actual_val is not None else "N/A"
                 html += f"                <tr><td>{_esc(row_idx)}</td><td>{pred_str}</td><td>{actual_str}</td></tr>\n"
             html += "            </table>\n"
         
@@ -861,7 +1284,7 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
 """
     
     # Add summary
-    if 'summary' in report:
+    if isinstance(report.get('summary'), dict) and report['summary']:
         summary = report['summary']
         html += """
         <div class="card">
@@ -871,13 +1294,15 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
         for key, value in summary.items():
             # Format numeric values properly
             if isinstance(value, float):
-                if 'time' in key.lower():
+                if not math.isfinite(value):
+                    formatted_value = "N/A"
+                elif 'time' in key.lower():
                     formatted_value = f"{value:.1f}s"
                 elif 'rate' in key.lower() or 'percent' in key.lower():
                     formatted_value = f"{value:.1f}%"
                 else:
                     formatted_value = f"{value:.2f}"
-            elif isinstance(value, int):
+            elif isinstance(value, int) and not isinstance(value, bool):
                 formatted_value = str(value)
             else:
                 formatted_value = _esc(value)
@@ -889,29 +1314,29 @@ def generate_html_report_from_combined(report: Dict[str, Any], output_path: str 
     output_files = []
     
     # Collect all file paths from report
-    if 'html_report_path' in report:
+    if report.get('html_report_path'):
         output_files.append(("📄 Combined HTML Report", os.path.abspath(str(report.get('html_report_path', '')))))
     
-    if 'model_path' in report:
+    if report.get('model_path'):
         output_files.append(("🤖 Trained Model (.pkl)", os.path.abspath(str(report.get('model_path', '')))))
     
-    if 'audit_path' in report:
+    if report.get('audit_path'):
         output_files.append(("📋 Audit Trail (.json)", os.path.abspath(str(report.get('audit_path', '')))))
     
-    if 'predictions' in report and report['predictions'].get('output_file'):
+    if isinstance(report.get('predictions'), dict) and report['predictions'].get('output_file'):
         output_files.append(("📊 Predictions CSV", os.path.abspath(str(report['predictions'].get('output_file', '')))))
     
-    if 'eda_report_path' in report:
+    if report.get('eda_report_path'):
         output_files.append(("📈 EDA Report (embedded)", str(report.get('eda_report_path', 'Embedded in this report'))))
     
-    if 'timeseries_report_path' in report:
+    if report.get('timeseries_report_path'):
         output_files.append(("📉 Time Series Report (embedded)", str(report.get('timeseries_report_path', 'Embedded in this report'))))
     
-    if 'benchmark_report_path' in report:
+    if report.get('benchmark_report_path'):
         output_files.append(("⚡ Benchmark Report (embedded)", str(report.get('benchmark_report_path', 'Embedded in this report'))))
     
     # Include any additional files from configuration
-    config = report.get('configuration', {})
+    config = report.get('configuration') if isinstance(report.get('configuration'), dict) else {}
     if config.get('input_file'):
         output_files.append(("📁 Input Dataset", str(config.get('input_file', ''))))
     
@@ -961,6 +1386,18 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     targets = results.get("targets", [])
     target_reports = results.get("target_reports", {})
     predictions = results.get("predictions", {})
+
+    total_predictions = 0
+    for p in predictions.values():
+        if isinstance(p, dict):
+            c = p.get("count", 0)
+            if hasattr(c, "item") and not isinstance(c, (str, bytes, bytearray)):
+                try:
+                    c = c.item()
+                except Exception:
+                    pass
+            if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(float(c)):
+                total_predictions += int(c)
     
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1248,7 +1685,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 <div class="label">Predictions Made</div>
             </div>
             <div class="stat-box">
-                <div class="value">{sum(p.get('count', 0) for p in predictions.values()):,}</div>
+                <div class="value">{_fmt_int(total_predictions)}</div>
                 <div class="label">Total Predictions</div>
             </div>
             <div class="stat-box">
@@ -1271,10 +1708,10 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
 """
         if "mean" in stats:
             html += f"""
-                <div class="stat"><span>Mean:</span><span>{stats.get('mean', 0):.4f}</span></div>
-                <div class="stat"><span>Std:</span><span>{stats.get('std', 0):.4f}</span></div>
-                <div class="stat"><span>Min:</span><span>{stats.get('min', 0):.4f}</span></div>
-                <div class="stat"><span>Max:</span><span>{stats.get('max', 0):.4f}</span></div>
+                <div class="stat"><span>Mean:</span><span>{_fmt_num(stats.get('mean'))}</span></div>
+                <div class="stat"><span>Std:</span><span>{_fmt_num(stats.get('std'))}</span></div>
+                <div class="stat"><span>Min:</span><span>{_fmt_num(stats.get('min'))}</span></div>
+                <div class="stat"><span>Max:</span><span>{_fmt_num(stats.get('max'))}</span></div>
 """
         elif "distribution" in stats:
             dist = stats.get("distribution", {})
@@ -1283,7 +1720,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 <div class="stat"><span>Class {_esc(k)}:</span><span>{_esc(v)}</span></div>
 """
         pred_count = pred.get('count', 0)
-        pred_count_str = f"{pred_count:,}" if isinstance(pred_count, (int, float)) else _esc(pred_count)
+        pred_count_str = _fmt_int(pred_count)
         html += f"""
                 <div class="stat"><span>Predictions:</span><span>{pred_count_str}</span></div>
                 <div class="stat"><span>Output:</span><span style="font-size:0.8em;">{_esc(os.path.basename(pred.get('output_file', 'N/A')))}</span></div>
@@ -1310,7 +1747,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
     # Add tab content for each target
     for i, target in enumerate(targets):
         active = "active" if i == 0 else ""
-        report = target_reports.get(target, {})
+        report = target_reports.get(target, {}) or {}
         
         html += f"""
             <div id="tab-panel-{i}" class="tab-content {active}">
@@ -1318,10 +1755,10 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
 """
         
         # Selected Model (from the actual combined report structure)
-        selected_model = report.get("selected_model", {})
-        if selected_model:
+        selected_model = report.get("selected_model") or {}
+        if isinstance(selected_model, dict) and selected_model:
             model_name = selected_model.get('name', 'N/A')
-            metrics = selected_model.get('metrics', {})
+            metrics = selected_model.get('metrics') or {}
             html += f"""
                 <h4>🤖 Selected Model</h4>
                 <table>
@@ -1330,16 +1767,13 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
 """
             for key, value in metrics.items():
                 if value is not None:
-                    if isinstance(value, float):
-                        html += f"                    <tr><td>{_esc(key)}</td><td>{value:.4f}</td></tr>\n"
-                    else:
-                        html += f"                    <tr><td>{_esc(key)}</td><td>{_esc(value)}</td></tr>\n"
+                    html += f"                    <tr><td>{_esc(key)}</td><td>{_fmt_num(value)}</td></tr>\n"
             html += """                </table>
 """
         
         # All Models Evaluated (from audit_trail.candidates_evaluated)
-        audit_trail = report.get("audit_trail", {})
-        candidates = audit_trail.get("candidates_evaluated", [])
+        audit_trail = report.get("audit_trail") or {}
+        candidates = audit_trail.get("candidates_evaluated", []) if isinstance(audit_trail, dict) else []
         if candidates:
             html += """
                 <h4>📋 All Models Evaluated</h4>
@@ -1356,12 +1790,12 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 risk = c.get('risk_penalty', 0) or 0
                 
                 # Format values safely
-                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
-                cv_std_str = f"{cv_std:.4f}" if isinstance(cv_std, (int, float)) else _esc(cv_std)
-                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
-                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
-                risk_str = f"{risk:.4f}" if isinstance(risk, (int, float)) else _esc(risk)
+                metric_str = _fmt_num(metric, ".4f")
+                cv_std_str = _fmt_num(cv_std, ".4f")
+                train_time_str = _fmt_num(train_time, ".2f")
+                memory_str = _fmt_num(memory, ".1f")
+                latency_str = _fmt_num(latency, ".3f")
+                risk_str = _fmt_num(risk, ".4f")
                 
                 html += f"""
                     <tr>
@@ -1379,7 +1813,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
 """
         
         # Pareto Front Models
-        pareto_front = audit_trail.get("pareto_front", [])
+        pareto_front = audit_trail.get("pareto_front", []) if isinstance(audit_trail, dict) else []
         if pareto_front:
             html += """
                 <h4>⚖️ Pareto Front Models (Optimal Trade-offs)</h4>
@@ -1393,10 +1827,10 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 memory = p.get('peak_mem_mb', 0) or 0
                 latency = p.get('latency_ms_per_row', 0) or 0
                 
-                metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else _esc(metric)
-                train_time_str = f"{train_time:.2f}" if isinstance(train_time, (int, float)) else _esc(train_time)
-                memory_str = f"{memory:.1f}" if isinstance(memory, (int, float)) else _esc(memory)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
+                metric_str = _fmt_num(metric, ".4f")
+                train_time_str = _fmt_num(train_time, ".2f")
+                memory_str = _fmt_num(memory, ".1f")
+                latency_str = _fmt_num(latency, ".3f")
                 
                 html += f"""
                     <tr>
@@ -1421,7 +1855,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                 <table>
                     <tr><th>Metric</th><th>Value</th></tr>
                     <tr><td>Best Model</td><td><span class="badge badge-success">{_esc(best_model)}</span></td></tr>
-                    <tr><td>RMSE</td><td>{_esc(rmse)}</td></tr>
+                    <tr><td>RMSE</td><td>{_fmt_num(rmse, ".4f")}</td></tr>
                 </table>
 """
         
@@ -1438,9 +1872,9 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                     html += f"""
                     <tr>
                         <td>{_esc(row.get('System', row.get('system', 'N/A')))}</td>
-                        <td>{_esc(row.get('RMSE', row.get('rmse', 'N/A')))}</td>
-                        <td>{_esc(row.get('MAE', row.get('mae', 'N/A')))}</td>
-                        <td>{_esc(row.get('Time(s)', row.get('time', 'N/A')))}</td>
+                        <td>{_fmt_num(row.get('RMSE', row.get('rmse', 'N/A')), ".4f")}</td>
+                        <td>{_fmt_num(row.get('MAE', row.get('mae', 'N/A')), ".4f")}</td>
+                        <td>{_fmt_num(row.get('Time(s)', row.get('time', 'N/A')), ".2f")}</td>
                     </tr>
 """
             html += """                </table>
@@ -1456,14 +1890,17 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
 """
             for res in bench_results:
                 system = res.get('system', 'N/A')
-                score = res.get('test_score', 0) or 0
-                time_val = res.get('fit_time_s', 0) or 0
-                latency = res.get('latency_ms_per_row', 0) or 0
+                raw_score = res.get('test_score')
+                score = 0 if raw_score is None else raw_score
+                raw_time = res.get('fit_time_s')
+                time_val = 0 if raw_time is None else raw_time
+                raw_lat = res.get('latency_ms_per_row')
+                latency = 0 if raw_lat is None else raw_lat
                 model_name = res.get('model_name', 'N/A')
                 
-                score_str = f"{score:.4f}" if isinstance(score, (int, float)) else _esc(score)
-                time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
-                latency_str = f"{latency:.3f}" if isinstance(latency, (int, float)) else _esc(latency)
+                score_str = _fmt_num(score, ".4f")
+                time_str = _fmt_num(time_val, ".2f")
+                latency_str = _fmt_num(latency, ".3f")
                 
                 html += f"""
                     <tr>
@@ -1483,14 +1920,16 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
             quality_score = eda_report.get('quality_score', 'N/A')
             n_rows = eda_report.get('n_rows', 'N/A')
             n_cols = eda_report.get('n_cols', 'N/A')
-            n_rows_str = f"{n_rows:,}" if isinstance(n_rows, (int, float)) else _esc(n_rows)
+            n_rows_str = _fmt_int(n_rows)
+            n_cols_str = _fmt_int(n_cols)
+            quality_str = _fmt_num(quality_score, "g")
             html += f"""
                 <h4>🔍 EDA Summary</h4>
                 <table>
                     <tr><th>Metric</th><th>Value</th></tr>
-                    <tr><td>Quality Score</td><td><span class="badge badge-success">{_esc(quality_score)}/100</span></td></tr>
+                    <tr><td>Quality Score</td><td><span class="badge badge-success">{quality_str}/100</span></td></tr>
                     <tr><td>Rows</td><td>{n_rows_str}</td></tr>
-                    <tr><td>Columns</td><td>{_esc(n_cols)}</td></tr>
+                    <tr><td>Columns</td><td>{n_cols_str}</td></tr>
                 </table>
 """
         
@@ -1519,9 +1958,10 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
                             name = item.get('name', 'N/A')
                             status = item.get('status', 'N/A')
                             model = item.get('model_name', 'N/A') or 'N/A'
-                            time_val = item.get('time', 0) or 0
+                            raw_time = item.get('time')
+                            time_val = 0 if raw_time is None else raw_time
                             status_class = 'badge-success' if 'SUCCESS' in str(status) else 'badge-warning'
-                            time_str = f"{time_val:.2f}" if isinstance(time_val, (int, float)) else _esc(time_val)
+                            time_str = _fmt_num(time_val, ".2f")
                             status_str = str(status)
                             status_disp = status_str[:50] if len(status_str) > 50 else status_str
                             html += f"""
@@ -1552,7 +1992,7 @@ def _generate_multi_target_html_report(results: Dict[str, Any], base_name: str) 
         pred_file = pred.get('output_file')
         pred_href = _esc(_file_uri(pred_file)) if pred_file else '#'
         pred_count = pred.get('count', 0)
-        pred_count_str = f"{pred_count:,}" if isinstance(pred_count, (int, float)) else _esc(pred_count)
+        pred_count_str = _fmt_int(pred_count)
         html += f"""
                 <div class="prediction-box">
                     <h4>🎯 {_esc(target)}</h4>

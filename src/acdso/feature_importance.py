@@ -59,6 +59,13 @@ from scipy import stats
 from scipy.cluster import hierarchy
 from scipy.spatial.distance import squareform
 
+from acdso.cv import (
+    build_cv_splitter,
+    iter_cv_splits,
+    resolve_cv_strategy_name,
+    validate_groups,
+)
+
 
 @dataclass
 class FeatureImportanceResult:
@@ -146,7 +153,9 @@ class SafeImportanceReport:
     scorer: str = "accuracy"
     reliable_count: int = 0
     warnings: List[str] = field(default_factory=list)
-    
+    cv_strategy: str = "auto"
+    n_groups: Optional[int] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "features": [f.to_dict() for f in self.features],
@@ -157,6 +166,8 @@ class SafeImportanceReport:
             "scorer": self.scorer,
             "reliable_count": self.reliable_count,
             "warnings": self.warnings,
+            "cv_strategy": self.cv_strategy,
+            "n_groups": self.n_groups,
         }
     
     def get_top_features(self, n: int = 10, reliable_only: bool = True) -> List[str]:
@@ -248,6 +259,7 @@ class SafeFeatureImportance:
         random_state: int = 42,
         n_jobs: int = -1,
         verbose: int = 0,
+        cv_strategy: str = "auto",
     ):
         self.estimator = estimator
         self.scorer = scorer
@@ -259,11 +271,13 @@ class SafeFeatureImportance:
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
+        self.cv_strategy = cv_strategy
         
         # Results
         self.report_: Optional[SafeImportanceReport] = None
         self.feature_names_: List[str] = []
         self.correlation_matrix_: Optional[np.ndarray] = None
+        self._last_cv_strategy_: str = cv_strategy
     
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -314,9 +328,9 @@ class SafeFeatureImportance:
 
     @staticmethod
     def _has_expanding_or_dropping_step(obj: Any) -> bool:
-        """Check whether pre-final pipeline steps contain OneHotEncoder or feature selectors."""
+        """Check whether pre-final pipeline steps change feature dimensionality."""
         cls_name = type(obj).__name__
-        if "OneHotEncoder" in cls_name or "Select" in cls_name:
+        if any(tok in cls_name for tok in ("OneHotEncoder", "Select", "TextFeaturizer", "Vectorizer", "PCA", "SVD")):
             return True
         if hasattr(obj, "steps"):
             return any(SafeFeatureImportance._has_expanding_or_dropping_step(s) for _, s in obj.steps)
@@ -350,6 +364,11 @@ class SafeFeatureImportance:
         )
 
         resolved_scorer = self._resolve_scorer(pipeline)
+        if is_classifier(pipeline):
+            if len(np.unique(y_train)) < 2:
+                return np.zeros(n_features, dtype=float)
+            if isinstance(resolved_scorer, str) and "roc_auc" in resolved_scorer and len(np.unique(y_val)) < 2:
+                return np.zeros(n_features, dtype=float)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -383,16 +402,19 @@ class SafeFeatureImportance:
             except Exception:
                 model = pipeline
 
-            result = permutation_importance(
-                model,
-                X_val,
-                y_val,
-                n_repeats=self.n_repeats,
-                random_state=seed,
-                n_jobs=inner_n_jobs,
-                scoring=resolved_scorer,
-            )
-            return np.asarray(result.importances_mean, dtype=float)
+            try:
+                result = permutation_importance(
+                    model,
+                    X_val,
+                    y_val,
+                    n_repeats=self.n_repeats,
+                    random_state=seed,
+                    n_jobs=inner_n_jobs,
+                    scoring=resolved_scorer,
+                )
+                return np.asarray(result.importances_mean, dtype=float)
+            except Exception:
+                return np.zeros(n_features, dtype=float)
 
     def _compute_correlations(self, X: pd.DataFrame) -> Tuple[np.ndarray, Dict[int, List[str]]]:
         """Compute correlation matrix and identify correlated groups."""
@@ -401,8 +423,8 @@ class SafeFeatureImportance:
         if len(numeric_cols) < 2:
             return np.eye(len(numeric_cols)), {}
 
-        X_numeric = X[numeric_cols]
-        X_numeric = X_numeric.fillna(X_numeric.median())
+        X_numeric = X[numeric_cols].astype(float).replace([np.inf, -np.inf], np.nan)
+        X_numeric = X_numeric.fillna(X_numeric.median()).fillna(0.0)
 
         corr_matrix = np.nan_to_num(np.abs(X_numeric.corr().values), nan=0.0)
         np.fill_diagonal(corr_matrix, 0.0)
@@ -448,22 +470,46 @@ class SafeFeatureImportance:
         self,
         X: pd.DataFrame,
         y: np.ndarray,
+        groups: Optional[np.ndarray] = None,
+        cv_strategy: str = "auto",
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Compute cross-validated permutation importance (DataFrame-safe, bounded parallel)."""
         y_arr = np.asarray(y)
         pipeline = self._get_pipeline()
 
-        if is_classifier(pipeline) or (
+        is_clf = is_classifier(pipeline) or (
             not hasattr(pipeline, "_estimator_type") and len(np.unique(y_arr)) <= 10
-        ):
+        )
+        task = "classification" if is_clf else "regression"
+
+        is_temporal = isinstance(cv_strategy, str) and cv_strategy.strip().lower() == "temporal"
+        if is_temporal:
+            n_splits = self.cv_folds
+        elif groups is not None:
+            n_uniq_g = int(len(np.unique(groups)))
+            n_splits = max(2, min(self.cv_folds, n_uniq_g))
+        elif is_clf:
             _, counts = np.unique(y_arr, return_counts=True)
             n_splits = max(2, min(self.cv_folds, int(counts.min()))) if counts.size else self.cv_folds
-            cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
         else:
             n_splits = max(2, min(self.cv_folds, len(y_arr) // 2))
-            cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
 
-        splits = list(cv.split(X, y_arr))
+        cv = build_cv_splitter(
+            cv=n_splits,
+            y=y_arr,
+            groups=groups,
+            task=task,
+            cv_strategy=cv_strategy,
+            random_state=self.random_state,
+        )
+        self._last_cv_strategy_ = resolve_cv_strategy_name(cv)
+        splits = iter_cv_splits(
+            cv,
+            X,
+            y_arr,
+            groups,
+            validate_groups_leakage=(groups is not None and not is_temporal),
+        )
         rng = np.random.RandomState(self.random_state)
         seeds = [int(rng.randint(0, 2**31 - 1)) for _ in splits]
         n_workers = self._resolve_workers(len(splits))
@@ -495,6 +541,7 @@ class SafeFeatureImportance:
         self,
         X: pd.DataFrame,
         y: np.ndarray,
+        groups: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Compute importance stability via bootstrap (DataFrame-safe, bounded parallel)."""
         y_arr = np.asarray(y)
@@ -502,11 +549,30 @@ class SafeFeatureImportance:
         if self.n_bootstrap <= 0:
             return np.ones(n_features, dtype=float)
 
+        pipeline = self._get_pipeline()
         rng = np.random.RandomState(self.random_state)
-        boot_indices = [rng.choice(n_samples, size=n_samples, replace=True) for _ in range(self.n_bootstrap)]
+        if groups is not None:
+            codes, uniques = pd.factorize(pd.Series(groups, dtype=object), sort=False)
+            n_uniq = len(uniques)
+            group_rows = [np.flatnonzero(codes == g) for g in range(n_uniq)]
+            is_clf = is_classifier(pipeline) or (
+                not hasattr(pipeline, "_estimator_type") and len(np.unique(y_arr)) <= 10
+            )
+            n_global_classes = len(np.unique(y_arr)) if is_clf else 0
+            boot_indices = []
+            for _ in range(self.n_bootstrap):
+                idx = np.concatenate([group_rows[g] for g in rng.choice(n_uniq, size=n_uniq, replace=True)])
+                if is_clf and n_global_classes >= 2 and len(np.unique(y_arr[idx])) < 2:
+                    for _retry in range(5):
+                        cand = np.concatenate([group_rows[g] for g in rng.choice(n_uniq, size=n_uniq, replace=True)])
+                        if len(np.unique(y_arr[cand])) >= 2:
+                            idx = cand
+                            break
+                boot_indices.append(idx)
+        else:
+            boot_indices = [rng.choice(n_samples, size=n_samples, replace=True) for _ in range(self.n_bootstrap)]
         seeds = [int(rng.randint(0, 2**31 - 1)) for _ in range(self.n_bootstrap)]
 
-        pipeline = self._get_pipeline()
         n_workers = self._resolve_workers(self.n_bootstrap)
         inner_n_jobs = 1 if n_workers > 1 else self.n_jobs
 
@@ -541,6 +607,8 @@ class SafeFeatureImportance:
         self,
         X: Union[pd.DataFrame, np.ndarray],
         y: Union[pd.Series, np.ndarray],
+        groups: Optional[Any] = None,
+        cv_strategy: Optional[str] = None,
     ) -> SafeImportanceReport:
         """
         Compute safe feature importance.
@@ -551,6 +619,10 @@ class SafeFeatureImportance:
             Features.
         y : Series or array
             Target.
+        groups : array-like, optional
+            Entity/group identifiers aligned with X and y for grouped CV and cluster bootstrap.
+        cv_strategy : str, optional
+            Override the instance ``cv_strategy`` for this call.
             
         Returns
         -------
@@ -563,6 +635,30 @@ class SafeFeatureImportance:
         
         self.feature_names_ = list(X.columns)
         y_arr = np.asarray(y)
+        if len(y_arr) != len(X):
+            raise ValueError(f"X and y must have the same number of samples (got {len(X)} vs {len(y_arr)}).")
+
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
+        groups_arr: Optional[np.ndarray] = None
+        n_groups: Optional[int] = None
+        if groups is not None:
+            groups_arr = validate_groups(groups, n_samples=len(X), min_unique=2)
+            n_groups = int(len(np.unique(groups_arr)))
+
+        pipeline = self._get_pipeline()
+        is_clf = is_classifier(pipeline) or (
+            not hasattr(pipeline, "_estimator_type") and len(np.unique(y_arr)) <= 10
+        )
+        probe_task = "classification" if is_clf else "regression"
+        probe_splitter = build_cv_splitter(
+            cv=self.cv_folds,
+            y=y_arr,
+            groups=groups_arr,
+            task=probe_task,
+            cv_strategy=eff_strategy,
+            random_state=self.random_state,
+        )
+        resolved_strategy = resolve_cv_strategy_name(probe_splitter)
         
         self._log(f"Computing safe importance for {len(self.feature_names_)} features")
         
@@ -572,11 +668,13 @@ class SafeFeatureImportance:
         
         # Step 2: Cross-validated permutation importance
         self._log("Computing cross-validated permutation importance...")
-        mean_importance, std_importance = self._compute_cv_importance(X, y_arr)
+        mean_importance, std_importance = self._compute_cv_importance(
+            X, y_arr, groups=groups_arr, cv_strategy=eff_strategy
+        )
         
         # Step 3: Stability analysis
         self._log("Analyzing importance stability...")
-        stability = self._compute_stability(X, y_arr)
+        stability = self._compute_stability(X, y_arr, groups=groups_arr)
         
         # Step 4: Build feature results
         warnings = []
@@ -652,6 +750,8 @@ class SafeFeatureImportance:
             scorer=self._resolve_scorer(),
             reliable_count=reliable_count,
             warnings=warnings,
+            cv_strategy=getattr(self, "_last_cv_strategy_", resolved_strategy),
+            n_groups=n_groups,
         )
         
         self._log(f"Done. {reliable_count}/{len(features)} features have reliable importance.")
@@ -744,6 +844,8 @@ def compute_safe_importance(
     y: Union[pd.Series, np.ndarray],
     scorer: str = "accuracy",
     verbose: int = 0,
+    groups: Optional[Any] = None,
+    cv_strategy: str = "auto",
 ) -> SafeImportanceReport:
     """
     Convenience function to compute safe feature importance.
@@ -760,6 +862,10 @@ def compute_safe_importance(
         Scoring metric.
     verbose : int
         Verbosity level.
+    groups : array-like, optional
+        Entity/group identifiers aligned with X and y.
+    cv_strategy : str, default="auto"
+        Cross-validation strategy.
         
     Returns
     -------
@@ -774,6 +880,11 @@ def compute_safe_importance(
     >>> report = compute_safe_importance(clf, X_train, y_train)
     >>> print(report.get_top_features(10))
     """
-    fi = SafeFeatureImportance(estimator, scorer=scorer, verbose=verbose)
-    return fi.compute(X, y)
+    fi = SafeFeatureImportance(
+        estimator,
+        scorer=scorer,
+        verbose=verbose,
+        cv_strategy=cv_strategy,
+    )
+    return fi.compute(X, y, groups=groups, cv_strategy=cv_strategy)
 

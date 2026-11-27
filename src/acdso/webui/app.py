@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
+from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 
 # src/acdso/webui/app.py -> src/acdso/webui -> src/acdso -> src -> <repo root>
@@ -102,9 +103,130 @@ FLAGS: tuple[Flag, ...] = (
     ),
     Flag(
         "task", "--task", "choice", "Task type",
-        "Leave on 'auto' to let ACDSO infer classification vs regression.",
-        default="auto", choices=("auto", "classification", "regression"),
+        "Leave on 'auto' to let ACDSO infer classification vs regression, or pick a specialized task.",
+        default="auto",
+        choices=(
+            "auto",
+            "classification",
+            "regression",
+            "clustering",
+            "anomaly",
+            "multilabel",
+            "ranking",
+            "survival",
+            "recommender",
+        ),
         group="Target", tier="core",
+    ),
+    # --- Columns & Grouping ----------------------------------------------
+    Flag(
+        "group_col", "--group-col", "columns", "Group column",
+        "Entity/group column for grouped CV (GroupKFold / StratifiedGroupKFold).",
+        group="Cross-Validation", tier="advanced",
+    ),
+    Flag(
+        "cv_strategy", "--cv-strategy", "choice", "CV strategy",
+        "Cross-validation splitting strategy.",
+        default="auto",
+        choices=("auto", "kfold", "stratified", "group_kfold", "stratified_group_kfold", "temporal"),
+        group="Cross-Validation", tier="advanced",
+    ),
+    # --- Classical NLP ---------------------------------------------------
+    Flag(
+        "text_cols", "--text-cols", "columns", "Text columns",
+        "Comma-separated free-text columns for classical NLP featurization.",
+        group="NLP", tier="advanced",
+    ),
+    Flag(
+        "nlp_method", "--nlp-method", "choice", "NLP method",
+        "Classical NLP featurization method.",
+        default="auto",
+        choices=("auto", "tfidf", "ngram", "lda", "nmf", "combined"),
+        group="NLP", tier="advanced",
+    ),
+    # --- Clustering ------------------------------------------------------
+    Flag(
+        "cluster_algo", "--cluster-algo", "choice", "Cluster algorithm",
+        "Clustering algorithm for --task clustering.",
+        default="auto",
+        choices=("auto", "kmeans", "hdbscan", "gmm"),
+        group="Clustering", tier="advanced",
+    ),
+    Flag(
+        "n_clusters", "--n-clusters", "int", "Number of clusters",
+        "Target number of clusters (>= 2) for clustering.",
+        default=None, group="Clustering", tier="advanced",
+    ),
+    Flag(
+        "dim_reduce", "--dim-reduce", "choice", "Dim reduction",
+        "Dimensionality reduction pipeline before clustering.",
+        default="none",
+        choices=("none", "pca", "umap"),
+        group="Clustering", tier="advanced",
+    ),
+    Flag(
+        "cluster_metric", "--cluster-metric", "choice", "Cluster metric",
+        "Internal cluster validation metric for auto tuning.",
+        default="silhouette",
+        choices=("silhouette", "davies_bouldin"),
+        group="Clustering", tier="advanced",
+    ),
+    # --- Anomaly Detection -----------------------------------------------
+    Flag(
+        "anomaly_algo", "--anomaly-algo", "choice", "Anomaly algorithm",
+        "Anomaly detection algorithm for --task anomaly.",
+        default="auto",
+        choices=("auto", "isolation_forest", "lof", "ocsvm"),
+        group="Anomaly", tier="advanced",
+    ),
+    Flag(
+        "contamination", "--contamination", "text", "Contamination",
+        "Expected anomaly proportion ('auto' or float in (0.0, 0.5]).",
+        default="auto", group="Anomaly", tier="advanced",
+    ),
+    # --- Specialized Supervised ------------------------------------------
+    Flag(
+        "event_col", "--event-col", "columns", "Event column",
+        "Event indicator column (1=event, 0=censored) for --task survival.",
+        group="Specialized", tier="advanced",
+    ),
+    Flag(
+        "time_col", "--time-col", "columns", "Time column",
+        "Time-to-event column for --task survival.",
+        group="Specialized", tier="advanced",
+    ),
+    Flag(
+        "query_col", "--query-col", "columns", "Query group column",
+        "Query group identifier column for --task ranking.",
+        group="Specialized", tier="advanced",
+    ),
+    Flag(
+        "user_col", "--user-col", "columns", "User column",
+        "User identifier column for --task recommender.",
+        group="Specialized", tier="advanced",
+    ),
+    Flag(
+        "item_col", "--item-col", "columns", "Item column",
+        "Item identifier column for --task recommender.",
+        group="Specialized", tier="advanced",
+    ),
+    Flag(
+        "rating_col", "--rating-col", "columns", "Rating column",
+        "Optional explicit rating/interaction column for --task recommender.",
+        group="Specialized", tier="advanced",
+    ),
+    # --- Out-of-Core Scale -----------------------------------------------
+    Flag(
+        "chunk_size", "--chunk-size", "int", "Chunk size",
+        "Row chunk size (>= 1) for streaming/out-of-core execution.",
+        default=50000, group="Scale", tier="advanced",
+    ),
+    Flag(
+        "scale_mode", "--scale-mode", "choice", "Scale mode",
+        "Execution memory mode: auto, in_memory, chunked, or subsample.",
+        default="auto",
+        choices=("auto", "in_memory", "chunked", "subsample"),
+        group="Scale", tier="advanced",
     ),
     # --- Columns ---------------------------------------------------------
     Flag(
@@ -1030,8 +1152,19 @@ def build_argv(payload: dict[str, Any], data_file: Path | None) -> list[str]:
     if data_file is not None:
         argv += ["--file", str(data_file)]
 
+    raw_task = payload.get("task")
+    if raw_task not in (None, ""):
+        if isinstance(raw_task, bool) or not isinstance(raw_task, str):
+            raise ValueError("Task type must be a string")
+        task_norm = raw_task.strip().lower()
+    else:
+        task_norm = "auto"
+
     for flag in FLAGS:
         value = payload.get(flag.name)
+
+        if flag.name in ("predict", "target") and task_norm in ("clustering", "anomaly", "recommender"):
+            continue
 
         if flag.kind == "bool":
             if bool(value):
@@ -1052,26 +1185,67 @@ def build_argv(payload: dict[str, Any], data_file: Path | None) -> list[str]:
                 raise ValueError(f"{flag.label}: expected an integer, got boolean")
             try:
                 num = float(value)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError(f"{flag.label}: expected an integer, got {value!r}") from exc
             if not math.isfinite(num) or int(num) != num:
                 raise ValueError(f"{flag.label}: expected an integer, got {value!r}")
-            argv += [flag.cli, str(int(num))]
+            ival = int(num)
+            if flag.name == "n_clusters" and ival < 2:
+                raise ValueError(f"{flag.label}: must be >= 2")
+            if flag.name in ("chunk_size", "horizon", "time_budget") and ival < 1:
+                raise ValueError(f"{flag.label}: must be >= 1")
+            argv += [flag.cli, str(ival)]
         elif flag.kind == "float":
             if isinstance(value, bool):
                 raise ValueError(f"{flag.label}: expected a number, got boolean")
-            num = float(value)
+            try:
+                num = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{flag.label}: must be a finite number") from exc
             if not math.isfinite(num):
                 raise ValueError(f"{flag.label}: must be a finite number")
             argv += [flag.cli, str(num)]
         elif flag.kind == "choice":
-            text = str(value)
+            if isinstance(value, bool) or not isinstance(value, str):
+                raise ValueError(f"{flag.label}: expected one of {flag.choices}")
+            text = value.strip()
+            if flag.name == "task":
+                text = text.lower()
             if text not in flag.choices:
                 raise ValueError(f"{flag.label}: {text!r} is not one of {flag.choices}")
             if text != flag.default:
                 argv += [flag.cli, text]
+        elif flag.name == "contamination":
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError(
+                    f"{flag.label}: must be 'auto' or a finite number in (0.0, 0.5]"
+                )
+            if isinstance(value, str):
+                text = value.strip()
+                if not text or text.lower() == "auto":
+                    continue
+                try:
+                    c_val = float(text)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"{flag.label}: must be 'auto' or a finite number in (0.0, 0.5]"
+                    ) from exc
+            else:
+                try:
+                    c_val = float(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"{flag.label}: must be 'auto' or a finite number in (0.0, 0.5]"
+                    ) from exc
+            if not math.isfinite(c_val) or c_val <= 0.0 or c_val > 0.5:
+                raise ValueError(
+                    f"{flag.label}: must be 'auto' or a finite number in (0.0, 0.5]"
+                )
+            argv += [flag.cli, str(c_val)]
         else:
-            text = str(value)
+            if isinstance(value, bool) or not isinstance(value, str):
+                raise ValueError(f"{flag.label}: expected text value")
+            text = value.strip()
             if flag.name == "output":
                 if "\x00" in text:
                     raise ValueError("Output path contains invalid NUL byte")
@@ -1195,10 +1369,39 @@ def artifacts_since(started_at: float) -> list[dict[str, Any]]:
 def _write_forecast_csv(result: dict[str, Any], upload_name: str) -> str:
     """Write history+forecast to a uniquely time-stamped CSV in ``reports/``."""
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    base = Path(secure_filename(upload_name)).stem or "data"
-    safe_col = re.sub(r"[^A-Za-z0-9]+", "_", result["value_col"]).strip("_") or "value"
+    base = (Path(secure_filename(upload_name)).stem or "data")[:24].strip("._-") or "data"
+    safe_col = (
+        re.sub(r"[^A-Za-z0-9]+", "_", result["value_col"]).strip("_")[:20].strip("_")
+        or "value"
+    )
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"forecast_{base}_{safe_col}_{stamp}_{uuid.uuid4().hex[:6]}.csv"
+    uid6 = uuid.uuid4().hex[:6]
+    name = f"forecast_{base}_{safe_col}_{stamp}_{uid6}.csv"
+
+    # Keep total path within Windows MAX_PATH (250 chars) against resolved REPORTS_DIR.
+    reports_len = len(str(REPORTS_DIR.resolve()))
+    max_name_len = 250 - reports_len - 1
+    if len(name) > max_name_len:
+        fixed_len = len("forecast_") + 2 + len(stamp) + 1 + len(uid6) + len(".csv")
+        avail = max_name_len - fixed_len
+        if avail >= 2:
+            b_lim = max(1, min(len(base), avail // 2))
+            c_lim = max(1, min(len(safe_col), avail - b_lim))
+            b_trim = base[:b_lim].strip("._-")
+            c_trim = safe_col[:c_lim].strip("_")
+            if b_trim and c_trim:
+                name = f"forecast_{b_trim}_{c_trim}_{stamp}_{uid6}.csv"
+            elif b_trim:
+                name = f"forecast_{b_trim}_{stamp}_{uid6}.csv"
+            elif c_trim:
+                name = f"forecast_{c_trim}_{stamp}_{uid6}.csv"
+            else:
+                name = f"forecast_{stamp}_{uid6}.csv"
+        else:
+            name = f"forecast_{stamp}_{uid6}.csv"
+        if len(name) > max_name_len:
+            name = f"forecast_{stamp}_{uid6}.csv"
+
     path = REPORTS_DIR / name
 
     is_bytes = bool(re.search(r"\(B\)|bytes?\b", result["value_col"], re.IGNORECASE))
@@ -1280,13 +1483,28 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
     if kind == "audit":
         audit = cleaned
 
-    candidates = audit.get("candidates_evaluated") or cleaned.get("candidates_evaluated") or []
-    pareto_front = audit.get("pareto_front") or cleaned.get("pareto_front") or []
-    pruned_or_failed = audit.get("pruned_or_failed") or cleaned.get("pruned_or_failed") or []
+    def _pick_list(*vals: Any) -> list[Any]:
+        for v in vals:
+            if isinstance(v, list) and v:
+                return list(v)
+        return []
 
-    selected_model = cleaned.get("selected_model")
-    if selected_model is None and isinstance(audit.get("selected"), dict):
-        selected_model = audit.get("selected")
+    candidates = _pick_list(
+        audit.get("candidates_evaluated"),
+        audit.get("candidates"),
+        cleaned.get("candidates_evaluated"),
+        cleaned.get("candidates"),
+    )
+    pareto_front = _pick_list(audit.get("pareto_front"), cleaned.get("pareto_front"))
+    pruned_or_failed = _pick_list(audit.get("pruned_or_failed"), cleaned.get("pruned_or_failed"))
+
+    raw_selected = cleaned.get("selected_model")
+    selected_model = raw_selected if isinstance(raw_selected, dict) else None
+    if selected_model is None:
+        if isinstance(audit.get("selected"), dict):
+            selected_model = audit.get("selected")
+        elif isinstance(audit.get("selected_candidate"), dict):
+            selected_model = audit.get("selected_candidate")
 
     phase_results = cleaned.get("phase_results")
     phases: list[dict[str, Any]] = []
@@ -1297,10 +1515,14 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(phase_results, list):
         phases = [item for item in phase_results if isinstance(item, dict)]
 
-    summary = cleaned.get("summary") or {}
-    dataset_info = cleaned.get("dataset_info") or {}
-    risk_report = cleaned.get("risk_report") or audit.get("risk_report")
-    eda_report = cleaned.get("eda_report")
+    summary = cleaned.get("summary") if isinstance(cleaned.get("summary"), dict) else {}
+    dataset_info = cleaned.get("dataset_info") if isinstance(cleaned.get("dataset_info"), dict) else {}
+    risk_report = (
+        cleaned.get("risk_report")
+        if isinstance(cleaned.get("risk_report"), dict)
+        else (audit.get("risk_report") if isinstance(audit.get("risk_report"), dict) else None)
+    )
+    eda_report = cleaned.get("eda_report") if isinstance(cleaned.get("eda_report"), dict) else None
     target_reports_out: dict[str, Any] | None = None
 
     if isinstance(cleaned.get("target_reports"), dict):
@@ -1313,21 +1535,21 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
                 (tr for tr in target_reports_out.values() if tr.get("selected_model") is not None),
                 next(iter(target_reports_out.values())),
             )
-            if selected_model is None:
+            if selected_model is None and isinstance(primary.get("selected_model"), dict):
                 selected_model = primary.get("selected_model")
-            if not candidates:
-                candidates = primary.get("candidates_evaluated") or []
-            if not pareto_front:
-                pareto_front = primary.get("pareto_front") or []
-            if not pruned_or_failed:
-                pruned_or_failed = primary.get("pruned_or_failed") or []
-            if risk_report is None:
+            if not candidates and isinstance(primary.get("candidates_evaluated"), list):
+                candidates = list(primary.get("candidates_evaluated") or [])
+            if not pareto_front and isinstance(primary.get("pareto_front"), list):
+                pareto_front = list(primary.get("pareto_front") or [])
+            if not pruned_or_failed and isinstance(primary.get("pruned_or_failed"), list):
+                pruned_or_failed = list(primary.get("pruned_or_failed") or [])
+            if risk_report is None and isinstance(primary.get("risk_report"), dict):
                 risk_report = primary.get("risk_report")
-            if eda_report is None:
+            if eda_report is None and isinstance(primary.get("eda_report"), dict):
                 eda_report = primary.get("eda_report")
-            if not dataset_info:
+            if not dataset_info and isinstance(primary.get("dataset_info"), dict):
                 dataset_info = primary.get("dataset_info") or {}
-            if not summary:
+            if not summary and isinstance(primary.get("summary"), dict):
                 summary = primary.get("summary") or {}
     elif kind == "multi_target" and isinstance(cleaned.get("models"), dict):
         models = cleaned["models"]
@@ -1336,9 +1558,12 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
             mo = models["multi_output"]
             mo_type = mo.get("type", "MultiOutput")
             fit_t = mo.get("fit_time")
-            mo_targets = mo.get("targets") or cleaned.get("targets") or []
+            raw_mo_targets = mo.get("targets") if isinstance(mo.get("targets"), list) else cleaned.get("targets")
+            mo_targets = raw_mo_targets if isinstance(raw_mo_targets, list) else []
             first_metric = None
             for tname in mo_targets:
+                if not isinstance(tname, str):
+                    continue
                 m_dict = mo.get(tname) if isinstance(mo.get(tname), dict) else {}
                 sc = m_dict.get("r2") if "r2" in m_dict else m_dict.get("f1", m_dict.get("accuracy"))
                 if first_metric is None and sc is not None:
@@ -1366,14 +1591,17 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
                 if selected_model is None:
                     selected_model = sel_obj
 
+    resolved_task = cleaned.get("task") or (
+        risk_report.get("task") if isinstance(risk_report, dict) else None
+    )
     meta = {
         "timestamp": cleaned.get("timestamp"),
         "mode": cleaned.get("mode") or kind,
         "file": cleaned.get("file"),
         "target": cleaned.get("target") or cleaned.get("targets"),
-        "task": cleaned.get("task"),
+        "task": resolved_task,
         "datetime_col": cleaned.get("datetime_col"),
-        "html_report_path": cleaned.get("html_report_path"),
+        "html_report_path": cleaned.get("html_report_path") if isinstance(cleaned.get("html_report_path"), str) else None,
     }
 
     feature_importance = (
@@ -1387,8 +1615,10 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
     return _sanitize_json_value({
         "path": rel,
         "kind": kind,
+        "task": resolved_task,
         "meta": meta,
         "summary": summary,
+        "metrics": cleaned.get("metrics"),
         "dataset_info": dataset_info,
         "phase_results": phase_results,
         "phases": phases,
@@ -1405,6 +1635,12 @@ def _summarize_json_report(rel: str, data: dict[str, Any]) -> dict[str, Any]:
         "timeseries": cleaned.get("timeseries"),
         "benchmark_results": cleaned.get("benchmark_results"),
         "target_reports": target_reports_out,
+        "clustering": cleaned.get("clustering"),
+        "anomaly": cleaned.get("anomaly"),
+        "cv": cleaned.get("cv"),
+        "nlp": cleaned.get("nlp"),
+        "specialized": cleaned.get("specialized"),
+        "scale": cleaned.get("scale"),
     })
 
 
@@ -1504,17 +1740,15 @@ def create_app() -> Flask:
             _save_upload_index(UPLOAD_DIR, _snapshot_uploads())
         return record
 
-    @app.get("/")
-    def index():
-        groups: dict[str, list[Flag]] = {}
-        for flag in FLAGS:
-            groups.setdefault(flag.group, []).append(flag)
-        flag_meta = [
+    def _build_flag_meta() -> list[dict[str, Any]]:
+        return [
             {
                 "name": f.name,
                 "cli": f.cli,
                 "kind": f.kind,
                 "default": f.default,
+                "choices": list(f.choices),
+                "group": f.group,
                 "label": f.label,
                 "dead": f.dead,
                 "tier": f.tier,
@@ -1522,6 +1756,13 @@ def create_app() -> Flask:
             }
             for f in FLAGS
         ]
+
+    @app.get("/")
+    def index():
+        groups: dict[str, list[Flag]] = {}
+        for flag in FLAGS:
+            groups.setdefault(flag.group, []).append(flag)
+        flag_meta = _build_flag_meta()
         return render_template(
             "index.html",
             groups=groups,
@@ -1529,6 +1770,10 @@ def create_app() -> Flask:
             repo_root=str(REPO_ROOT),
             flag_meta=json.dumps(flag_meta),
         )
+
+    @app.get("/api/flags")
+    def list_flags():
+        return jsonify(flags=_build_flag_meta())
 
     @app.get("/api/uploads")
     def list_uploads():
@@ -1566,10 +1811,24 @@ def create_app() -> Flask:
                 400,
             )
 
-        stem = Path(secure_filename(raw_path.stem)).name or "upload"
+        stem = (Path(secure_filename(raw_path.stem)).name or "upload")[:60].strip("._-") or "upload"
         upload_id = uuid.uuid4().hex[:12]
+        # Enforce Windows MAX_PATH headroom against resolved UPLOAD_DIR.
+        # Format is "{stem}_{upload_id}{suffix}" where "_{upload_id}" is 13 chars.
+        upload_dir_len = len(str(UPLOAD_DIR.resolve()))
+        max_stem_len = max(1, 250 - upload_dir_len - 1 - 13 - len(suffix))
+        if len(stem) > max_stem_len:
+            stem = stem[:max_stem_len].strip("._-") or "u"
         dest = UPLOAD_DIR / f"{stem}_{upload_id}{suffix}"
-        file.save(dest)
+        try:
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            file.save(dest)
+        except OSError as exc:
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return jsonify(error=f"Could not save uploaded file: {exc}"), 500
 
         record = Upload(
             id=upload_id,
@@ -1591,7 +1850,16 @@ def create_app() -> Flask:
         with uploads_lock:
             uploads[upload_id] = record
             snapshot = list(uploads.values())
-        _save_upload_index(UPLOAD_DIR, snapshot)
+        try:
+            _save_upload_index(UPLOAD_DIR, snapshot)
+        except OSError as exc:
+            with uploads_lock:
+                uploads.pop(upload_id, None)
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return jsonify(error=f"Could not update upload index: {exc}"), 500
 
         return jsonify(record.to_summary_dict(include_preview=True))
 
@@ -1688,7 +1956,10 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001
             return jsonify(error=f"Forecast failed: {exc}"), 500
 
-        result["csv_path"] = _write_forecast_csv(result, record.original_name)
+        try:
+            result["csv_path"] = _write_forecast_csv(result, record.original_name)
+        except OSError as exc:
+            return jsonify(error=f"Failed to write forecast CSV: {exc}"), 500
         return jsonify(result)
 
     @app.post("/api/suggest-target")
@@ -1779,6 +2050,14 @@ def create_app() -> Flask:
             "exclude": _as_list(payload.get("exclude"), "exclude"),
             "datetime_col": _as_list(payload.get("datetime_col"), "datetime_col"),
             "treatment": _as_list(payload.get("treatment"), "treatment"),
+            "group_col": _as_list(payload.get("group_col"), "group_col"),
+            "text_cols": _as_list(payload.get("text_cols"), "text_cols"),
+            "event_col": _as_list(payload.get("event_col"), "event_col"),
+            "time_col": _as_list(payload.get("time_col"), "time_col"),
+            "query_col": _as_list(payload.get("query_col"), "query_col"),
+            "user_col": _as_list(payload.get("user_col"), "user_col"),
+            "item_col": _as_list(payload.get("item_col"), "item_col"),
+            "rating_col": _as_list(payload.get("rating_col"), "rating_col"),
         }
 
     @app.post("/api/validate-columns")
@@ -1795,6 +2074,11 @@ def create_app() -> Flask:
         if record is None or not record.path.is_file():
             return jsonify(error="Upload a data file first"), 400
 
+        raw_task = payload.get("task")
+        if raw_task not in (None, "") and (isinstance(raw_task, bool) or not isinstance(raw_task, str)):
+            return jsonify(error="task must be a string"), 400
+        task = (raw_task or "auto").strip().lower()
+
         try:
             roles = _column_roles_from_payload(payload)
         except ValueError as exc:
@@ -1807,7 +2091,7 @@ def create_app() -> Flask:
         except Exception as exc:  # noqa: BLE001
             return jsonify(error=f"Could not read the file: {exc}"), 400
 
-        result = validate_columns(frame, roles)
+        result = validate_columns(frame, roles, task=task)
         return jsonify(result.to_dict())
 
     @app.post("/api/nl-plan")
@@ -1865,10 +2149,22 @@ def create_app() -> Flask:
             or (payload.get("benchmark") and not upload_id)
         )
 
+        raw_task = payload.get("task")
+        if raw_task in (None, ""):
+            task_norm = "auto"
+        elif isinstance(raw_task, bool) or not isinstance(raw_task, str):
+            return jsonify(error="Task type must be a string."), 400
+        else:
+            task_norm = raw_task.strip().lower()
+            if task_norm not in FLAGS_BY_NAME["task"].choices:
+                return jsonify(error=f"Unsupported task type: {task_norm!r}"), 400
+
         # Numeric parameter bounds validation
         for int_field, label, min_val in (
             ("horizon", "Forecast horizon", 1),
             ("time_budget", "Time budget", 1),
+            ("n_clusters", "Number of clusters", 2),
+            ("chunk_size", "Chunk size", 1),
         ):
             raw_val = payload.get(int_field)
             if raw_val not in (None, ""):
@@ -1878,7 +2174,7 @@ def create_app() -> Flask:
                     num = float(raw_val)
                     if not math.isfinite(num) or int(num) != num or int(num) < min_val:
                         raise ValueError("invalid")
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return jsonify(error=f"{label} must be an integer >= {min_val}"), 400
 
         raw_budget = payload.get("budget")
@@ -1889,8 +2185,29 @@ def create_app() -> Flask:
                 b_val = float(raw_budget)
                 if not math.isfinite(b_val) or b_val < 0:
                     raise ValueError("invalid")
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return jsonify(error="Budget constraint must be a finite number >= 0"), 400
+
+        raw_contam = payload.get("contamination")
+        if raw_contam not in (None, ""):
+            if isinstance(raw_contam, bool) or not isinstance(raw_contam, (str, int, float)):
+                return jsonify(error="Contamination must be 'auto' or a finite number in (0.0, 0.5]"), 400
+            if isinstance(raw_contam, str):
+                contam_text = raw_contam.strip()
+                if contam_text and contam_text.lower() != "auto":
+                    try:
+                        c_val = float(contam_text)
+                        if not math.isfinite(c_val) or c_val <= 0.0 or c_val > 0.5:
+                            raise ValueError("invalid")
+                    except (TypeError, ValueError, OverflowError):
+                        return jsonify(error="Contamination must be 'auto' or a finite number in (0.0, 0.5]"), 400
+            else:
+                try:
+                    c_val = float(raw_contam)
+                    if not math.isfinite(c_val) or c_val <= 0.0 or c_val > 0.5:
+                        raise ValueError("invalid")
+                except (TypeError, ValueError, OverflowError):
+                    return jsonify(error="Contamination must be 'auto' or a finite number in (0.0, 0.5]"), 400
 
         try:
             roles = _column_roles_from_payload(payload)
@@ -1913,8 +2230,21 @@ def create_app() -> Flask:
             )
 
         has_target = bool(roles["predict"] or roles["target"])
-        if data_file is not None and not run_all_demos and not standalone_no_file and not has_target:
-            return jsonify(error="Pick at least one target column to predict."), 400
+        if data_file is not None and not run_all_demos and not standalone_no_file:
+            if task_norm in ("clustering", "anomaly"):
+                pass
+            elif task_norm == "survival":
+                target_cols_comb = roles["predict"] or roles["target"]
+                if not ((roles["time_col"] and roles["event_col"]) or len(target_cols_comb) == 2):
+                    return jsonify(error="Survival task requires time_col and event_col (or 2 target columns)."), 400
+            elif task_norm == "recommender":
+                if not (roles["user_col"] and roles["item_col"]):
+                    return jsonify(error="Recommender task requires user_col and item_col."), 400
+            elif task_norm == "ranking":
+                if not has_target or not (roles["query_col"] or roles["group_col"]):
+                    return jsonify(error="Ranking task requires a target column and query_col (or group_col)."), 400
+            elif not has_target:
+                return jsonify(error="Pick at least one target column to predict."), 400
 
         if record is not None:
             try:
@@ -1928,7 +2258,7 @@ def create_app() -> Flask:
                 except Exception as exc:  # noqa: BLE001
                     return jsonify(error=f"Could not read the uploaded file: {exc}"), 400
 
-                check = _rule_based_validate(frame, roles)
+                check = _rule_based_validate(frame, roles, task=task_norm)
                 if not check.ok:
                     blocking = [i for i in check.issues if i.severity == "block"]
                     return (
@@ -2145,13 +2475,41 @@ def create_app() -> Flask:
                 return jsonify(error=f"Unsupported JSON report '{rel}'"), 400
             summaries.append(_summarize_json_report(rel, data))
 
+        def _pick_metric_score(metrics_dict: dict[str, Any], top_metrics: dict[str, Any], sel_dict: dict[str, Any]) -> Any:
+            for src in (metrics_dict, top_metrics):
+                if not isinstance(src, dict):
+                    continue
+                for k in (
+                    "metric",
+                    "silhouette_score",
+                    "f1_micro",
+                    "ndcg_at_k",
+                    "c_index",
+                    "rmse",
+                    "accuracy",
+                    "r2",
+                    "f1",
+                    "roc_auc",
+                    "n_anomalies",
+                ):
+                    val = src.get(k)
+                    if val is not None and not isinstance(val, bool) and isinstance(val, (int, float)) and math.isfinite(val):
+                        return val
+            raw_sel_metric = sel_dict.get("metric")
+            if raw_sel_metric is not None and not isinstance(raw_sel_metric, bool) and isinstance(raw_sel_metric, (int, float)) and math.isfinite(raw_sel_metric):
+                return raw_sel_metric
+            return None
+
         def _extract_kpis(s: dict[str, Any]) -> dict[str, Any]:
-            sel = s.get("selected_model") or {}
-            metrics = sel.get("metrics") or {}
-            meta = s.get("meta") or {}
-            rr = s.get("risk_report") or {}
-            ds = s.get("dataset_info") or {}
-            score = metrics.get("metric") if metrics.get("metric") is not None else sel.get("metric")
+            sel = s.get("selected_model") if isinstance(s.get("selected_model"), dict) else {}
+            metrics = sel.get("metrics") if isinstance(sel.get("metrics"), dict) else {}
+            top_metrics = s.get("metrics") if isinstance(s.get("metrics"), dict) else {}
+            meta = s.get("meta") if isinstance(s.get("meta"), dict) else {}
+            rr = s.get("risk_report") if isinstance(s.get("risk_report"), dict) else {}
+            ds = s.get("dataset_info") if isinstance(s.get("dataset_info"), dict) else {}
+            cands_val = s.get("candidates_evaluated")
+            pareto_val = s.get("pareto_front")
+            score = _pick_metric_score(metrics, top_metrics, sel)
             train_t = metrics.get("train_time_s")
             mem = metrics.get("peak_mem_mb")
             risk = metrics.get("risk_penalty")
@@ -2159,7 +2517,7 @@ def create_app() -> Flask:
             return {
                 "path": s.get("path"),
                 "target": meta.get("target"),
-                "task": meta.get("task") or rr.get("task"),
+                "task": meta.get("task") or s.get("task") or rr.get("task"),
                 "selected_model": sel.get("name") or sel.get("model_name") or "None",
                 "metric": score,
                 "train_time_s": train_t,
@@ -2169,8 +2527,8 @@ def create_app() -> Flask:
                 "test_performance": s.get("test_performance"),
                 "rows": ds.get("rows"),
                 "columns": ds.get("columns"),
-                "candidates_count": len(s.get("candidates_evaluated") or []),
-                "pareto_count": len(s.get("pareto_front") or []),
+                "candidates_count": len(cands_val) if isinstance(cands_val, list) else 0,
+                "pareto_count": len(pareto_val) if isinstance(pareto_val, list) else 0,
             }
 
         items = [_extract_kpis(s) for s in summaries]
@@ -2182,7 +2540,14 @@ def create_app() -> Flask:
             deltas: dict[str, float | None] = {}
             for key in ("metric", "train_time_s", "peak_mem_mb", "risk_penalty"):
                 a, b = base.get(key), item.get(key)
-                if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                if (
+                    not isinstance(a, bool)
+                    and not isinstance(b, bool)
+                    and isinstance(a, (int, float))
+                    and isinstance(b, (int, float))
+                    and math.isfinite(a)
+                    and math.isfinite(b)
+                ):
                     deltas[key] = round(float(b) - float(a), 6)
                 else:
                     deltas[key] = None
@@ -2310,6 +2675,19 @@ def create_app() -> Flask:
             active_job=active.id if active and active.status == "running" else None,
             queue_length=len(manager.list_queue()),
         )
+
+    @app.errorhandler(HTTPException)
+    def _api_http_error(exc: HTTPException):
+        if request.path.startswith("/api/"):
+            return jsonify(error=exc.description or exc.name), exc.code or 500
+        return exc
+
+    @app.errorhandler(500)
+    def _api_internal_error(exc: Exception):
+        if request.path.startswith("/api/"):
+            orig = getattr(exc, "original_exception", exc)
+            return jsonify(error=f"Internal server error: {orig}"), 500
+        return exc
 
     return app
 

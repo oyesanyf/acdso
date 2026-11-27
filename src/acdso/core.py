@@ -49,6 +49,15 @@ from sklearn.metrics import get_scorer
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 
+from acdso.cv import (
+    VALID_CV_STRATEGIES,
+    build_cv_splitter,
+    group_holdout_split,
+    iter_cv_splits,
+    resolve_cv_strategy_name,
+    sample_by_groups,
+    validate_groups,
+)
 from acdso.pareto import CandidateResult, knee_point_selection, pareto_front
 from acdso.risk import RiskReport, analyze_risk, compute_risk_penalty
 from acdso.utils import build_preprocessor, measure_latency_ms_per_row, sanitize_features, split_columns
@@ -83,10 +92,37 @@ def _safe_numpy(X: Any) -> np.ndarray:
     """Convert X to numpy array without copying when possible."""
     if isinstance(X, np.ndarray):
         return X
+    if hasattr(X, "toarray") and hasattr(X, "shape"):
+        return X.toarray()
     try:
         return np.asarray(X)
     except Exception:
         return np.array(X)
+
+
+def _slice_rows(X: Any, idx: Any) -> Any:
+    """Row-index DataFrame, SciPy sparse matrix, or dense array safely."""
+    if hasattr(X, "iloc"):
+        return X.iloc[idx]
+    if hasattr(X, "tocsr") and hasattr(X, "shape"):
+        try:
+            return X[idx]
+        except TypeError:
+            return X.tocsr()[idx]
+    return _safe_numpy(X)[idx]
+
+
+def _is_partition(splits: List[Tuple[np.ndarray, np.ndarray]], n_rows: int) -> bool:
+    """Return True if validation folds form a disjoint cover of 0..n_rows-1."""
+    if not splits or n_rows <= 0:
+        return False
+    seen = np.zeros(n_rows, dtype=np.int64)
+    for _, va in splits:
+        va_idx = np.asarray(va, dtype=np.intp)
+        if va_idx.size == 0 or int(va_idx.min()) < 0 or int(va_idx.max()) >= n_rows:
+            return False
+        seen[va_idx] += 1
+    return bool(np.all(seen == 1))
 
 
 def _extract_meta_features_for_task(
@@ -435,8 +471,8 @@ def _auto_adjust_scorer(
             pass
     
     # Rule-based fallback
-    y_arr = np.asarray(y)
-    unique_labels = np.unique(y_arr)
+    y_clean = pd.Series(y).dropna()
+    unique_labels = y_clean.unique()
     n_classes = len(unique_labels)
     
     # Scorers that require pos_label=1 (binary-only)
@@ -450,12 +486,14 @@ def _auto_adjust_scorer(
                 return "roc_auc_ovr_weighted"
             return f"{scorer}_weighted"
         
-        # Binary but labels are not {0, 1}: use weighted version
+        # Binary but labels are not {0, 1}: use weighted version for pos_label=1 scorers.
+        # Keep "roc_auc" as-is because sklearn handles arbitrary 2-class labels natively
+        # and "roc_auc_ovr_weighted" errors on binary y_true.
         if n_classes == 2:
-            labels_set = set(unique_labels)
+            labels_set = set(unique_labels.tolist())
             if labels_set != {0, 1}:
                 if scorer == "roc_auc":
-                    return "roc_auc_ovr_weighted"
+                    return "roc_auc"
                 return f"{scorer}_weighted"
     
     return scorer
@@ -501,6 +539,10 @@ class _ACDSOEngineV3:
         selection_mode: str = "knee_point",
         n_jobs: Optional[int] = None,
         enable_stacking: bool = True,
+        cv_strategy: str = "auto",
+        max_in_memory_rows: Optional[int] = 200_000,
+        text_cols: Optional[List[str]] = None,
+        text_method: str = "tfidf",
     ):
         self.task = task
         self.scorer = scorer  # Will be adjusted in fit() based on y
@@ -513,6 +555,10 @@ class _ACDSOEngineV3:
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
         self.n_jobs = n_jobs
         self.enable_stacking = bool(enable_stacking)
+        self.cv_strategy = cv_strategy
+        self.max_in_memory_rows = max_in_memory_rows
+        self.text_cols = text_cols
+        self.text_method = text_method
 
         self.max_train_time_s = max_train_time_s
         self.max_peak_mem_mb = max_peak_mem_mb
@@ -528,6 +574,9 @@ class _ACDSOEngineV3:
         self.all_results_: List[CandidateResult] = []
         self.best_result_: Optional[CandidateResult] = None
         self.audit_trail_: Dict[str, Any] = {}
+        self.cv_strategy_: str = str(cv_strategy)
+        self._groups: Optional[np.ndarray] = None
+        self._text_cols_: List[Any] = []
 
     def _log(self, msg: str) -> None:
         """Log message if verbose mode is enabled."""
@@ -554,11 +603,37 @@ class _ACDSOEngineV3:
             cap = min(int(self.n_jobs), cpu_cnt, 12)
         return max(1, min(max(1, n_tasks), cap))
 
+    def _resolve_columns_and_preprocessor(
+        self, X: Any
+    ) -> Tuple[List[Any], List[Any], List[Any], Any]:
+        """Resolve numeric, categorical, and free-text columns and build preprocessor."""
+        df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        if self.text_cols is not None:
+            missing = [c for c in self.text_cols if c not in df.columns]
+            if missing:
+                raise ValueError(f"text_cols not found in input DataFrame: {missing}")
+            eff_text_cols = list(self.text_cols)
+            num_cols, cat_cols = split_columns(df, detect_text=False)
+            text_set = set(eff_text_cols)
+            num_cols = [c for c in num_cols if c not in text_set]
+            cat_cols = [c for c in cat_cols if c not in text_set]
+        else:
+            num_cols, cat_cols, eff_text_cols = split_columns(df, detect_text=True)
+
+        self._text_cols_ = list(eff_text_cols)
+        text_method_norm = str(self.text_method).strip().lower()
+        pre = build_preprocessor(
+            num_cols,
+            cat_cols,
+            text_cols=eff_text_cols or None,
+            text_method=text_method_norm,
+        )
+        return num_cols, cat_cols, eff_text_cols, pre
+
     def _build_preprocessor(self, X: Any) -> Any:
         """Build a preprocessing ColumnTransformer from X (used by fallback paths)."""
-        df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
-        num_cols, cat_cols = split_columns(df)
-        return build_preprocessor(num_cols, cat_cols)
+        _, _, _, pre = self._resolve_columns_and_preprocessor(X)
+        return pre
 
     def _generate_candidates(
         self,
@@ -577,10 +652,7 @@ class _ACDSOEngineV3:
         - Very few features → skip feature selection, simpler models
         - More features than samples → increased regularization
         """
-        df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
-        num_cols, cat_cols = split_columns(df)
-
-        pre = build_preprocessor(num_cols, cat_cols)
+        num_cols, cat_cols, eff_text_cols, pre = self._resolve_columns_and_preprocessor(X)
 
         # Dataset size detection for adaptive model configuration
         n_samples = rr.n_rows
@@ -614,9 +686,9 @@ class _ACDSOEngineV3:
                 self._log(f"Edge cases detected: {', '.join(edge_cases)}")
 
         # Add feature selection if high multicollinearity detected
-        # BUT skip if very few features (no point selecting from ≤3 features)
+        # BUT skip if very few features (no point selecting from ≤3 features) or when NLP text features are active
         selector = None
-        if self.enable_feature_selection and rr.vif_max >= 10.0 and not very_few_features:
+        if self.enable_feature_selection and rr.vif_max >= 10.0 and not very_few_features and not eff_text_cols:
             score_func = f_classif if self.task == "classification" else f_regression
             # Determine k: more aggressive selection for higher VIF
             # VIF 10-20: keep 75% of features, VIF 20-50: keep 60%, VIF >50: keep 50%
@@ -931,12 +1003,28 @@ class _ACDSOEngineV3:
         """
         # Keep 60% of candidates, but at least 3 (or all if fewer than 3)
         keep0 = max(min(3, n_candidates), int(math.ceil(n_candidates * 0.6)))
+        if hasattr(self.cv, "split"):
+            try:
+                cv_n = int(self.cv.get_n_splits())
+            except Exception:
+                cv_n = 4
+            cheap_cv: Any = max(2, cv_n // 2)
+        else:
+            cheap_cv = max(2, int(self.cv) // 2)
         return [
-            {"name": "cheap", "row_frac": 0.25, "cv": max(2, self.cv // 2), "keep": keep0},
+            {"name": "cheap", "row_frac": 0.25, "cv": cheap_cv, "keep": keep0},
             {"name": "full", "row_frac": 1.0, "cv": self.cv, "keep": n_candidates},
         ]
 
-    def _subsample_rows(self, X: Any, y: Any, frac: float) -> Tuple[Any, Any]:
+    def _subsample_rows(
+        self,
+        X: Any,
+        y: Any,
+        frac: float,
+        groups: Optional[np.ndarray] = None,
+        cv_strategy: Optional[str] = None,
+        stage_cv: Optional[Any] = None,
+    ) -> Tuple[Any, Any, Optional[np.ndarray]]:
         """
         Subsample rows for multi-fidelity evaluation.
 
@@ -945,51 +1033,180 @@ class _ACDSOEngineV3:
         so minority classes are never starved.
         """
         if frac >= 1.0:
-            return X, y
+            return X, y, groups
 
-        n = len(y)
+        n = (
+            int(y.shape[0])
+            if hasattr(y, "shape") and getattr(y, "shape", None)
+            else (len(y) if hasattr(y, "__len__") else int(np.asarray(y).shape[0]))
+        )
         if n < 100:
-            return X, y
+            return X, y, groups
 
         y_arr = np.asarray(y)
         if self.task == "classification":
             uniq, counts = np.unique(y_arr, return_counts=True)
             if len(uniq) >= 2 and int(counts.min()) < 8:
-                return X, y
+                return X, y, groups
 
         sample_size = max(10, int(n * frac))
         if sample_size >= n:
-            return X, y
+            return X, y, groups
 
-        idx = None
-        if self.task == "classification":
-            try:
-                uniq, counts = np.unique(y_arr, return_counts=True)
-                min_strat = max(sample_size, len(uniq) * 4)
-                if min_strat >= n:
-                    return X, y
-                if len(uniq) >= 2 and int(counts.min()) >= 2 and min_strat >= len(uniq):
-                    from sklearn.model_selection import StratifiedShuffleSplit
-                    sss = StratifiedShuffleSplit(
-                        n_splits=1, train_size=min_strat, random_state=self.random_state
-                    )
-                    cand_idx, _ = next(sss.split(np.zeros(n), y_arr))
-                    _, sub_counts = np.unique(y_arr[cand_idx], return_counts=True)
-                    if len(sub_counts) == len(uniq) and int(sub_counts.min()) >= 2:
-                        idx = cand_idx
-            except Exception:
-                idx = None
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
 
-        if idx is None:
-            rng = np.random.RandomState(self.random_state)
-            idx = rng.choice(n, size=sample_size, replace=False)
-
-        if hasattr(X, "iloc"):
-            Xs = X.iloc[idx]
+        if stage_cv is not None:
+            if hasattr(stage_cv, "split"):
+                try:
+                    min_folds = max(2, int(stage_cv.get_n_splits()))
+                except Exception:
+                    min_folds = 2
+            else:
+                min_folds = max(2, int(stage_cv))
+        elif not hasattr(self.cv, "split"):
+            min_folds = max(2, min(int(self.cv), 2))
         else:
-            Xs = _safe_numpy(X)[idx]
+            min_folds = 2
+
+        if groups is not None:
+            if str(eff_strategy).strip().lower() == "temporal":
+                codes, uniques = pd.factorize(pd.Series(groups, dtype=object), sort=False)
+                n_uniq_full = len(uniques)
+                if n_uniq_full < 2:
+                    return X, y, groups
+                group_last_pos = np.full(n_uniq_full, -1, dtype=np.intp)
+                group_indices: List[List[int]] = [[] for _ in range(n_uniq_full)]
+                for pos, code in enumerate(codes.tolist()):
+                    group_indices[code].append(pos)
+                    group_last_pos[code] = pos
+                tail_group_order = np.argsort(-group_last_pos, kind="mergesort").tolist()
+
+                min_groups_req = min(n_uniq_full, max(2, min_folds))
+                if self.task == "classification":
+                    u_orig = np.unique(y_arr)
+                    n_cls = len(u_orig)
+                    min_groups_req = min(n_uniq_full, max(min_groups_req, max(2, n_cls)))
+                else:
+                    u_orig = np.array([])
+
+                selected_pos: List[int] = []
+                selected_g_count = 0
+                for g_code in tail_group_order:
+                    selected_pos.extend(group_indices[g_code])
+                    selected_g_count += 1
+                    if len(selected_pos) < sample_size or selected_g_count < min_groups_req:
+                        continue
+                    if self.task == "classification" and len(u_orig) >= 2:
+                        ys_cur = y_arr[selected_pos]
+                        u_cur, c_cur = np.unique(ys_cur, return_counts=True)
+                        if len(u_cur) < len(u_orig) or int(c_cur.min()) < 2:
+                            continue
+                    break
+
+                if selected_g_count >= n_uniq_full or len(selected_pos) >= n:
+                    return X, y, groups
+                idx = np.sort(np.asarray(selected_pos, dtype=np.intp))
+                Xs = _slice_rows(X, idx)
+                ys_sub = y.iloc[idx] if hasattr(y, "iloc") else y_arr[idx]
+                gs = np.asarray(groups)[idx]
+                return Xs, ys_sub, gs
+
+            n_uniq_full = int(len(np.unique(groups)))
+            if self.task == "classification":
+                u_orig = np.unique(y_arr)
+                n_classes = len(u_orig)
+                min_groups_needed = max(4, min_folds * max(2, n_classes))
+                if n_uniq_full < min_groups_needed:
+                    return X, y, groups
+                Xs, ys_sub, gs = sample_by_groups(
+                    X,
+                    y=y,
+                    groups=groups,
+                    frac=frac,
+                    random_state=self.random_state,
+                    stratify=True,
+                    min_groups_per_class=max(2, min_folds),
+                    min_groups_total=min_groups_needed,
+                )
+                if gs is None:
+                    return X, y, groups
+                n_uniq_sub = int(len(np.unique(gs)))
+                if n_uniq_sub < 2 or n_uniq_sub >= n_uniq_full:
+                    return X, y, groups
+                ys_sub_arr = np.asarray(ys_sub)
+                u_sub, c_sub = np.unique(ys_sub_arr, return_counts=True)
+                if len(u_orig) >= 2 and (len(u_sub) < len(u_orig) or int(c_sub.min()) < 2):
+                    return X, y, groups
+                if len(u_orig) >= 2:
+                    try:
+                        sp_chk = build_cv_splitter(
+                            cv=min(min_folds, n_uniq_sub),
+                            y=ys_sub_arr,
+                            groups=gs,
+                            task=self.task,
+                            cv_strategy=eff_strategy,
+                            random_state=self.random_state,
+                        )
+                        chk_splits = iter_cv_splits(
+                            sp_chk,
+                            Xs,
+                            ys_sub_arr,
+                            gs,
+                            validate_groups_leakage=True,
+                        )
+                        if any(len(np.unique(ys_sub_arr[tr])) < len(u_orig) for tr, _ in chk_splits):
+                            return X, y, groups
+                    except Exception:
+                        return X, y, groups
+                return Xs, ys_sub, gs
+
+            if n_uniq_full < 4:
+                return X, y, groups
+            min_reg_groups = min(n_uniq_full, max(4, min_folds))
+            Xs, ys_sub, gs = sample_by_groups(
+                X,
+                y=y,
+                groups=groups,
+                frac=frac,
+                random_state=self.random_state,
+                min_groups_total=min_reg_groups,
+            )
+            if gs is None:
+                return X, y, groups
+            n_uniq_sub = int(len(np.unique(gs)))
+            if n_uniq_sub < min_reg_groups or n_uniq_sub >= n_uniq_full:
+                return X, y, groups
+            return Xs, ys_sub, gs
+
+        if str(eff_strategy).strip().lower() == "temporal":
+            idx = np.arange(n - sample_size, n, dtype=np.intp)
+        else:
+            idx = None
+            if self.task == "classification":
+                try:
+                    uniq, counts = np.unique(y_arr, return_counts=True)
+                    min_strat = max(sample_size, len(uniq) * 4)
+                    if min_strat >= n:
+                        return X, y, None
+                    if len(uniq) >= 2 and int(counts.min()) >= 2 and min_strat >= len(uniq):
+                        from sklearn.model_selection import StratifiedShuffleSplit
+                        sss = StratifiedShuffleSplit(
+                            n_splits=1, train_size=min_strat, random_state=self.random_state
+                        )
+                        cand_idx, _ = next(sss.split(np.zeros(n), y_arr))
+                        _, sub_counts = np.unique(y_arr[cand_idx], return_counts=True)
+                        if len(sub_counts) == len(uniq) and int(sub_counts.min()) >= 2:
+                            idx = cand_idx
+                except Exception:
+                    idx = None
+
+            if idx is None:
+                rng = np.random.RandomState(self.random_state)
+                idx = rng.choice(n, size=sample_size, replace=False)
+
+        Xs = _slice_rows(X, idx)
         ys = y_arr[idx]
-        return Xs, ys
+        return Xs, ys, None
 
     def _evaluate_candidate(
         self,
@@ -997,38 +1214,51 @@ class _ACDSOEngineV3:
         y: Any,
         name: str,
         pipe: Pipeline,
-        cv_override: Optional[int] = None,
+        cv_override: Optional[Any] = None,
+        groups: Optional[np.ndarray] = None,
+        cv_strategy: Optional[str] = None,
     ) -> CandidateResult:
         """
         Evaluate a single candidate pipeline (sequential fallback / direct helper).
         """
         start = time.time()
         y_arr = np.asarray(y)
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
+        eff_strat_norm = str(eff_strategy).strip().lower()
 
-        cv_used = int(cv_override or self.cv)
-        if self.task == "classification":
-            uniq, counts = np.unique(y_arr, return_counts=True)
-            if len(uniq) >= 2 and int(counts.min()) >= 2:
-                cv_used = max(2, min(cv_used, int(counts.min())))
-                splitter = StratifiedKFold(
-                    n_splits=cv_used,
-                    shuffle=True,
-                    random_state=self.random_state,
-                )
+        raw_cv = self.cv if cv_override is None else cv_override
+        if hasattr(raw_cv, "split"):
+            cv_arg: Any = raw_cv
+        else:
+            cv_used = int(raw_cv)
+            if groups is not None:
+                if eff_strat_norm != "temporal":
+                    cv_used = max(2, min(cv_used, int(len(np.unique(groups)))))
+            elif self.task == "classification":
+                uniq, counts = np.unique(y_arr, return_counts=True)
+                if len(uniq) >= 2 and int(counts.min()) >= 2:
+                    cv_used = max(2, min(cv_used, int(counts.min())))
+                else:
+                    cv_used = max(2, min(cv_used, len(y_arr) // 2))
             else:
                 cv_used = max(2, min(cv_used, len(y_arr) // 2))
-                splitter = KFold(
-                    n_splits=cv_used,
-                    shuffle=True,
-                    random_state=self.random_state,
-                )
-        else:
-            cv_used = max(2, min(cv_used, len(y_arr) // 2))
-            splitter = KFold(
-                n_splits=cv_used,
-                shuffle=True,
-                random_state=self.random_state,
-            )
+            cv_arg = cv_used
+
+        splitter = build_cv_splitter(
+            cv=cv_arg,
+            y=y_arr,
+            groups=groups,
+            task=self.task,
+            cv_strategy=eff_strategy,
+            random_state=self.random_state,
+        )
+        splits = iter_cv_splits(
+            splitter,
+            X,
+            y_arr,
+            groups,
+            validate_groups_leakage=(groups is not None and eff_strat_norm != "temporal"),
+        )
 
         scorer = get_scorer(self.scorer)
 
@@ -1045,7 +1275,7 @@ class _ACDSOEngineV3:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=RuntimeWarning)
-            scores = cross_val_score(pipe, X, y_arr, cv=splitter, scoring=scorer, n_jobs=None)
+            scores = cross_val_score(pipe, X, y_arr, cv=splits, scoring=scorer, n_jobs=None)
 
         if proc is not None:
             try:
@@ -1070,12 +1300,30 @@ class _ACDSOEngineV3:
         if val_size >= n_samples:
             val_size = max(1, n_samples // 2)
 
-        rng = np.random.RandomState(self.random_state)
-        all_idx = np.arange(n_samples)
-        rng.shuffle(all_idx)
-
-        train_idx = all_idx[val_size:]
-        val_idx = all_idx[:val_size]
+        if groups is not None and eff_strat_norm != "temporal":
+            train_idx, val_idx = group_holdout_split(
+                X,
+                y=y_arr,
+                groups=groups,
+                test_size=0.2,
+                task=self.task,
+                random_state=self.random_state,
+            )
+            if (
+                self.task == "classification"
+                and len(np.unique(y_arr)) >= 2
+                and len(np.unique(y_arr[train_idx])) < 2
+            ):
+                train_idx, val_idx = splits[0]
+        elif eff_strat_norm == "temporal":
+            train_idx = np.arange(0, n_samples - val_size, dtype=np.intp)
+            val_idx = np.arange(n_samples - val_size, n_samples, dtype=np.intp)
+        else:
+            rng = np.random.RandomState(self.random_state)
+            all_idx = np.arange(n_samples)
+            rng.shuffle(all_idx)
+            train_idx = all_idx[val_size:]
+            val_idx = all_idx[:val_size]
 
         if hasattr(X, "iloc"):
             X_train_stress = X.iloc[train_idx]
@@ -1146,6 +1394,8 @@ class _ACDSOEngineV3:
         survivors: List[Tuple[str, Pipeline]],
         stage: Dict[str, Any],
         t0: float,
+        groups: Optional[np.ndarray] = None,
+        cv_strategy: Optional[str] = None,
     ) -> Tuple[List[CandidateResult], List[Dict[str, Any]], bool]:
         """
         Evaluate a stage with leak-free fold preprocessor caching and bounded
@@ -1156,6 +1406,8 @@ class _ACDSOEngineV3:
         stage_results: List[CandidateResult] = []
         stage_failures: List[Dict[str, Any]] = []
         budget_exhausted = False
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
+        eff_strat_norm = str(eff_strategy).strip().lower()
 
         if not survivors:
             return stage_results, stage_failures, budget_exhausted
@@ -1174,7 +1426,12 @@ class _ACDSOEngineV3:
                     budget_exhausted = True
                     break
                 try:
-                    res = self._evaluate_candidate(Xs, ys, name, pipe, cv_override=stage["cv"])
+                    res = self._evaluate_candidate(
+                        Xs, ys, name, pipe,
+                        cv_override=stage["cv"],
+                        groups=groups,
+                        cv_strategy=eff_strategy,
+                    )
                     if is_full and not self._passes_constraints(res):
                         stage_failures.append({
                             "name": name,
@@ -1197,20 +1454,42 @@ class _ACDSOEngineV3:
 
         ys_arr = np.asarray(ys)
         n_rows = len(ys_arr)
-        cv_used = int(stage["cv"])
-        if self.task == "classification":
-            uniq, counts = np.unique(ys_arr, return_counts=True)
-            if len(uniq) >= 2 and int(counts.min()) >= 2:
-                cv_used = max(2, min(cv_used, int(counts.min())))
-                splitter = StratifiedKFold(n_splits=cv_used, shuffle=True, random_state=self.random_state)
+        raw_cv = stage["cv"]
+        if hasattr(raw_cv, "split"):
+            cv_arg: Any = raw_cv
+        else:
+            cv_used = int(raw_cv)
+            if groups is not None:
+                n_uniq_g = int(len(np.unique(groups)))
+                if n_uniq_g < 2:
+                    raise ValueError(f"groups must contain at least 2 unique groups, got {n_uniq_g}.")
+                if eff_strat_norm != "temporal":
+                    cv_used = max(2, min(cv_used, n_uniq_g))
+            elif self.task == "classification":
+                uniq, counts = np.unique(ys_arr, return_counts=True)
+                if len(uniq) >= 2 and int(counts.min()) >= 2:
+                    cv_used = max(2, min(cv_used, int(counts.min())))
+                else:
+                    cv_used = max(2, min(cv_used, max(2, n_rows // 2)))
             else:
                 cv_used = max(2, min(cv_used, max(2, n_rows // 2)))
-                splitter = KFold(n_splits=cv_used, shuffle=True, random_state=self.random_state)
-        else:
-            cv_used = max(2, min(cv_used, max(2, n_rows // 2)))
-            splitter = KFold(n_splits=cv_used, shuffle=True, random_state=self.random_state)
+            cv_arg = cv_used
 
-        splits = list(splitter.split(Xs, ys_arr))
+        splitter = build_cv_splitter(
+            cv=cv_arg,
+            y=ys_arr,
+            groups=groups,
+            task=self.task,
+            cv_strategy=eff_strategy,
+            random_state=self.random_state,
+        )
+        splits = iter_cv_splits(
+            splitter,
+            Xs,
+            ys_arr,
+            groups,
+            validate_groups_leakage=(groups is not None and eff_strat_norm != "temporal"),
+        )
         n_folds = len(splits)
 
         base_pre = survivors[0][1].named_steps["pre"]
@@ -1546,6 +1825,10 @@ class _ACDSOEngineV3:
                 "global_classes": global_classes,
                 "oof_by_name": oof_by_name,
                 "fold0_by_name": fold0_by_name,
+                "groups": groups,
+                "cv_strategy": eff_strategy,
+                "resolved_cv_strategy": resolve_cv_strategy_name(splitter),
+                "is_partition": _is_partition(splits, n_rows),
             }
 
         return stage_results, stage_failures, budget_exhausted
@@ -1727,6 +2010,12 @@ class _ACDSOEngineV3:
         """
         cache = getattr(self, "_last_full_oof_cache", None)
         if not self.enable_stacking or not cache or len(results) < 2:
+            return None
+        if (
+            not cache.get("is_partition", True)
+            or str(cache.get("cv_strategy", "")).strip().lower() == "temporal"
+            or cache.get("resolved_cv_strategy") == "temporal"
+        ):
             return None
 
         entries: List[_FoldCacheEntry] = cache["entries"]
@@ -2008,7 +2297,35 @@ class _ACDSOEngineV3:
                     pass
             base_estimators.append((f"{b['family']}_{idx}", est))
 
-        stack_cv = 2
+        groups_arr = cache.get("groups")
+        eff_strategy = cache.get("cv_strategy", self.cv_strategy)
+        if groups_arr is None:
+            stack_cv: Any = 2
+        else:
+            if len(np.unique(groups_arr)) < 2:
+                return None
+            stack_splitter = build_cv_splitter(
+                cv=2,
+                y=ys_arr,
+                groups=groups_arr,
+                task=self.task,
+                cv_strategy=eff_strategy,
+                random_state=self.random_state,
+            )
+            stack_splits = iter_cv_splits(
+                stack_splitter,
+                X,
+                ys_arr,
+                groups_arr,
+                validate_groups_leakage=True,
+            )
+            if self.task == "classification":
+                assert global_classes is not None
+                n_global_cls = len(global_classes)
+                if any(len(np.unique(ys_arr[tr])) < n_global_cls for tr, _ in stack_splits):
+                    return None
+            stack_cv = stack_splits
+
         if self.task == "classification":
             stacker: Any = StackingClassifier(
                 estimators=base_estimators,
@@ -2138,7 +2455,13 @@ class _ACDSOEngineV3:
         except Exception:
             return base
 
-    def fit(self, X: Any, y: Any) -> "_ACDSOEngineV3":
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        groups: Optional[Any] = None,
+        cv_strategy: Optional[str] = None,
+    ) -> "_ACDSOEngineV3":
         """
         Run the full ACDSO optimization loop.
 
@@ -2153,8 +2476,12 @@ class _ACDSOEngineV3:
         # Start total wall-clock timer BEFORE risk analysis so time_budget_s covers full fit()
         t0 = time.time()
 
-        # Step 0: Validate X and y upfront and sanitize input features
-        n_x = len(X) if hasattr(X, '__len__') else np.asarray(X).shape[0]
+        # Step 0: Validate X, y, and groups upfront and sanitize input features
+        n_x = (
+            int(X.shape[0])
+            if hasattr(X, "shape") and getattr(X, "shape", None)
+            else (len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0]))
+        )
         y_arr = np.asarray(y)
         if y_arr.ndim == 0 or len(y_arr) == 0:
             raise ValueError("Target y cannot be empty.")
@@ -2174,22 +2501,314 @@ class _ACDSOEngineV3:
                 if isinstance(v, (float, np.floating)) and not math.isfinite(float(v)):
                     raise ValueError("Target y contains infinite values.")
 
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
+        if self.max_in_memory_rows is not None:
+            if isinstance(self.max_in_memory_rows, bool) or int(self.max_in_memory_rows) < 1:
+                raise ValueError(
+                    f"max_in_memory_rows must be a positive integer or None, got {self.max_in_memory_rows!r}."
+                )
+        text_method_norm = str(self.text_method).strip().lower()
+        if text_method_norm not in ("tfidf", "ngram", "lda", "nmf", "combined"):
+            raise ValueError(
+                f"Invalid text_method {self.text_method!r}; expected one of "
+                "('tfidf', 'ngram', 'lda', 'nmf', 'combined')."
+            )
+
+        groups_arr: Optional[np.ndarray] = None
+        if groups is not None:
+            groups_arr = validate_groups(groups, n_samples=n_x, min_unique=2)
+        self._groups = groups_arr
+
+        orig_n_rows = int(n_x)
+        was_subsampled = False
+        if self.max_in_memory_rows is not None and n_x > int(self.max_in_memory_rows):
+            limit = int(self.max_in_memory_rows)
+            is_temporal_guard = (
+                isinstance(eff_strategy, str) and eff_strategy.strip().lower() == "temporal"
+            ) or (
+                hasattr(self.cv, "split") and resolve_cv_strategy_name(self.cv) == "temporal"
+            )
+
+            if is_temporal_guard:
+                if groups_arr is not None:
+                    codes, uniques = pd.factorize(pd.Series(groups_arr, dtype=object), sort=False)
+                    n_uniq_full = len(uniques)
+                    group_last_pos = np.full(n_uniq_full, -1, dtype=np.intp)
+                    group_indices: List[List[int]] = [[] for _ in range(n_uniq_full)]
+                    for pos, code in enumerate(codes.tolist()):
+                        group_indices[code].append(pos)
+                        group_last_pos[code] = pos
+                    tail_group_order = np.argsort(-group_last_pos, kind="mergesort").tolist()
+                    selected_pos: List[int] = []
+                    selected_g_count = 0
+                    min_g_req = min(n_uniq_full, 2)
+                    if self.task == "classification":
+                        u_orig, c_orig = np.unique(y_arr, return_counts=True)
+                    else:
+                        u_orig = np.array([])
+                        c_orig = np.array([])
+
+                    if self.task == "classification" and len(u_orig) >= 2:
+                        selected_set: set = set()
+                        class_row_counts = {val: 0 for val in u_orig.tolist()}
+                        class_group_counts = {val: 0 for val in u_orig.tolist()}
+                        group_class_vals: List[Dict[Any, int]] = []
+                        groups_with_cls: Dict[Any, int] = {val: 0 for val in u_orig.tolist()}
+                        for g_code in range(n_uniq_full):
+                            g_vals, g_cnts = np.unique(y_arr[group_indices[g_code]], return_counts=True)
+                            cls_map = dict(zip(g_vals.tolist(), g_cnts.tolist()))
+                            group_class_vals.append(cls_map)
+                            for v in cls_map:
+                                if v in groups_with_cls:
+                                    groups_with_cls[v] += 1
+
+                        cls_order = [u_orig[i] for i in np.argsort(c_orig, kind="mergesort").tolist()]
+                        orig_cnt_map = dict(zip(u_orig.tolist(), c_orig.tolist()))
+
+                        # Pass A1: guarantee at least 1 recent group per class within budget
+                        for cls_val in cls_order:
+                            if class_row_counts[cls_val] >= 1:
+                                continue
+                            for g_code in tail_group_order:
+                                if g_code in selected_set or cls_val not in group_class_vals[g_code]:
+                                    continue
+                                g_rows = group_indices[g_code]
+                                if selected_pos and len(selected_pos) + len(g_rows) > limit:
+                                    continue
+                                selected_set.add(g_code)
+                                selected_pos.extend(g_rows)
+                                selected_g_count += 1
+                                for v, cnt in group_class_vals[g_code].items():
+                                    if v in class_row_counts:
+                                        class_row_counts[v] += int(cnt)
+                                        class_group_counts[v] += 1
+                                break
+
+                        # Pass A2: reach >=2 samples & >=2 groups per class where feasible within budget
+                        for cls_val in cls_order:
+                            target_samples = min(int(orig_cnt_map[cls_val]), 2)
+                            target_groups = min(int(groups_with_cls[cls_val]), 2)
+                            for g_code in tail_group_order:
+                                if (
+                                    class_row_counts[cls_val] >= target_samples
+                                    and class_group_counts[cls_val] >= target_groups
+                                ):
+                                    break
+                                if g_code in selected_set or cls_val not in group_class_vals[g_code]:
+                                    continue
+                                g_rows = group_indices[g_code]
+                                if selected_pos and len(selected_pos) + len(g_rows) > limit:
+                                    continue
+                                selected_set.add(g_code)
+                                selected_pos.extend(g_rows)
+                                selected_g_count += 1
+                                for v, cnt in group_class_vals[g_code].items():
+                                    if v in class_row_counts:
+                                        class_row_counts[v] += int(cnt)
+                                        class_group_counts[v] += 1
+
+                        # Phase B: fill remaining budget in reverse chronological tail order
+                        for g_code in tail_group_order:
+                            if g_code in selected_set:
+                                continue
+                            g_rows = group_indices[g_code]
+                            if selected_pos and len(selected_pos) + len(g_rows) > limit and selected_g_count >= min_g_req:
+                                continue
+                            selected_set.add(g_code)
+                            selected_pos.extend(g_rows)
+                            selected_g_count += 1
+                            if len(selected_pos) >= limit and selected_g_count >= min_g_req:
+                                break
+                    else:
+                        for g_code in tail_group_order:
+                            g_rows = group_indices[g_code]
+                            if selected_pos and len(selected_pos) + len(g_rows) > limit and selected_g_count >= min_g_req:
+                                break
+                            selected_pos.extend(g_rows)
+                            selected_g_count += 1
+                            if len(selected_pos) >= limit and selected_g_count >= min_g_req:
+                                break
+
+                    if 0 < len(selected_pos) < n_x:
+                        idx_sub = np.sort(np.asarray(selected_pos, dtype=np.intp))
+                        X = _slice_rows(X, idx_sub)
+                        y = y.iloc[idx_sub] if hasattr(y, "iloc") else y_arr[idx_sub]
+                        groups_arr = groups_arr[idx_sub]
+                        y_arr = np.asarray(y)
+                        self._groups = groups_arr
+                        was_subsampled = True
+                else:
+                    idx_sub = np.arange(n_x - limit, n_x, dtype=np.intp)
+                    X = _slice_rows(X, idx_sub)
+                    y = y.iloc[idx_sub] if hasattr(y, "iloc") else y_arr[idx_sub]
+                    y_arr = np.asarray(y)
+                    was_subsampled = True
+            elif groups_arr is not None:
+                n_uniq_g = int(len(np.unique(groups_arr)))
+                min_g_total = min(n_uniq_g, 4 if self.task == "classification" else 2)
+                X_sub, y_sub, g_sub = sample_by_groups(
+                    X,
+                    y=y,
+                    groups=groups_arr,
+                    max_rows=limit,
+                    random_state=self.random_state,
+                    stratify=(self.task == "classification"),
+                    min_groups_per_class=2,
+                    min_groups_total=min_g_total,
+                )
+                if len(y_sub) < orig_n_rows:
+                    X = X_sub
+                    y = y_sub
+                    groups_arr = g_sub
+                    y_arr = np.asarray(y)
+                    self._groups = groups_arr
+                    was_subsampled = True
+            else:
+                idx_sub = None
+                if self.task == "classification":
+                    try:
+                        uniq, counts = np.unique(y_arr, return_counts=True)
+                        if len(uniq) >= 2 and limit >= len(uniq):
+                            min_folds = (
+                                int(self.cv)
+                                if not hasattr(self.cv, "split")
+                                else int(getattr(self.cv, "n_splits", 2) or 2)
+                            )
+                            desired_floor = max(2, min_folds)
+                            floors = [min(int(c), desired_floor) for c in counts.tolist()]
+                            if sum(floors) > limit:
+                                if limit >= 2 * len(uniq):
+                                    alt_floor = max(2, limit // len(uniq))
+                                    floors = [min(int(c), alt_floor) for c in counts.tolist()]
+                                    if sum(floors) > limit:
+                                        floors = [min(int(c), 2) for c in counts.tolist()]
+                                else:
+                                    floors = [1] * len(uniq)
+                            while sum(floors) > limit:
+                                max_idx = max(range(len(floors)), key=lambda i: floors[i])
+                                if floors[max_idx] <= 1:
+                                    break
+                                floors[max_idx] -= 1
+
+                            rng_guard = np.random.RandomState(self.random_state)
+                            floor_parts: List[np.ndarray] = []
+                            for cls_val, fl in zip(uniq.tolist(), floors):
+                                if fl <= 0:
+                                    continue
+                                cls_pos = np.flatnonzero(y_arr == cls_val)
+                                if fl >= len(cls_pos):
+                                    floor_parts.append(cls_pos)
+                                else:
+                                    floor_parts.append(rng_guard.choice(cls_pos, size=fl, replace=False))
+                            selected_floor = (
+                                np.concatenate(floor_parts).astype(np.intp)
+                                if floor_parts
+                                else np.empty(0, dtype=np.intp)
+                            )
+                            rem_budget = limit - int(len(selected_floor))
+                            if rem_budget <= 0:
+                                idx_sub = np.sort(selected_floor[:limit])
+                            else:
+                                rem_mask = np.ones(n_x, dtype=bool)
+                                rem_mask[selected_floor] = False
+                                rem_pos = np.flatnonzero(rem_mask)
+                                y_rem = y_arr[rem_pos]
+                                rem_uniq, rem_counts = np.unique(y_rem, return_counts=True)
+                                rem_extra: Optional[np.ndarray] = None
+                                if (
+                                    len(rem_uniq) >= 2
+                                    and int(rem_counts.min()) >= 2
+                                    and rem_budget >= len(rem_uniq)
+                                    and (len(rem_pos) - rem_budget) >= len(rem_uniq)
+                                ):
+                                    from sklearn.model_selection import StratifiedShuffleSplit
+
+                                    sss = StratifiedShuffleSplit(
+                                        n_splits=1, train_size=rem_budget, random_state=self.random_state
+                                    )
+                                    rel_idx, _ = next(sss.split(np.zeros(len(rem_pos)), y_rem))
+                                    rem_extra = rem_pos[rel_idx]
+                                elif rem_budget >= len(rem_pos):
+                                    rem_extra = rem_pos
+                                else:
+                                    exact = rem_counts.astype(np.float64) * (float(rem_budget) / float(len(rem_pos)))
+                                    alloc = np.minimum(rem_counts, np.floor(exact).astype(np.int64))
+                                    leftover = int(rem_budget - int(alloc.sum()))
+                                    if leftover > 0:
+                                        rems = exact - alloc.astype(np.float64)
+                                        for ci in np.argsort(-rems, kind="mergesort").tolist():
+                                            if leftover <= 0:
+                                                break
+                                            cap = int(rem_counts[ci] - alloc[ci])
+                                            if cap > 0:
+                                                take = min(cap, leftover)
+                                                alloc[ci] += take
+                                                leftover -= take
+                                    extra_parts: List[np.ndarray] = []
+                                    for cls_val, take_n in zip(rem_uniq.tolist(), alloc.tolist()):
+                                        if take_n <= 0:
+                                            continue
+                                        c_pos = rem_pos[y_rem == cls_val]
+                                        if take_n >= len(c_pos):
+                                            extra_parts.append(c_pos)
+                                        else:
+                                            extra_parts.append(rng_guard.choice(c_pos, size=take_n, replace=False))
+                                    rem_extra = (
+                                        np.concatenate(extra_parts).astype(np.intp)
+                                        if extra_parts
+                                        else np.empty(0, dtype=np.intp)
+                                    )
+                                idx_sub = np.sort(np.concatenate([selected_floor, rem_extra]).astype(np.intp))
+                    except Exception:
+                        idx_sub = None
+                if idx_sub is None:
+                    rng_guard = np.random.RandomState(self.random_state)
+                    idx_sub = np.sort(rng_guard.choice(n_x, size=limit, replace=False).astype(np.intp))
+                X = _slice_rows(X, idx_sub)
+                y = y.iloc[idx_sub] if hasattr(y, "iloc") else y_arr[idx_sub]
+                y_arr = np.asarray(y)
+                was_subsampled = True
+
+            n_x = len(y_arr)
+            if was_subsampled:
+                self._log(f"Bounded memory guard: subsampled {orig_n_rows} -> {n_x} rows (max_in_memory_rows={limit})")
+
+        if hasattr(X, "toarray") and hasattr(X, "shape"):
+            X = X.toarray()
         X = sanitize_features(X)
 
-        # Step 0a: Adapt CV folds for small datasets
+        # Step 0a: Adapt CV folds for small datasets / small group counts
         n_samples = len(y_arr)
-        original_cv = self.cv
+        is_temporal = isinstance(eff_strategy, str) and eff_strategy.strip().lower() == "temporal"
+        if not hasattr(self.cv, "split"):
+            original_cv = int(self.cv)
+            self.cv = original_cv
 
-        # Ensure we have at least 2 samples per fold
-        max_cv_for_data = n_samples // 2
-        if self.cv > max_cv_for_data:
-            self.cv = max(2, max_cv_for_data)
-            self._log(f"Reduced CV folds from {original_cv} to {self.cv} (small dataset: {n_samples} samples)")
+            max_cv_for_data = n_samples // 2
+            if self.cv > max_cv_for_data:
+                self.cv = max(2, max_cv_for_data)
+                self._log(f"Reduced CV folds from {original_cv} to {self.cv} (small dataset: {n_samples} samples)")
 
-        # For very small datasets, use leave-one-out style (but cap at 5)
-        if n_samples < 20:
-            self.cv = min(n_samples - 1, 5)
-            self._log(f"Using {self.cv}-fold CV for very small dataset ({n_samples} samples)")
+            if n_samples < 20:
+                self.cv = max(2, min(n_samples - 1, 5))
+                self._log(f"Using {self.cv}-fold CV for very small dataset ({n_samples} samples)")
+
+            if groups_arr is not None and not is_temporal:
+                n_uniq_groups = int(len(np.unique(groups_arr)))
+                if self.cv > n_uniq_groups:
+                    self.cv = max(2, n_uniq_groups)
+                    self._log(f"Reduced CV folds to {self.cv} (unique groups: {n_uniq_groups})")
+
+        probe_splitter = build_cv_splitter(
+            cv=self.cv,
+            y=y_arr,
+            groups=groups_arr,
+            task=self.task,
+            cv_strategy=eff_strategy,
+            random_state=self.random_state,
+        )
+        self.cv_strategy_ = resolve_cv_strategy_name(probe_splitter)
+        stage_strategy = self.cv_strategy_ if self.cv_strategy_ in VALID_CV_STRATEGIES else eff_strategy
 
         # Step 0b: Auto-adjust scorer for multiclass or non-standard binary labels
         adjusted_scorer = _auto_adjust_scorer(self.scorer, y, self.task)
@@ -2210,6 +2829,8 @@ class _ACDSOEngineV3:
             random_state=self.random_state,
             llm_advisor=self.llm_advisor,
             time_budget_s=risk_budget,
+            groups=groups_arr,
+            cv_strategy=eff_strategy,
         )
         self._log(f"Risk report: {asdict(self.risk_report_)}")
 
@@ -2236,9 +2857,11 @@ class _ACDSOEngineV3:
 
             self._log(f"Halving stage: {stage['name']} | row_frac={stage['row_frac']} cv={stage['cv']} keep={stage['keep']}")
 
-            Xs, ys = self._subsample_rows(X, y, stage["row_frac"])
+            Xs, ys, gs = self._subsample_rows(
+                X, y, stage["row_frac"], groups=groups_arr, cv_strategy=stage_strategy, stage_cv=stage["cv"]
+            )
             stage_results, stage_failures, budget_exhausted = self._evaluate_stage(
-                Xs, ys, survivors, stage, t0
+                Xs, ys, survivors, stage, t0, groups=gs, cv_strategy=stage_strategy
             )
 
             stage_results.sort(key=_rank_key, reverse=True)
@@ -2301,7 +2924,11 @@ class _ACDSOEngineV3:
             raw_templates["Baseline_Fallback"] = clone(fallback_pipe)
 
             try:
-                fallback_res = self._evaluate_candidate(X, y, "Baseline_Fallback", fallback_pipe)
+                fallback_res = self._evaluate_candidate(
+                    X, y, "Baseline_Fallback", fallback_pipe,
+                    groups=groups_arr,
+                    cv_strategy=stage_strategy,
+                )
                 results = [fallback_res]
                 self._log(f"Fallback model: metric={fallback_res.metric:.4f}")
             except Exception as fallback_e:
@@ -2452,6 +3079,17 @@ class _ACDSOEngineV3:
                 "type": "ridge" if calibrator is not None else None,
                 "used": calibrator is not None,
             },
+            "cv_strategy": self.cv_strategy_,
+            "groups_provided": groups_arr is not None,
+            "n_groups": int(len(np.unique(groups_arr))) if groups_arr is not None else None,
+            "text_cols": [c if isinstance(c, (str, int)) else str(c) for c in getattr(self, "_text_cols_", [])],
+            "text_method": text_method_norm,
+            "scale_guard": {
+                "max_in_memory_rows": int(self.max_in_memory_rows) if self.max_in_memory_rows is not None else None,
+                "subsampled": bool(was_subsampled),
+                "original_rows": int(orig_n_rows),
+                "analyzed_rows": int(len(y_arr)),
+            },
         }
 
         return self
@@ -2562,6 +3200,10 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         selection_mode: str = "knee_point",
         n_jobs: Optional[int] = None,
         enable_stacking: bool = True,
+        cv_strategy: str = "auto",
+        max_in_memory_rows: Optional[int] = 200_000,
+        text_cols: Optional[List[str]] = None,
+        text_method: str = "tfidf",
     ) -> None:
         self.scorer = scorer
         self.cv = cv
@@ -2578,15 +3220,26 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
         self.n_jobs = n_jobs
         self.enable_stacking = enable_stacking
+        self.cv_strategy = cv_strategy
+        self.max_in_memory_rows = max_in_memory_rows
+        self.text_cols = text_cols
+        self.text_method = text_method
 
         # Fitted attributes
         self.best_estimator_: Optional[Pipeline] = None
         self.risk_report_: Optional[Dict[str, Any]] = None
         self.pareto_front_: Optional[List[Dict[str, Any]]] = None
         self.audit_trail_: Optional[Dict[str, Any]] = None
+        self.cv_strategy_: Optional[str] = None
         self._engine: Optional[_ACDSOEngineV3] = None
 
-    def fit(self, X: Any, y: Any) -> "ACDSOClassifier":
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        groups: Optional[Any] = None,
+        cv_strategy: Optional[str] = None,
+    ) -> "ACDSOClassifier":
         """
         Fit the ACDSO classifier.
 
@@ -2602,12 +3255,17 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
             Training data.
         y : array-like of shape (n_samples,)
             Target values.
+        groups : array-like of shape (n_samples,), optional
+            Entity/group identifiers for grouped cross-validation.
+        cv_strategy : str, optional
+            Override ``self.cv_strategy`` for this fit call.
 
         Returns
         -------
         self : ACDSOClassifier
             Fitted estimator.
         """
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
         self._engine = _ACDSOEngineV3(
             task="classification",
             scorer=self.scorer,
@@ -2625,13 +3283,18 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
             selection_mode=self.selection_mode,
             n_jobs=self.n_jobs,
             enable_stacking=self.enable_stacking,
-        ).fit(X, y)
+            cv_strategy=eff_strategy,
+            max_in_memory_rows=self.max_in_memory_rows,
+            text_cols=self.text_cols,
+            text_method=self.text_method,
+        ).fit(X, y, groups=groups, cv_strategy=eff_strategy)
 
         assert self._engine.best_result_ is not None
         self.best_estimator_ = self._engine.best_result_.pipeline
         self.risk_report_ = asdict(self._engine.risk_report_) if self._engine.risk_report_ else None
         self.pareto_front_ = self._engine.audit_trail_.get("pareto_front")
         self.audit_trail_ = self._engine.audit_trail_
+        self.cv_strategy_ = self._engine.cv_strategy_
         
         # Store adjusted scorer internally without mutating public estimator param `scorer`
         self._effective_scorer_ = getattr(self._engine, "_adjusted_scorer", self.scorer)
@@ -2654,7 +3317,8 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         """
         if self.best_estimator_ is None:
             raise RuntimeError("ACDSOClassifier is not fitted. Call fit() first.")
-        return self.best_estimator_.predict(X)
+        X_in = X.toarray() if hasattr(X, "toarray") and hasattr(X, "shape") else X
+        return self.best_estimator_.predict(X_in)
 
     def predict_proba(self, X: Any) -> Any:
         """
@@ -2678,7 +3342,8 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
         if self.best_estimator_ is None:
             raise RuntimeError("ACDSOClassifier is not fitted. Call fit() first.")
         if hasattr(self.best_estimator_, "predict_proba"):
-            return self.best_estimator_.predict_proba(X)
+            X_in = X.toarray() if hasattr(X, "toarray") and hasattr(X, "shape") else X
+            return self.best_estimator_.predict_proba(X_in)
         raise AttributeError("Selected estimator does not support predict_proba().")
 
     def score(self, X: Any, y: Any) -> float:
@@ -2701,7 +3366,8 @@ class ACDSOClassifier(BaseEstimator, ClassifierMixin):
             raise RuntimeError("ACDSOClassifier is not fitted. Call fit() first.")
         scorer_name = getattr(self, "_effective_scorer_", self.scorer)
         scorer = get_scorer(scorer_name)
-        return float(scorer(self.best_estimator_, X, y))
+        X_in = X.toarray() if hasattr(X, "toarray") and hasattr(X, "shape") else X
+        return float(scorer(self.best_estimator_, X_in, y))
 
 
 class ACDSORegressor(BaseEstimator, RegressorMixin):
@@ -2800,6 +3466,10 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         selection_mode: str = "knee_point",
         n_jobs: Optional[int] = None,
         enable_stacking: bool = True,
+        cv_strategy: str = "auto",
+        max_in_memory_rows: Optional[int] = 200_000,
+        text_cols: Optional[List[str]] = None,
+        text_method: str = "tfidf",
     ) -> None:
         self.scorer = scorer
         self.cv = cv
@@ -2816,15 +3486,26 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         self.selection_mode = selection_mode  # "knee_point" or "best_score"
         self.n_jobs = n_jobs
         self.enable_stacking = enable_stacking
+        self.cv_strategy = cv_strategy
+        self.max_in_memory_rows = max_in_memory_rows
+        self.text_cols = text_cols
+        self.text_method = text_method
 
         # Fitted attributes
         self.best_estimator_: Optional[Pipeline] = None
         self.risk_report_: Optional[Dict[str, Any]] = None
         self.pareto_front_: Optional[List[Dict[str, Any]]] = None
         self.audit_trail_: Optional[Dict[str, Any]] = None
+        self.cv_strategy_: Optional[str] = None
         self._engine: Optional[_ACDSOEngineV3] = None
 
-    def fit(self, X: Any, y: Any) -> "ACDSORegressor":
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        groups: Optional[Any] = None,
+        cv_strategy: Optional[str] = None,
+    ) -> "ACDSORegressor":
         """
         Fit the ACDSO regressor.
 
@@ -2834,12 +3515,17 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
             Training data.
         y : array-like of shape (n_samples,)
             Target values.
+        groups : array-like of shape (n_samples,), optional
+            Entity/group identifiers for grouped cross-validation.
+        cv_strategy : str, optional
+            Override ``self.cv_strategy`` for this fit call.
 
         Returns
         -------
         self : ACDSORegressor
             Fitted estimator.
         """
+        eff_strategy = self.cv_strategy if cv_strategy is None else cv_strategy
         self._engine = _ACDSOEngineV3(
             task="regression",
             scorer=self.scorer,
@@ -2857,13 +3543,18 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
             selection_mode=self.selection_mode,
             n_jobs=self.n_jobs,
             enable_stacking=self.enable_stacking,
-        ).fit(X, y)
+            cv_strategy=eff_strategy,
+            max_in_memory_rows=self.max_in_memory_rows,
+            text_cols=self.text_cols,
+            text_method=self.text_method,
+        ).fit(X, y, groups=groups, cv_strategy=eff_strategy)
 
         assert self._engine.best_result_ is not None
         self.best_estimator_ = self._engine.best_result_.pipeline
         self.risk_report_ = asdict(self._engine.risk_report_) if self._engine.risk_report_ else None
         self.pareto_front_ = self._engine.audit_trail_.get("pareto_front")
         self.audit_trail_ = self._engine.audit_trail_
+        self.cv_strategy_ = self._engine.cv_strategy_
         
         # Store adjusted scorer internally without mutating public estimator param `scorer`
         self._effective_scorer_ = getattr(self._engine, "_adjusted_scorer", self.scorer)
@@ -2886,7 +3577,8 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
         """
         if self.best_estimator_ is None:
             raise RuntimeError("ACDSORegressor is not fitted. Call fit() first.")
-        return self.best_estimator_.predict(X)
+        X_in = X.toarray() if hasattr(X, "toarray") and hasattr(X, "shape") else X
+        return self.best_estimator_.predict(X_in)
 
     def score(self, X: Any, y: Any) -> float:
         """
@@ -2908,5 +3600,6 @@ class ACDSORegressor(BaseEstimator, RegressorMixin):
             raise RuntimeError("ACDSORegressor is not fitted. Call fit() first.")
         scorer_name = getattr(self, "_effective_scorer_", self.scorer)
         scorer = get_scorer(scorer_name)
-        return float(scorer(self.best_estimator_, X, y))
+        X_in = X.toarray() if hasattr(X, "toarray") and hasattr(X, "shape") else X
+        return float(scorer(self.best_estimator_, X_in, y))
 

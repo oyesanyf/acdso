@@ -61,6 +61,16 @@ _LAZY_SUBMODULES = frozenset({
     "integrations",
     "timeseries",
     "decision",
+    # M1-M5 submodules
+    "cv",
+    "nlp",
+    "clustering",
+    "anomaly",
+    "multilabel",
+    "ranking",
+    "survival",
+    "recommender",
+    "scale",
 })
 
 _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
@@ -133,6 +143,33 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "LLMColumnAnalyzer": ("acdso.advisors", "LLMColumnAnalyzer"),
     "ColumnAnalysisResult": ("acdso.advisors", "ColumnAnalysisResult"),
     "auto_exclude_columns": ("acdso.advisors", "auto_exclude_columns"),
+    # Entity-grouped & temporal cross-validation (R3 / M1)
+    "VALID_CV_STRATEGIES": ("acdso.cv", "VALID_CV_STRATEGIES"),
+    "build_cv_splitter": ("acdso.cv", "build_cv_splitter"),
+    "validate_no_group_leakage": ("acdso.cv", "validate_no_group_leakage"),
+    "validate_groups": ("acdso.cv", "validate_groups"),
+    "splitter_supports_groups": ("acdso.cv", "splitter_supports_groups"),
+    "resolve_cv_strategy_name": ("acdso.cv", "resolve_cv_strategy_name"),
+    "iter_cv_splits": ("acdso.cv", "iter_cv_splits"),
+    "sample_by_groups": ("acdso.cv", "sample_by_groups"),
+    "group_holdout_split": ("acdso.cv", "group_holdout_split"),
+    # Classical NLP & free-text featurization (R4 / M2)
+    "TextFeaturizer": ("acdso.nlp", "TextFeaturizer"),
+    "detect_text_columns": ("acdso.nlp", "detect_text_columns"),
+    # Unsupervised clustering & trainable anomaly detection (R1, R2 / M3)
+    "ACDSOClusterer": ("acdso.clustering", "ACDSOClusterer"),
+    "ACDSOAnomalyDetector": ("acdso.anomaly", "ACDSOAnomalyDetector"),
+    # Specialized supervised formulations (R5 / M4)
+    "ACDSOMultiLabelClassifier": ("acdso.multilabel", "ACDSOMultiLabelClassifier"),
+    "ACDSORanker": ("acdso.ranking", "ACDSORanker"),
+    "ndcg_at_k": ("acdso.ranking", "ndcg_at_k"),
+    "ACDSOSurvivalAnalyzer": ("acdso.survival", "ACDSOSurvivalAnalyzer"),
+    "concordance_index": ("acdso.survival", "concordance_index"),
+    "ACDSORecommender": ("acdso.recommender", "ACDSORecommender"),
+    # Single-machine out-of-core / chunked scale (R6 / M5)
+    "ACDSOOutOfCoreTrainer": ("acdso.scale", "ACDSOOutOfCoreTrainer"),
+    "iter_file_chunks": ("acdso.scale", "iter_file_chunks"),
+    "reservoir_sample_file": ("acdso.scale", "reservoir_sample_file"),
 }
 
 
@@ -228,5 +265,42 @@ __all__ = [
     "timeseries",
     # Decision Intelligence submodule (DoWhy, EconML, OR-Tools, RLlib)
     "decision",
+    # Cross-validation (R3 / M1)
+    "VALID_CV_STRATEGIES",
+    "build_cv_splitter",
+    "validate_no_group_leakage",
+    "validate_groups",
+    "splitter_supports_groups",
+    "resolve_cv_strategy_name",
+    "iter_cv_splits",
+    "sample_by_groups",
+    "group_holdout_split",
+    # Classical NLP (R4 / M2)
+    "TextFeaturizer",
+    "detect_text_columns",
+    # Clustering & Anomaly Detection (R1, R2 / M3)
+    "ACDSOClusterer",
+    "ACDSOAnomalyDetector",
+    # Specialized Supervised Formulations (R5 / M4)
+    "ACDSOMultiLabelClassifier",
+    "ACDSORanker",
+    "ndcg_at_k",
+    "ACDSOSurvivalAnalyzer",
+    "concordance_index",
+    "ACDSORecommender",
+    # Out-of-Core Scale (R6 / M5)
+    "ACDSOOutOfCoreTrainer",
+    "iter_file_chunks",
+    "reservoir_sample_file",
+    # M1-M5 lazy submodules
+    "cv",
+    "nlp",
+    "clustering",
+    "anomaly",
+    "multilabel",
+    "ranking",
+    "survival",
+    "recommender",
+    "scale",
 ]
 

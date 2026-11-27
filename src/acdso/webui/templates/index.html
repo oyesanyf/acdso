@@ -92,6 +92,12 @@
               <option value="auto" selected>auto</option>
               <option value="classification">classification</option>
               <option value="regression">regression</option>
+              <option value="clustering">clustering</option>
+              <option value="anomaly">anomaly</option>
+              <option value="multilabel">multilabel</option>
+              <option value="ranking">ranking</option>
+              <option value="survival">survival</option>
+              <option value="recommender">recommender</option>
             </select>
           </div>
           <div class="field">
@@ -99,6 +105,112 @@
             <select id="f_datetime_col" name="datetime_col" data-kind="columns" data-columns="1">
               <option value="">(none)</option>
             </select>
+          </div>
+        </div>
+        <div id="taskTargetHint" class="hint" style="margin:0 0 10px"></div>
+
+        <div id="clusterOptsWrap" class="task-opts-box" style="display:none">
+          <div class="hint" style="margin-top:0"><strong>Clustering Options</strong> (targetless segmentation)</div>
+          <div class="grid-2">
+            <div class="field">
+              <label for="f_cluster_algo">Cluster algorithm <code class="inline">--cluster-algo</code></label>
+              <select id="f_cluster_algo" name="cluster_algo" data-kind="choice">
+                <option value="auto" selected>auto</option>
+                <option value="kmeans">kmeans</option>
+                <option value="hdbscan">hdbscan</option>
+                <option value="gmm">gmm</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="f_n_clusters">Number of clusters <code class="inline">--n-clusters</code></label>
+              <input id="f_n_clusters" name="n_clusters" data-kind="int" type="number" min="2" value="" placeholder="auto (2..8)">
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label for="f_dim_reduce">Dim reduction <code class="inline">--dim-reduce</code></label>
+              <select id="f_dim_reduce" name="dim_reduce" data-kind="choice">
+                <option value="none" selected>none</option>
+                <option value="pca">pca</option>
+                <option value="umap">umap</option>
+              </select>
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label for="f_cluster_metric">Cluster metric <code class="inline">--cluster-metric</code></label>
+              <select id="f_cluster_metric" name="cluster_metric" data-kind="choice">
+                <option value="silhouette" selected>silhouette</option>
+                <option value="davies_bouldin">davies_bouldin</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div id="anomalyOptsWrap" class="task-opts-box" style="display:none">
+          <div class="hint" style="margin-top:0"><strong>Anomaly Detection Options</strong> (targetless scoring)</div>
+          <div class="grid-2">
+            <div class="field" style="margin-bottom:0">
+              <label for="f_anomaly_algo">Anomaly algorithm <code class="inline">--anomaly-algo</code></label>
+              <select id="f_anomaly_algo" name="anomaly_algo" data-kind="choice">
+                <option value="auto" selected>auto</option>
+                <option value="isolation_forest">isolation_forest</option>
+                <option value="lof">lof</option>
+                <option value="ocsvm">ocsvm</option>
+              </select>
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label for="f_contamination">Contamination <code class="inline">--contamination</code></label>
+              <input id="f_contamination" name="contamination" data-kind="text" type="text" value="" placeholder="auto or (0, 0.5]">
+            </div>
+          </div>
+        </div>
+
+        <div id="survivalOptsWrap" class="task-opts-box" style="display:none">
+          <div class="hint" style="margin-top:0"><strong>Survival Analysis Columns</strong> (pick Time + Event, or 2 target columns)</div>
+          <div class="grid-2">
+            <div class="field" style="margin-bottom:0">
+              <label for="f_time_col">Time column <code class="inline">--time-col</code></label>
+              <select id="f_time_col" name="time_col" data-kind="columns" data-columns="1">
+                <option value="">(none)</option>
+              </select>
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label for="f_event_col">Event column <code class="inline">--event-col</code></label>
+              <select id="f_event_col" name="event_col" data-kind="columns" data-columns="1">
+                <option value="">(none)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div id="rankingOptsWrap" class="task-opts-box" style="display:none">
+          <div class="hint" style="margin-top:0"><strong>Learning-to-Rank Columns</strong> (pick relevance target + Query group column)</div>
+          <div class="field" style="margin-bottom:0">
+            <label for="f_query_col">Query group column <code class="inline">--query-col</code></label>
+            <select id="f_query_col" name="query_col" data-kind="columns" data-columns="1">
+              <option value="">(none)</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="recommenderOptsWrap" class="task-opts-box" style="display:none">
+          <div class="hint" style="margin-top:0"><strong>Recommender Columns</strong> (pick User + Item, optional Rating)</div>
+          <div class="grid-2">
+            <div class="field">
+              <label for="f_user_col">User column <code class="inline">--user-col</code></label>
+              <select id="f_user_col" name="user_col" data-kind="columns" data-columns="1">
+                <option value="">(none)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="f_item_col">Item column <code class="inline">--item-col</code></label>
+              <select id="f_item_col" name="item_col" data-kind="columns" data-columns="1">
+                <option value="">(none)</option>
+              </select>
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label for="f_rating_col">Rating column <code class="inline">--rating-col</code></label>
+              <select id="f_rating_col" name="rating_col" data-kind="columns" data-columns="1">
+                <option value="">(none)</option>
+              </select>
+            </div>
           </div>
         </div>
 
@@ -213,6 +325,53 @@
               <label for="f_output">Benchmark output JSON <code class="inline">--output</code></label>
               <input id="f_output" name="output" data-kind="text" type="text" value="">
             </div>
+            <div class="grid-2">
+              <div class="field">
+                <label for="f_group_col">Group column <code class="inline">--group-col</code></label>
+                <select id="f_group_col" name="group_col" data-kind="columns" data-columns="1">
+                  <option value="">(none)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="f_cv_strategy">CV strategy <code class="inline">--cv-strategy</code></label>
+                <select id="f_cv_strategy" name="cv_strategy" data-kind="choice">
+                  <option value="auto" selected>auto</option>
+                  <option value="kfold">kfold</option>
+                  <option value="stratified">stratified</option>
+                  <option value="group_kfold">group_kfold</option>
+                  <option value="stratified_group_kfold">stratified_group_kfold</option>
+                  <option value="temporal">temporal</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="f_text_cols">Free-text columns <code class="inline">--text-cols</code></label>
+                <select id="f_text_cols" name="text_cols" data-kind="columns" data-columns="1" multiple></select>
+              </div>
+              <div class="field">
+                <label for="f_nlp_method">NLP method <code class="inline">--nlp-method</code></label>
+                <select id="f_nlp_method" name="nlp_method" data-kind="choice">
+                  <option value="auto" selected>auto</option>
+                  <option value="tfidf">tfidf</option>
+                  <option value="ngram">ngram</option>
+                  <option value="lda">lda</option>
+                  <option value="nmf">nmf</option>
+                  <option value="combined">combined</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="f_scale_mode">Scale mode <code class="inline">--scale-mode</code></label>
+                <select id="f_scale_mode" name="scale_mode" data-kind="choice">
+                  <option value="auto" selected>auto</option>
+                  <option value="in_memory">in_memory</option>
+                  <option value="chunked">chunked</option>
+                  <option value="subsample">subsample</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="f_chunk_size">Chunk size <code class="inline">--chunk-size</code></label>
+                <input id="f_chunk_size" name="chunk_size" data-kind="int" type="number" min="1" value="" placeholder="50000">
+              </div>
+            </div>
             <div class="check">
               <input type="checkbox" id="f_autonomous" name="autonomous" data-kind="bool" checked disabled>
               <label for="f_autonomous">Autonomous pipeline <code class="inline">--autonomous</code> <span class="noop">always active</span>
@@ -302,13 +461,13 @@
     <div class="card">
       <h2>Live Output &amp; Progress</h2>
       <div id="pipelineStepper" class="stepper">
-        <span class="step" data-step="0" data-match="data loading">1. Data Loading</span>
+        <span class="step" data-step="0" data-match="data loading" data-match-r7="schema inspection">1. Data Loading</span>
         <span class="step" data-step="1" data-match="auto eda">2. Auto EDA</span>
         <span class="step" data-step="2" data-match="risk analysis">3. Risk Analysis</span>
-        <span class="step" data-step="3" data-match="automl,train,feature preparation,multi-output">4. AutoML</span>
+        <span class="step" data-step="3" data-match="automl,train,feature preparation,multi-output" data-match-r7="clustering,anomaly,multi-label,ranking,survival,recommender,out-of-core">4. AutoML / Task</span>
         <span class="step" data-step="4" data-match="time series">5. Time Series</span>
         <span class="step" data-step="5" data-match="decision,benchmark,policy,v3">6. Decision / Bench</span>
-        <span class="step" data-step="6" data-match="report,export,predictions">7. Report</span>
+        <span class="step" data-step="6" data-match="report,export,predictions" data-match-r7="streaming predictions,risk predictions">7. Report</span>
       </div>
       <div id="progressWrap" class="progress-wrap">
         <div class="row" style="justify-content:space-between; margin-bottom:4px">
